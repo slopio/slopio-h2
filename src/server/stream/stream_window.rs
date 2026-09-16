@@ -2,22 +2,27 @@ use std::cell::Cell;
 
 use crate::server::connection::Settings;
 
-/// Notre SETTINGS_INITIAL_WINDOW_SIZE. Annonce dans le preface et jamais
-/// modifie, donc une constante suffit — seuls les settings du pair bougent.
 pub const LOCAL_INITIAL_WINDOW_SIZE: u32 = 65_535;
 
 pub struct StreamWindow {
-    //what we can send to the peer
     to_send: Cell<i32>,
-    //what the peer can send to this stream
     to_recv: Cell<i32>,
 }
 
-impl StreamWindow {}
+impl StreamWindow {
+    /// §6.9.1: going past 2^31-1 is an error, and `i32::MAX` is exactly that
+    /// bound. The window can be negative — a shrinking SETTINGS may have put
+    /// it there.
+    pub fn credit_send(&self, increment: u32) -> Result<(), ()> {
+        let credited = self.to_send.get().checked_add_unsigned(increment).ok_or(())?;
+        self.to_send.set(credited);
+        Ok(())
+    }
+}
 
 impl From<&Settings> for StreamWindow {
-    /// `to_send` est credite par le SETTINGS_INITIAL_WINDOW_SIZE du pair,
-    /// `to_recv` par le notre — d'ou la constante pour le second cote.
+    /// `to_send` is credited by the peer's SETTINGS_INITIAL_WINDOW_SIZE,
+    /// `to_recv` by ours.
     fn from(peer: &Settings) -> Self {
         Self {
             to_send: Cell::new(peer.initial_window_size as i32),

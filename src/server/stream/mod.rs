@@ -20,12 +20,10 @@ pub struct Stream {
 }
 
 impl Stream {
-    /// `settings` sont ceux du pair : ils creditent la fenetre d'emission.
-    /// Le `Handle` de la tache ne vit pas ici — la connexion le garde a cote
-    /// du `Rc<Stream>` dans sa map, ce qui casse le cycle construction/spawn.
+    /// `settings` are the peer's: they credit the send window.
     pub fn create(settings: &Settings, header: Box<Headers>) -> Self {
-        // END_STREAM des la requete : le pair a fini d'emettre, le stream
-        // nait half-closed(remote).
+        // END_STREAM already on the request: the stream is born
+        // half-closed(remote).
         let state = if header.is_end_stream() {
             StreamState::InputClosed
         } else {
@@ -39,6 +37,10 @@ impl Stream {
             input: None,
             waker: None,
         }
+    }
+
+    pub fn credit_send(&self, increment: u32) -> Result<(), ()> {
+        self.window.credit_send(increment)
     }
 }
 
