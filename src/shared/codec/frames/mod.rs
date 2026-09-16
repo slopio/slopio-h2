@@ -22,7 +22,9 @@ pub mod headers;
 pub mod stream_id;
 
 const FRAME_HEADER_SIZE: usize = 9;
-const DEFAULT_MAX_FRAME_SIZE: u32 = 16_384;
+/// §6.5.2: SETTINGS_MAX_FRAME_SIZE until a peer says otherwise. Seeds both
+/// what the decoder accepts and what we assume a peer accepts.
+pub const DEFAULT_MAX_FRAME_SIZE: u32 = 16_384;
 /// The 24-byte client connection preface (§3.4). The server validates it on
 /// the inbound stream; a client writes it as the very first bytes it sends.
 pub const CLIENT_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";

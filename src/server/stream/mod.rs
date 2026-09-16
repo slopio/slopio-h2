@@ -2,7 +2,7 @@ use std::task::Waker;
 
 use crate::{
     server::{
-        connection::Settings,
+        connection::settings::Settings,
         stream::{input_data::InputData, stream_window::StreamWindow},
     },
     shared::codec::frames::headers::Headers,

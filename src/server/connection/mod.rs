@@ -1,5 +1,6 @@
 use std::rc::Rc;
 
+use crate::server::connection::settings::Settings;
 use crate::server::{STREAM_ID, connection::shared_with_streams::SharedConnection, stream::Stream};
 use crate::shared::codec::{
     frames::{FrameHandler, FrameKind, SettingsIter, headers::Headers, stream_id::StreamId},
@@ -11,6 +12,7 @@ use crate::shared::codec::{
 use runtime::{Handle, spawn};
 use rustc_hash::FxHashMap;
 
+pub(crate) mod settings;
 mod shared_with_streams;
 
 pub const MAX_CONCURRENT_STREAMS: u32 = 64;
@@ -24,41 +26,101 @@ pub struct Connection {
     streams: Streams,
 }
 
-/// §6.9.2: the connection window always starts at 65535, and
-/// SETTINGS_INITIAL_WINDOW_SIZE never touches it. Only a WINDOW_UPDATE on
-/// stream 0 moves it.
 pub const CONNECTION_INITIAL_WINDOW_SIZE: u32 = 65_535;
-
-/// The gap with the initial value must be announced by a WINDOW_UPDATE on
-/// stream 0, sent from `on_preface`.
 pub const CONNECTION_RECV_WINDOW: u32 = 1024 * 1024;
 
 pub struct ConnectionWindow {
-    /// §6.9.1: a DATA frame debits this window *and* its stream's.
     to_send: i32,
-    /// Debited by `padded_len`, padding included (§6.9.1).
     to_recv: i32,
     pending_release: u32,
 }
 
 struct Streams {
     last_client_stream_id: STREAM_ID,
+    goaway_stream_id: Option<STREAM_ID>,
     streams: FxHashMap<STREAM_ID, (Rc<Stream>, Handle<()>)>,
 }
 
+enum Rejected {
+    /// Reset the id with this code, nothing else is wrong.
+    Refused(u32),
+    /// A stream error to report on the id.
+    Violation(StreamViolation),
+    /// The id itself breaks the protocol: the connection must go.
+    Fatal(u32, &'static str),
+}
+
 impl Streams {
-    fn new_stream(&mut self) {}
+    fn create(
+        &mut self,
+        settings: &Settings,
+        shared: &Rc<SharedConnection>,
+        headers: Box<Headers>,
+    ) -> Result<(), Rejected> {
+        let id = headers.stream_id();
+        let raw: STREAM_ID = id.into();
+
+        if !id.is_client_initiated() {
+            return Err(Rejected::Fatal(
+                PROTOCOL_ERROR,
+                "HEADERS with server-initiated stream id",
+            ));
+        }
+
+        if raw <= self.last_client_stream_id {
+            return Err(Rejected::Fatal(STREAM_CLOSED, "HEADERS on closed stream"));
+        }
+
+        self.spend(raw);
+
+        if self.goaway_stream_id.is_some_and(|last| raw > last) {
+            return Err(Rejected::Refused(REFUSED_STREAM));
+        }
+
+        if is_malformed_request(&headers) {
+            return Err(Rejected::Violation(StreamViolation::MalformedRequest));
+        }
+
+        if !self.admits() {
+            return Err(Rejected::Refused(REFUSED_STREAM));
+        }
+
+        let stream = Rc::new(Stream::create(settings, headers));
+        let handle = spawn(handle_stream(Rc::clone(shared), Rc::clone(&stream), id));
+        self.streams.insert(raw, (stream, handle));
+        Ok(())
+    }
+
+    /// An id is spent as soon as we have seen it, stream or no stream: that
+    /// is what later tells a closed stream apart from an idle one.
+    fn spend(&mut self, id: STREAM_ID) {
+        self.last_client_stream_id = id.max(self.last_client_stream_id);
+    }
+
+    /// §5.1.2: the map only holds live streams, so its length is the current
+    /// count.
+    fn admits(&self) -> bool {
+        self.streams.len() < MAX_CONCURRENT_STREAMS as usize
+    }
 
     /// An id absent from the map is a stream that closed and was removed: the
     /// peer may have sent before receiving our RST_STREAM. That is legal, so
     /// `Ok`.
-    fn credit_send(&self, id: STREAM_ID, increment: u32) -> Result<(), StreamViolation> {
+    fn credit_send(&self, id: STREAM_ID, increment: u32) -> Result<(), Rejected> {
+        // §5.1: an idle stream only accepts HEADERS and PRIORITY.
+        if id > self.last_client_stream_id {
+            return Err(Rejected::Fatal(
+                PROTOCOL_ERROR,
+                "WINDOW_UPDATE on idle stream",
+            ));
+        }
+
         let Some((stream, _)) = self.streams.get(&id) else {
             return Ok(());
         };
         stream
             .credit_send(increment)
-            .map_err(|()| StreamViolation::StreamWindowOverflow)
+            .map_err(|()| Rejected::Violation(StreamViolation::StreamWindowOverflow))
     }
 }
 
@@ -86,10 +148,14 @@ impl Connection {
         unimplemented!()
     }
 
-    /// §5.1.2: the map only holds live streams, so its length is the current
-    /// count.
-    fn admits(&self) -> bool {
-        self.streams.streams.len() < MAX_CONCURRENT_STREAMS as usize
+    /// Answers what `Streams` refused: it decides, we are the one that can
+    /// write.
+    fn reject(&mut self, stream_id: StreamId, rejected: Rejected) {
+        match rejected {
+            Rejected::Refused(code) => self.reset_stream(stream_id, code),
+            Rejected::Violation(violation) => self.fail_stream(stream_id, violation),
+            Rejected::Fatal(code, reason) => self.fail_connection(code, reason),
+        }
     }
 }
 
@@ -127,65 +193,56 @@ impl FrameHandler for Connection {
         let id = headers.stream_id();
         let raw: STREAM_ID = id.into();
 
-        // §5.3.1: a stream MUST NOT depend on itself.
+        // §5.3.1: a stream MUST NOT depend on itself. Checked before the id
+        // itself, which the frame never gets to spend.
         if let Some(dep) = headers.stream_dep()
             && dep.dependency_id == id
         {
             return self.fail_stream(id, StreamViolation::HeadersSelfDependency);
         }
 
-        // §5.1.1: client ids are odd; even ones are reserved for the server.
-        if !id.is_client_initiated() {
-            return self.fail_connection(PROTOCOL_ERROR, "HEADERS with server-initiated stream id");
-        }
-
         // List truncated during decoding: HPACK state stays in sync, but the
-        // content is incomplete and must not reach the handler.
+        // content is incomplete and must not reach the handler — neither as a
+        // request nor as trailers, hence before the lookup below.
         if headers.is_over_size() {
-            self.streams.last_client_stream_id = raw.max(self.streams.last_client_stream_id);
+            self.streams.spend(raw);
             return self.reset_stream(id, REFUSED_STREAM);
         }
 
+        // §8.1: an id already live takes these HEADERS as its trailers.
         if let Some((stream, _)) = self.streams.streams.get(&raw) {
             let stream = Rc::clone(stream);
             return self.on_trailers(stream, headers);
         }
 
-        // Absent from the map but already used: the stream lived and is gone.
-        // `last_client_stream_id` is what tells this apart from "id never
-        // used", since the map only holds live streams.
-        if raw <= self.streams.last_client_stream_id {
-            return self.fail_connection(STREAM_CLOSED, "HEADERS on closed stream");
+        if let Err(rejected) = self
+            .streams
+            .create(&self.peer_settings, &self.shared, headers)
+        {
+            self.reject(id, rejected);
         }
-
-        // The id is spent as soon as we refuse it: both branches below
-        // advance it, but neither opens a stream.
-        if is_malformed_request(&headers) {
-            self.streams.last_client_stream_id = raw;
-            return self.fail_stream(id, StreamViolation::MalformedRequest);
-        }
-
-        if !self.admits() {
-            self.streams.last_client_stream_id = raw;
-            return self.reset_stream(id, REFUSED_STREAM);
-        }
-
-        self.streams.last_client_stream_id = raw;
-
-        // The entry stays in the map even with END_STREAM set: the stream is
-        // half-closed(remote), not gone — we still need to take its
-        // WINDOW_UPDATEs and reject stray DATA.
-        let stream = Rc::new(Stream::create(&self.peer_settings, headers));
-        let handle = spawn(handle_stream(
-            Rc::clone(&self.shared),
-            Rc::clone(&stream),
-            id,
-        ));
-        self.streams.streams.insert(raw, (stream, handle));
     }
 
+    /// The decoder has already refused a non-zero stream id, an ACK with a
+    /// payload, and a length that is not a multiple of 6.
     fn on_settings(&mut self, ack: bool, settings: SettingsIter<'_>) {
-        unimplemented!()
+        // An ACK carries timing, not values: its payload is empty, and what
+        // it says is that the settings we announced are now in force on the
+        // peer's side. Acknowledging it back would loop forever.
+        if ack {
+            return;
+        }
+
+        for setting in settings {
+            if let Err(invalid) = self.peer_settings.apply(setting) {
+                return self.fail_connection(invalid.code, invalid.message);
+            }
+        }
+
+        // §6.5.3: the values are in force as of now, and the ACK is what tells
+        // the peer so. It must not overtake frames already queued, hence the
+        // tail of this function rather than anywhere earlier.
+        // TODO: queue `encode_settings_ack` once the writer exists.
     }
 
     /// The decoder has already masked the reserved bit and refused a zero
@@ -203,14 +260,8 @@ impl FrameHandler for Connection {
 
         let raw: STREAM_ID = stream_id.into();
 
-        // §5.1: an idle stream only accepts HEADERS and PRIORITY.
-        if raw > self.streams.last_client_stream_id {
-            return self.fail_connection(PROTOCOL_ERROR, "WINDOW_UPDATE on idle stream");
-        }
-
-        // Overflow only kills the stream, not the connection.
-        if let Err(violation) = self.streams.credit_send(raw, increment) {
-            self.fail_stream(stream_id, violation);
+        if let Err(rejected) = self.streams.credit_send(raw, increment) {
+            self.reject(stream_id, rejected);
         }
     }
 
@@ -245,23 +296,4 @@ impl FrameHandler for Connection {
     fn on_preface(&mut self) {
         unimplemented!()
     }
-}
-
-pub struct Settings {
-    /// 0x01 — max size of the HPACK dynamic table. Default 4096.
-    pub header_table_size: u32,
-    /// 0x02 — server push. Default true, but a server advertises false.
-    pub enable_push: bool,
-    /// 0x03 — `None` = unlimited (default). `Some(0)` forbids any new stream.
-    pub max_concurrent_streams: Option<u32>,
-    /// 0x04 — initial window of every stream. Default 65535, max 2^31-1.
-    pub initial_window_size: u32,
-    /// 0x05 — max frame payload size. Default 16384, within [2^14, 2^24-1].
-    pub max_frame_size: u32,
-    /// 0x06 — `None` = unlimited (default). Advisory, not binding.
-    pub max_header_list_size: Option<u32>,
-    /// 0x08 — RFC 8441, extended CONNECT (WebSocket over h2). Default false.
-    pub enable_connect_protocol: bool,
-    /// 0x09 — RFC 9218, dropping the RFC 7540 priority scheme. Default false.
-    pub no_rfc7540_priorities: bool,
 }

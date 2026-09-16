@@ -1,6 +1,6 @@
 use std::cell::Cell;
 
-use crate::server::connection::Settings;
+use crate::server::connection::settings::Settings;
 
 pub const LOCAL_INITIAL_WINDOW_SIZE: u32 = 65_535;
 
@@ -14,7 +14,11 @@ impl StreamWindow {
     /// bound. The window can be negative — a shrinking SETTINGS may have put
     /// it there.
     pub fn credit_send(&self, increment: u32) -> Result<(), ()> {
-        let credited = self.to_send.get().checked_add_unsigned(increment).ok_or(())?;
+        let credited = self
+            .to_send
+            .get()
+            .checked_add_unsigned(increment)
+            .ok_or(())?;
         self.to_send.set(credited);
         Ok(())
     }
