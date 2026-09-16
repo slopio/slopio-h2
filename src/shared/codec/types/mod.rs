@@ -42,12 +42,15 @@ pub enum StreamViolation {
     MalformedTrailers,
     /// §8.1.1: DATA payloads not adding up to `content-length`.
     ContentLengthMismatch,
+    /// §5.1: DATA on a stream whose peer half END_STREAM already closed.
+    DataAfterEndStream,
 }
 
 impl StreamViolation {
     pub fn code(self) -> u32 {
         match self {
             Self::StreamWindowOverflow => FLOW_CONTROL_ERROR,
+            Self::DataAfterEndStream => STREAM_CLOSED,
             Self::PriorityLength => FRAME_SIZE_ERROR,
             _ => PROTOCOL_ERROR,
         }
@@ -63,6 +66,7 @@ impl StreamViolation {
             Self::MalformedRequest => "malformed request",
             Self::MalformedTrailers => "malformed trailers",
             Self::ContentLengthMismatch => "body does not match content-length",
+            Self::DataAfterEndStream => "DATA after END_STREAM",
         }
     }
 }

@@ -22,6 +22,24 @@ impl StreamWindow {
         self.to_send.set(credited);
         Ok(())
     }
+
+    /// §6.9.1: a DATA frame debits the receive window by its *padded* length,
+    /// pad-length byte and padding included. Dropping below zero means the
+    /// peer sent past the credit we gave it.
+    ///
+    /// §6.9.2 carves out one exception we do not need: a receiver that has
+    /// just shrunk its window must tolerate an overrun in flight. We never
+    /// send SETTINGS_INITIAL_WINDOW_SIZE, so an overrun here is always real.
+    pub fn recv(&self, padded_len: u32) -> Result<(), ()> {
+        let debited = self
+            .to_recv
+            .get()
+            .checked_sub_unsigned(padded_len)
+            .filter(|remaining| *remaining >= 0)
+            .ok_or(())?;
+        self.to_recv.set(debited);
+        Ok(())
+    }
 }
 
 impl From<&Settings> for StreamWindow {
