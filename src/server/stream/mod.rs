@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::task::Waker;
+use std::task::{Poll, Waker};
 
 use http::header;
 
@@ -179,6 +179,108 @@ impl Stream {
     /// The trailers, once and only once — the task's to take after the body.
     pub fn take_trailers(&self) -> Option<Box<Headers>> {
         self.trailers.take()
+    }
+
+    /// Which of the two body contracts this request falls under, decided by
+    /// its `content-length` when the stream was created: `true` for the one
+    /// delivered whole by [`Stream::body`], `false` for the one drained
+    /// through [`Stream::readable`], [`Stream::peek`] and
+    /// [`Stream::consume`]. A request with no body counts as the first, and
+    /// `body` answers `None` for it.
+    pub fn body_is_oneshot(&self) -> bool {
+        self.input
+            .borrow()
+            .as_ref()
+            .is_none_or(|input| !input.wakes_per_frame())
+    }
+
+    /// The whole body, once it is whole.
+    ///
+    /// Resolves at END_STREAM and not before — nothing is handed over in
+    /// pieces, so no credit is handed back in pieces either, and the peer
+    /// gets no WINDOW_UPDATE until the stream retires. That is what bounds
+    /// this form: `BUFFER_ONESHOT_LIMIT` is small enough that every stream
+    /// accumulating at once still fits in the connection window, which is
+    /// the static assertion in `input_data`.
+    ///
+    /// `None` when the request carried no body, or when it is large enough
+    /// that it has to be drained instead — [`Stream::body_is_oneshot`] is
+    /// what tells the two apart beforehand.
+    pub fn body(&self) -> impl Future<Output = Option<Box<[u8]>>> {
+        std::future::poll_fn(move |cx| {
+            // Incomplete: the peer's half is still open, so more is coming.
+            if !self.no_more_input.get() {
+                self.register_waker(cx.waker());
+                return Poll::Pending;
+            }
+            Poll::Ready(
+                self.input
+                    .borrow_mut()
+                    .take()
+                    .and_then(InputData::into_oneshot),
+            )
+        })
+    }
+
+    /// Waits until the body has bytes to take, or has ended.
+    ///
+    /// `false` is the end: the peer's half is closed and the buffer is
+    /// drained, so no further [`Stream::peek`] will ever show anything. A
+    /// body that ended with bytes still buffered answers `true` until they
+    /// are consumed.
+    pub fn readable(&self) -> impl Future<Output = bool> {
+        std::future::poll_fn(move |cx| {
+            if self.available_len() > 0 {
+                return Poll::Ready(true);
+            }
+            if self.no_more_input.get() {
+                return Poll::Ready(false);
+            }
+            self.register_waker(cx.waker());
+            Poll::Pending
+        })
+    }
+
+    /// Shows what is buffered without consuming it. The slice borrows the
+    /// stream's buffer, hence the closure: nothing may hold it across the
+    /// `await` that would let the connection push more in.
+    pub fn peek<R>(&self, with: impl FnOnce(&[u8]) -> R) -> R {
+        let input = self.input.borrow();
+        with(input.as_ref().map_or(&[][..], InputData::available))
+    }
+
+    /// Takes the `n` leading bytes the handler is done with, and says how
+    /// many that was — `n` clamped to what is actually there.
+    ///
+    /// Only the bookkeeping: the credit those bytes were holding is now owed
+    /// back to the peer, and `SharedConnection::consume` is what turns it
+    /// into WINDOW_UPDATE frames, being the half that can write.
+    pub fn consume(&self, n: usize) -> u32 {
+        let mut input = self.input.borrow_mut();
+        let Some(input) = input.as_mut() else {
+            return 0;
+        };
+        let n = n.min(input.available().len());
+        input.consume(n);
+        // Held credit, so bounded by the receive window and by `unreleased`
+        // itself, which counts the same bytes.
+        self.unreleased.set(self.unreleased.get() - n as u32);
+        n as u32
+    }
+
+    /// Credit owed back to the peer on *this stream* for consumed bytes.
+    /// `Some` is the amount to announce, already credited here, so the
+    /// caller must write the frame that carries it.
+    #[must_use]
+    pub fn release_recv(&self, len: u32) -> Option<u32> {
+        self.window.release_recv(len)
+    }
+
+    fn available_len(&self) -> usize {
+        self.input
+            .borrow()
+            .as_ref()
+            .map_or(0, |input| input.available().len())
     }
 
     /// Takes one DATA payload, already stripped of its padding.

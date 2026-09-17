@@ -92,4 +92,40 @@ impl InputData {
     pub fn wakes_per_frame(&self) -> bool {
         !matches!(self, Self::Capped { .. })
     }
+
+    /// What the handler may take right now.
+    ///
+    /// Always empty for `Capped`: that form is delivered whole or not at
+    /// all, which is exactly what lets it issue no WINDOW_UPDATE while it
+    /// fills — it never hands back credit mid-body because it never hands
+    /// back bytes mid-body. Its receive window is meant to be spent down to
+    /// the end of the body and no further.
+    pub fn available(&self) -> &[u8] {
+        match self {
+            Self::Capped { .. } => &[],
+            Self::BufferedCapped { data, .. } | Self::Uncapped { data } => data,
+        }
+    }
+
+    /// Drops the `n` leading bytes the handler has taken.
+    ///
+    /// A no-op on `Capped`, whose `push` writes at an absolute offset that
+    /// removing the front would shift out from under it — and which has
+    /// nothing to consume before the end anyway.
+    pub fn consume(&mut self, n: usize) {
+        match self {
+            Self::Capped { .. } => {}
+            Self::BufferedCapped { data, .. } | Self::Uncapped { data } => {
+                data.drain(..n);
+            }
+        }
+    }
+
+    /// The whole body, for the form that is delivered in one piece.
+    pub fn into_oneshot(self) -> Option<Box<[u8]>> {
+        match self {
+            Self::Capped { data } => Some(data),
+            _ => None,
+        }
+    }
 }

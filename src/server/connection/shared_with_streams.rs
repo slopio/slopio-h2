@@ -3,19 +3,24 @@ use std::task::{Poll, Waker};
 
 use http::{HeaderMap, StatusCode};
 
-use crate::server::connection::CONNECTION_INITIAL_WINDOW_SIZE;
 use crate::server::connection::output::Output;
+use crate::server::connection::{CONNECTION_INITIAL_WINDOW_SIZE, CONNECTION_RECV_WINDOW};
 use crate::server::stream::Stream;
 use crate::shared::{
     codec::frames::{
         encode::{
             encode_continuation_header, encode_data_header, encode_headers_fragment_header,
-            encode_headers_header,
+            encode_headers_header, encode_window_update,
         },
         stream_id::StreamId,
     },
     hpack::{Encoder, Header},
 };
+
+/// Credit owed back to the peer before a WINDOW_UPDATE on stream 0 goes out.
+/// Half the window, as at stream level: the peer keeps the other half to
+/// spend while our frame is in flight, so it never stalls on our silence.
+const CONNECTION_RELEASE_THRESHOLD: u32 = CONNECTION_RECV_WINDOW / 2;
 
 pub struct SharedConnection {
     /// Connection-level by definition: every header block on the connection
@@ -112,11 +117,25 @@ impl ConnectionWindow {
         Ok(())
     }
 
-    /// Credit owed back to the peer for bytes no application will ever read.
+    /// Credit owed back to the peer: for bytes no application will ever read
+    /// — padding, or what a departing stream still held — and for body bytes
+    /// a handler has consumed.
+    ///
     /// Accumulated rather than sent, so that a WINDOW_UPDATE goes out once a
-    /// worthwhile amount has piled up instead of once per DATA frame.
-    pub fn release(&self, len: u32) {
-        self.pending_release.set(self.pending_release.get() + len);
+    /// worthwhile amount has piled up instead of once per DATA frame. `Some`
+    /// is that amount, credited here in the same breath, so the caller must
+    /// write the frame it is handed — the ledger must never say more than
+    /// the wire.
+    #[must_use]
+    pub fn release(&self, len: u32) -> Option<u32> {
+        let pending = self.pending_release.get() + len;
+        if pending < CONNECTION_RELEASE_THRESHOLD {
+            self.pending_release.set(pending);
+            return None;
+        }
+        self.pending_release.set(0);
+        self.to_recv.set(self.to_recv.get() + pending as i32);
+        Some(pending)
     }
 }
 
@@ -292,6 +311,28 @@ impl SharedConnection {
                 }
             }
         })
+    }
+
+    /// Takes `n` body bytes off the stream on the handler's behalf and gives
+    /// the peer back the credit they were holding — on the stream and on the
+    /// connection both, §6.9.1 having debited both when they arrived.
+    ///
+    /// Here rather than on `Stream` for the same reason `write_data` is: it
+    /// has to write frames, and the stream half cannot. Nothing goes out
+    /// until a worthwhile amount has piled up at either level, so a handler
+    /// taking a few bytes at a time does not answer every DATA frame with a
+    /// WINDOW_UPDATE of its own.
+    pub fn consume(&self, stream_id: StreamId, stream: &Stream, n: usize) {
+        let taken = stream.consume(n);
+        if taken == 0 {
+            return;
+        }
+        if let Some(increment) = stream.release_recv(taken) {
+            self.write_frame(|out| encode_window_update(out, stream_id, increment));
+        }
+        if let Some(increment) = self.window.release(taken) {
+            self.write_frame(|out| encode_window_update(out, StreamId::ZERO, increment));
+        }
     }
 
     /// Everything written since the last flush, as one gather write. The

@@ -4,9 +4,17 @@ use crate::server::connection::settings::Settings;
 
 pub const LOCAL_INITIAL_WINDOW_SIZE: u32 = 65_535;
 
+/// Credit a handler has consumed before a WINDOW_UPDATE goes out for it.
+/// Half the window: rare enough not to answer every DATA frame with a frame
+/// of our own, early enough that the peer never runs out of credit waiting
+/// for us.
+const RELEASE_THRESHOLD: u32 = LOCAL_INITIAL_WINDOW_SIZE / 2;
+
 pub struct StreamWindow {
     to_send: Cell<i32>,
     to_recv: Cell<i32>,
+    /// Consumed by the handler and owed back to the peer, not yet announced.
+    pending_release: Cell<u32>,
 }
 
 impl StreamWindow {
@@ -53,6 +61,25 @@ impl StreamWindow {
         Ok(())
     }
 
+    /// Credit owed back to the peer for body bytes the handler has taken.
+    /// Accumulated rather than announced one DATA frame at a time; `Some` is
+    /// the amount that has piled up and is worth a frame.
+    ///
+    /// The window is credited here, in the same breath, so the caller *must*
+    /// write the WINDOW_UPDATE it is handed: the ledger would otherwise say
+    /// more than the wire, which is the one thing §6.9 cannot forgive.
+    #[must_use]
+    pub fn release_recv(&self, len: u32) -> Option<u32> {
+        let pending = self.pending_release.get() + len;
+        if pending < RELEASE_THRESHOLD {
+            self.pending_release.set(pending);
+            return None;
+        }
+        self.pending_release.set(0);
+        self.to_recv.set(self.to_recv.get() + pending as i32);
+        Some(pending)
+    }
+
     /// §6.9.1: a DATA frame debits the receive window by its *padded* length,
     /// pad-length byte and padding included. Dropping below zero means the
     /// peer sent past the credit we gave it.
@@ -79,6 +106,7 @@ impl From<&Settings> for StreamWindow {
         Self {
             to_send: Cell::new(peer.initial_window_size as i32),
             to_recv: Cell::new(LOCAL_INITIAL_WINDOW_SIZE as i32),
+            pending_release: Cell::new(0),
         }
     }
 }

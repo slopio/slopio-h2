@@ -190,7 +190,7 @@ impl Streams {
             if !stream.is_closed() {
                 return true;
             }
-            shared.window.release(stream.take_unreleased());
+            release_connection_credit(shared, stream.take_unreleased());
             false
         });
     }
@@ -207,7 +207,7 @@ impl Streams {
         let (stream, handle) = self.streams.remove(&id)?;
         handle.kill();
         // Body bytes the task never consumed still hold connection credit.
-        shared.window.release(stream.take_unreleased());
+        release_connection_credit(shared, stream.take_unreleased());
         Some(stream)
     }
 
@@ -389,6 +389,16 @@ impl Protocol {
     }
 }
 
+/// Hands the peer back connection-level credit for bytes that reached no
+/// handler — padding, and whatever a departing stream still held — writing
+/// the WINDOW_UPDATE on stream 0 when enough has piled up. The frame goes
+/// out beside the ledger entry, never after it.
+fn release_connection_credit(shared: &SharedConnection, len: u32) {
+    if let Some(increment) = shared.window.release(len) {
+        shared.write_frame(|out| encode_window_update(out, StreamId::ZERO, increment));
+    }
+}
+
 /// §8.1.2.1/.3/.6: `:method` and `:scheme` are required, `:path` non-empty,
 /// and no `:status` (a response pseudo-header).
 fn is_malformed_request(headers: &Headers) -> bool {
@@ -408,10 +418,28 @@ fn is_malformed_request(headers: &Headers) -> bool {
 /// catch task panics.
 /// The placeholder handler: `200` and a fixed body, whatever the request.
 async fn handle_stream(shared: Rc<SharedConnection>, stream: Rc<Stream>, id: StreamId) {
-    const BODY: &[u8] = b"hello world";
+    // The two body contracts, picked by the request's `content-length`.
+    let received = match stream.body_is_oneshot() {
+        // Small enough to hold: wait for all of it, take it in one piece.
+        // No credit goes back while it fills — that is what this form buys.
+        true => stream.body().await.map_or(0, |body| body.len()),
+        // Too large, or of unknown length: drained as it arrives. Taking
+        // bytes is what hands the peer its credit back, so a handler that
+        // stops taking is a handler that stops the upload.
+        false => {
+            let mut total = 0;
+            while stream.readable().await {
+                let taken = stream.peek(|bytes| bytes.len());
+                shared.consume(id, &stream, taken);
+                total += taken;
+            }
+            total
+        }
+    };
 
+    let body = format!("read {received} bytes\n");
     shared.write_headers(id, StatusCode::OK, &HeaderMap::new(), false);
-    shared.write_data(id, &stream, BODY, true).await;
+    shared.write_data(id, &stream, body.as_bytes(), true).await;
     stream.end_output();
 }
 
@@ -444,10 +472,13 @@ impl FrameHandler for Protocol {
         // all of it is. Either way it goes back now — release only what a
         // handler consumes and the window shrinks by the padding for good,
         // until the connection stalls with nothing to show for it.
-        self.shared.window.release(match received {
-            Ok(()) => padded_len - payload.len() as u32,
-            Err(_) => padded_len,
-        });
+        release_connection_credit(
+            &self.shared,
+            match received {
+                Ok(()) => padded_len - payload.len() as u32,
+                Err(_) => padded_len,
+            },
+        );
 
         if let Err(rejected) = received {
             self.reject(stream_id, rejected);
