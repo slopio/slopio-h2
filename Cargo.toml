@@ -8,5 +8,6 @@ bytes = "1"
 fnv = "1"
 http = "1"
 runtime = { git = "ssh://git@github.com/saucisoupe/runtime.git", version = "0.1.0" }
+runtime-streams = { git = "ssh://git@github.com/saucisoupe/runtime.git" }
 rustc-hash = "2.1.3"
 zerocopy = { version = "0.8", features = ["derive"] }

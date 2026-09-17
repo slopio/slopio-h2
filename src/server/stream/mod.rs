@@ -16,13 +16,35 @@ mod stream_window;
 
 /// Reached only through an `Rc` shared with the stream task, so everything the
 /// connection mutates while a frame is being decoded lives behind a `Cell`.
+///
+/// A stream has two halves that close independently (§5.1): the peer's, by
+/// its END_STREAM on DATA or trailers, and ours, by the END_STREAM of our
+/// response. `no_more_input` and `no_more_output` track them one each;
+/// both set is the closed state the sweep retires.
 pub struct Stream {
     header: Box<Headers>,
-    state: Cell<StreamState>,
+    /// §8.1: the trailers, if the request had any. Written once by the
+    /// connection at END_STREAM, taken once by the task after the body. The
+    /// decoder's own `Box`, kept as is: 8 bytes per stream for something
+    /// almost no request carries.
+    trailers: Cell<Option<Box<Headers>>>,
+    /// The peer's half is done: its END_STREAM came, on the HEADERS, a DATA
+    /// or the trailers. Half-closed(remote) from here on — DATA or HEADERS
+    /// after it is a frame on a stream that, from its side, no longer
+    /// exists.
+    no_more_input: Cell<bool>,
+    /// Our half is done: the response is written, END_STREAM included. Says
+    /// nothing about the peer's half — the stream is half-closed(local), and
+    /// §5.1 still lets the peer send its body.
+    no_more_output: Cell<bool>,
     input: RefCell<Option<InputData>>,
     /// Body bytes taken so far, padding excluded. Doubles as the write cursor
     /// of a pre-allocated buffer.
     received: Cell<u64>,
+    /// Body bytes taken from the connection window and not yet consumed by
+    /// the task — still holding credit. Whatever is left when the stream
+    /// goes must be given back, or the connection window shrinks for good.
+    unreleased: Cell<u32>,
     window: StreamWindow,
     waker: RefCell<Option<Waker>>,
 }
@@ -54,19 +76,53 @@ impl Stream {
         Ok(Self {
             window: StreamWindow::from(settings),
             header,
-            state: Cell::new(if end_stream {
-                StreamState::InputClosed
-            } else {
-                StreamState::Normal
-            }),
+            trailers: Cell::new(None),
+            no_more_input: Cell::new(end_stream),
+            no_more_output: Cell::new(false),
             input: RefCell::new(input),
             received: Cell::new(0),
+            unreleased: Cell::new(0),
             waker: RefCell::new(None),
         })
     }
 
+    /// A WINDOW_UPDATE on this stream. The task may be waiting on exactly
+    /// this, so it is woken; it re-checks the window itself.
     pub fn credit_send(&self, increment: u32) -> Result<(), ()> {
-        self.window.credit_send(increment)
+        self.window.credit_send(increment)?;
+        self.wake();
+        Ok(())
+    }
+
+    /// §6.9.2: the peer's initial window changed. Woken only when the change
+    /// opens room — a shrink has nothing to offer a waiting task.
+    pub fn adjust_send(&self, delta: i32) -> Result<(), ()> {
+        self.window.adjust_send(delta)?;
+        if delta > 0 {
+            self.wake();
+        }
+        Ok(())
+    }
+
+    /// What a DATA frame may still spend on this stream.
+    pub fn available_send(&self) -> u32 {
+        self.window.available_send()
+    }
+
+    /// Debits the send window for a DATA frame of ours. `Err` is the peer's
+    /// credit running short, with nothing debited.
+    pub fn debit_send(&self, len: u32) -> Result<(), ()> {
+        self.window.debit_send(len)
+    }
+
+    /// The task parks here, on whatever it waits for — body bytes, a
+    /// WINDOW_UPDATE. One slot: a stream has one task, and that task waits
+    /// on one thing at a time. Whoever wakes it, it re-checks its condition.
+    pub fn register_waker(&self, waker: &Waker) {
+        let mut slot = self.waker.borrow_mut();
+        if !slot.as_ref().is_some_and(|w| w.will_wake(waker)) {
+            *slot = Some(waker.clone());
+        }
     }
 
     /// Debits the receive window. Split from `recv_data` because an overrun
@@ -75,14 +131,62 @@ impl Stream {
         self.window.recv(padded_len)
     }
 
+    /// Connection credit this stream still holds, zeroed on the way out so
+    /// it can only be given back once.
+    pub fn take_unreleased(&self) -> u32 {
+        self.unreleased.replace(0)
+    }
+
+    /// The task has written its whole response. Only our half: the stream
+    /// leaves the map once the peer's half is closed too.
+    pub fn end_output(&self) {
+        self.no_more_output.set(true);
+    }
+
+    /// Both halves done — what the sweep retires. A task that answered
+    /// before the peer finished sending keeps the stream here until its
+    /// END_STREAM, or a reset, arrives; §8.1 lets us hurry that along with
+    /// a RST_STREAM(NO_ERROR) after a complete response, later.
+    pub fn is_closed(&self) -> bool {
+        self.no_more_output.get() && self.no_more_input.get()
+    }
+
+    /// Takes the second and last HEADERS of a request (§8.1). Ends the input
+    /// exactly as END_STREAM on DATA does, with the same final check.
+    pub fn recv_trailers(&self, headers: Box<Headers>) -> Result<(), StreamViolation> {
+        if self.no_more_input.get() {
+            return Err(StreamViolation::DataAfterEndStream);
+        }
+
+        // §8.1: trailers end the message, so they carry END_STREAM; §8.3: no
+        // pseudo-header may appear in them.
+        if !headers.is_end_stream() || has_pseudo(&headers) {
+            return Err(StreamViolation::MalformedTrailers);
+        }
+
+        // §8.1.1: the body must add up to exactly what was declared.
+        let declared = self.input.borrow().as_ref().and_then(InputData::expected);
+        if declared.is_some_and(|declared| self.received.get() != declared) {
+            return Err(StreamViolation::ContentLengthMismatch);
+        }
+
+        self.trailers.set(Some(headers));
+        self.no_more_input.set(true);
+        self.wake();
+        Ok(())
+    }
+
+    /// The trailers, once and only once — the task's to take after the body.
+    pub fn take_trailers(&self) -> Option<Box<Headers>> {
+        self.trailers.take()
+    }
+
     /// Takes one DATA payload, already stripped of its padding.
     ///
     /// The length that matters here is `payload.len()`, never the padded one:
     /// flow control accounts for padding, `content-length` does not.
     pub fn recv_data(&self, payload: &[u8], end_stream: bool) -> Result<(), StreamViolation> {
-        // §5.1: END_STREAM closed the peer's half; anything after it is a
-        // frame on a stream that, from its side, no longer exists.
-        if self.state.get() == StreamState::InputClosed {
+        if self.no_more_input.get() {
             return Err(StreamViolation::DataAfterEndStream);
         }
 
@@ -94,7 +198,7 @@ impl Stream {
                 return Err(StreamViolation::ContentLengthMismatch);
             }
             if end_stream {
-                self.state.set(StreamState::InputClosed);
+                self.no_more_input.set(true);
                 self.wake();
             }
             return Ok(());
@@ -110,6 +214,9 @@ impl Stream {
 
         input.push(at, payload);
         self.received.set(received);
+        // Bounded by the receive window, so it cannot outgrow a u32.
+        self.unreleased
+            .set(self.unreleased.get() + payload.len() as u32);
 
         if end_stream {
             // §8.1.1: and the body must add up to exactly what was declared.
@@ -119,7 +226,7 @@ impl Stream {
             {
                 return Err(StreamViolation::ContentLengthMismatch);
             }
-            self.state.set(StreamState::InputClosed);
+            self.no_more_input.set(true);
         }
 
         // A body held whole is worth waking for only once; a drained one has
@@ -169,8 +276,13 @@ fn content_length(headers: &Headers) -> Result<Option<u64>, ()> {
     Ok(declared)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum StreamState {
-    Normal,
-    InputClosed,
+/// §8.3: a pseudo-header field anywhere in a trailer section.
+fn has_pseudo(headers: &Headers) -> bool {
+    let p = headers.pseudo();
+    p.method.is_some()
+        || p.scheme.is_some()
+        || p.authority.is_some()
+        || p.path.is_some()
+        || p.protocol.is_some()
+        || p.status.is_some()
 }

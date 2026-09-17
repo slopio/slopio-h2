@@ -10,6 +10,22 @@ pub struct StreamWindow {
 }
 
 impl StreamWindow {
+    /// What a DATA frame may still spend on this stream. A negative window
+    /// — a shrinking SETTINGS may have put it there — is no credit at all.
+    pub fn available_send(&self) -> u32 {
+        self.to_send.get().max(0) as u32
+    }
+
+    /// §6.9.2: the peer's SETTINGS_INITIAL_WINDOW_SIZE changed by `delta`,
+    /// and every live stream's send window moves with it — below zero if
+    /// need be, which only means waiting for WINDOW_UPDATE. Going past
+    /// 2^31-1 is a connection error.
+    pub fn adjust_send(&self, delta: i32) -> Result<(), ()> {
+        let adjusted = self.to_send.get().checked_add(delta).ok_or(())?;
+        self.to_send.set(adjusted);
+        Ok(())
+    }
+
     /// §6.9.1: going past 2^31-1 is an error, and `i32::MAX` is exactly that
     /// bound. The window can be negative — a shrinking SETTINGS may have put
     /// it there.
@@ -20,6 +36,20 @@ impl StreamWindow {
             .checked_add_unsigned(increment)
             .ok_or(())?;
         self.to_send.set(credited);
+        Ok(())
+    }
+
+    /// §6.9.1: a DATA frame we send debits this window by its payload length.
+    /// `Err` is the peer's credit running short: the frame must not go out,
+    /// and nothing is debited.
+    pub fn debit_send(&self, len: u32) -> Result<(), ()> {
+        let debited = self
+            .to_send
+            .get()
+            .checked_sub_unsigned(len)
+            .filter(|remaining| *remaining >= 0)
+            .ok_or(())?;
+        self.to_send.set(debited);
         Ok(())
     }
 

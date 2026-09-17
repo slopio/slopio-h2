@@ -184,6 +184,7 @@ dependencies = [
  "fnv",
  "http",
  "runtime",
+ "runtime-streams",
  "rustc-hash",
  "zerocopy",
 ]

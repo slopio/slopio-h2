@@ -5,16 +5,13 @@
 //! `Settings::apply` parses and validates a peer's SETTINGS frame. Everything
 //! downstream of that is missing, so the list below is deliberately long.
 //!
-//! ## Received but not applied
+//! ## Applied
 //!
-//! - **`INITIAL_WINDOW_SIZE` (0x04)** — neither applied nor stored. §6.9.2
-//!   makes it retroactive: it shifts the send window of *every live stream* by
-//!   `new - old`, which may drive a window negative, and may overflow 2^31-1
-//!   (a connection `FLOW_CONTROL_ERROR`). Storing the value without walking
-//!   the stream map would desync our ledger from the peer's, so it is skipped
-//!   whole. Until this lands, a peer that *shrinks* the window will see us
-//!   send past its credit and answer `FLOW_CONTROL_ERROR`. This is the only
-//!   gap here with a visible effect on the wire.
+//! - **`INITIAL_WINDOW_SIZE` (0x04)** — stored here, and §6.9.2's retroactive
+//!   shift of every live stream's send window by `new - old` is done by
+//!   `Protocol::on_settings`, which has the stream map. A window may go
+//!   negative that way; overflowing 2^31-1 is a connection
+//!   `FLOW_CONTROL_ERROR`.
 //!
 //! ## Stored but not honoured
 //!
@@ -60,7 +57,7 @@
 
 use crate::shared::codec::{
     frames::DEFAULT_MAX_FRAME_SIZE,
-    types::{PROTOCOL_ERROR, Setting},
+    types::{FLOW_CONTROL_ERROR, PROTOCOL_ERROR, Setting},
 };
 
 pub struct Settings {
@@ -107,12 +104,20 @@ impl Settings {
             // telling us to open nothing more.
             Setting::MaxConcurrentStreams(value) => self.max_concurrent_streams = Some(value),
 
-            // TODO: §6.9.2 makes this one retroactive — it shifts the send
-            // window of every live stream by `value - initial_window_size`,
-            // which needs the stream map, and overflowing 2^31-1 there is a
-            // FLOW_CONTROL_ERROR. Deliberately left unapplied until then:
-            // storing it alone would desync our window ledger from the peer's.
-            Setting::InitialWindowSize(_) => {}
+            // §6.5.2: capped at 2^31-1, and the code for going past it is
+            // FLOW_CONTROL_ERROR, not PROTOCOL_ERROR. Only the new value is
+            // stored here; §6.9.2 makes it retroactive on every live stream,
+            // and that walk is the connection's, from the change in this
+            // field before and after the frame.
+            Setting::InitialWindowSize(value) => {
+                if value > i32::MAX as u32 {
+                    return Err(InvalidSetting {
+                        code: FLOW_CONTROL_ERROR,
+                        message: "INITIAL_WINDOW_SIZE above 2^31-1",
+                    });
+                }
+                self.initial_window_size = value;
+            }
 
             Setting::MaxFrameSize(value) => {
                 // §6.5.2: confined to [2^14, 2^24-1].
