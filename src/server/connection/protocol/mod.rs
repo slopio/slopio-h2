@@ -11,8 +11,8 @@ use crate::shared::codec::{
     frames::{
         DECODE_MAX_HEADER_LIST_SIZE, FrameHandler, FrameKind, SettingsIter,
         encode::{
-            encode_goaway, encode_ping, encode_rst_stream, encode_settings,
-            encode_settings_ack, encode_window_update,
+            encode_goaway, encode_ping, encode_rst_stream, encode_settings, encode_settings_ack,
+            encode_window_update,
         },
         headers::Headers,
         stream_id::StreamId,
@@ -220,6 +220,27 @@ impl Streams {
         stream
             .credit_send(increment)
             .map_err(|()| Rejected::Violation(StreamViolation::StreamWindowOverflow))
+    }
+}
+
+impl Drop for Streams {
+    /// A handle merely *dropped* is a task detached, not stopped: it keeps
+    /// its `Rc<SharedConnection>` alive, writes into an output no one will
+    /// ever flush again, parks on the high-water mark, and is never woken —
+    /// so it is never dropped either, and the whole connection state leaks
+    /// with it. The connection therefore kills its streams on the way out.
+    ///
+    /// Only the bounded output makes this fatal: against a buffer that grew
+    /// without limit, an orphaned writer ran to the end of its body and
+    /// retired itself.
+    ///
+    /// Safe for the same reason [`Streams::remove`] is: the one task running
+    /// is the connection's, so no stream task holds a borrow or a
+    /// half-written frame.
+    fn drop(&mut self) {
+        for (_, (_, handle)) in self.streams.drain() {
+            handle.kill();
+        }
     }
 }
 
@@ -509,7 +530,8 @@ impl FrameHandler for Protocol {
         if ack {
             return;
         }
-        self.shared.write_frame(|out| encode_ping(out, opaque, true));
+        self.shared
+            .write_frame(|out| encode_ping(out, opaque, true));
     }
 
     /// The peer is leaving: `NO_ERROR` is a graceful shutdown, anything else

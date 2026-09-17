@@ -4,6 +4,7 @@ use std::task::{Poll, Waker};
 use http::{HeaderMap, StatusCode};
 
 use crate::server::connection::CONNECTION_INITIAL_WINDOW_SIZE;
+use crate::server::connection::output::Output;
 use crate::server::stream::Stream;
 use crate::shared::{
     codec::frames::{
@@ -28,8 +29,10 @@ pub struct SharedConnection {
     /// neither side alone says whether a write can go out.
     pub window: ConnectionWindow,
     /// Every frame — the connection's and every stream task's — in the order
-    /// it was written. Sent whole once per turn of the connection loop.
-    output: RefCell<Vec<u8>>,
+    /// it was written, in segments of a fixed size. Sent as one gather write
+    /// once per turn of the connection loop, and bounded: past
+    /// `OUTPUT_HIGH_WATER` a body writer waits for a flush.
+    output: RefCell<Output>,
 }
 
 /// Reached through the `Rc` every stream task holds, so its counters live
@@ -134,7 +137,7 @@ impl SharedConnection {
                 pending_release: Cell::new(0),
                 send_waiters: RefCell::new(Vec::new()),
             },
-            output: RefCell::new(Vec::new()),
+            output: RefCell::new(Output::new()),
         }
     }
 
@@ -142,14 +145,15 @@ impl SharedConnection {
     ///
     /// The borrow is held for the whole call, so nothing can land between a
     /// frame's header and its payload — and a header block, CONTINUATIONs
-    /// included, goes out whole, as §6.10 requires. Callers pass the matching
+    /// included, goes out whole, as §6.10 requires. The frame lands in one
+    /// output segment for the same reason. Callers pass the matching
     /// `encode_*` from the codec:
     ///
     /// ```ignore
     /// shared.write_frame(|out| encode_rst_stream(out, stream_id, CANCEL));
     /// ```
     pub fn write_frame(&self, encode: impl FnOnce(&mut Vec<u8>)) {
-        encode(&mut self.output.borrow_mut());
+        self.output.borrow_mut().write(encode);
     }
 
     /// Writes a response head, split over CONTINUATION frames when the
@@ -168,12 +172,13 @@ impl SharedConnection {
         end_stream: bool,
     ) {
         // §8.3: the response pseudo-header comes before every ordinary field.
-        let headers = std::iter::once(Header::Status(status)).chain(fields.iter().map(
-            |(name, value)| Header::Field {
-                name: Some(name.clone()),
-                value: value.clone(),
-            },
-        ));
+        let headers =
+            std::iter::once(Header::Status(status)).chain(fields.iter().map(|(name, value)| {
+                Header::Field {
+                    name: Some(name.clone()),
+                    value: value.clone(),
+                }
+            }));
         let mut block = Vec::new();
         self.encoder.borrow_mut().encode(headers, &mut block);
 
@@ -209,11 +214,13 @@ impl SharedConnection {
     ///
     /// §6.9.1: every frame is debited from the stream's send window and the
     /// connection's, and is cut to what both allow, bounded by the peer's
-    /// `max_frame_size`. With no credit at all the task parks on both
-    /// windows and resumes on the next WINDOW_UPDATE, or a SETTINGS that
-    /// widens the initial window (§6.9.2). Whatever is written before a park
-    /// stays written: a body goes out in as many frames as the credit came
-    /// in.
+    /// `max_frame_size` — and by the room left in the output, which is the
+    /// one of the four bounds that is ours rather than the peer's. With no
+    /// credit at all the task parks on both windows and resumes on the next
+    /// WINDOW_UPDATE, or a SETTINGS that widens the initial window (§6.9.2);
+    /// with no room it parks on the output and resumes once a flush has sent
+    /// what was queued. Whatever is written before a park stays written: a
+    /// body goes out in as many frames as the credit and the room came in.
     ///
     /// Cancel-safe in the only way that matters: the future is dropped when
     /// the stream is reset, and a half-written body on a reset stream is
@@ -241,18 +248,28 @@ impl SharedConnection {
                     return Poll::Ready(());
                 }
 
+                let credit = stream.available_send().min(self.window.available_send()) as usize;
+                let room = self.output.borrow().data_room();
                 let quota = remaining
                     .len()
                     .min(self.max_frame_size.get() as usize)
-                    .min(stream.available_send() as usize)
-                    .min(self.window.available_send() as usize);
+                    .min(credit)
+                    .min(room);
 
                 if quota == 0 {
-                    // Parked on both: either may be the one that is empty,
-                    // and either may be the one that fills first. A wake
-                    // from the other is one wasted poll, nothing more.
-                    stream.register_waker(cx.waker());
-                    self.window.wait_send(cx.waker());
+                    // Credit and room open on different events — a
+                    // WINDOW_UPDATE and a flush — so a writer out of both
+                    // waits for both. Within the credit, either window may
+                    // be the empty one and either may fill first, so that
+                    // park is on both as well. A wake from something that
+                    // was not the blocker is one wasted poll, nothing more.
+                    if credit == 0 {
+                        stream.register_waker(cx.waker());
+                        self.window.wait_send(cx.waker());
+                    }
+                    if room == 0 {
+                        self.output.borrow_mut().wait_room(cx.waker());
+                    }
                     return Poll::Pending;
                 }
 
@@ -277,19 +294,26 @@ impl SharedConnection {
         })
     }
 
-    /// Everything written since the last flush. The buffer is owed back to
-    /// `restore_output` once sent, so its capacity is not lost.
-    pub(crate) fn take_output(&self) -> Vec<u8> {
-        std::mem::take(&mut self.output.borrow_mut())
+    /// Everything written since the last flush, as one gather write. The
+    /// segments are owed back to `restore_output` once sent: they stay
+    /// counted against the high-water mark until they are, and the writers
+    /// waiting on that room are woken there.
+    pub(crate) fn take_output(&self) -> Vec<Vec<u8>> {
+        self.output.borrow_mut().take()
     }
 
-    /// Takes a sent buffer back, and with it whatever was written while it
-    /// was in flight — kept, at the front of the freed capacity.
-    pub(crate) fn restore_output(&self, mut buf: Vec<u8>) {
-        buf.clear();
-        let mut output = self.output.borrow_mut();
-        buf.extend_from_slice(&output);
-        *output = buf;
+    /// Takes the sent segments back. Whatever a task wrote while they were
+    /// in flight is already the next link of the chain — there is nothing
+    /// to move.
+    pub(crate) fn restore_output(&self, sent: Vec<Vec<u8>>) {
+        self.output.borrow_mut().restore(sent);
+    }
+
+    /// Nothing queued to send. The connection loop drains until this holds:
+    /// with a bounded output, a task may be parked waiting for room, and
+    /// only a flush gives it any.
+    pub(crate) fn output_is_empty(&self) -> bool {
+        self.output.borrow().is_empty()
     }
 
     /// Takes the peer's new `SETTINGS_MAX_FRAME_SIZE`.

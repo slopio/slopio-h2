@@ -4,6 +4,7 @@ use crate::server::connection::protocol::Protocol;
 use crate::shared::{codec::frames::FrameDecoder, transport::Transport};
 use runtime_streams::StreamExt;
 
+mod output;
 mod protocol;
 pub(crate) mod settings;
 mod shared_with_streams;
@@ -53,25 +54,42 @@ impl<T: Transport> Connection<T> {
                 }
                 Some(Ok(())) => {}
             }
-            if self.flush().await.is_err() {
+            if self.drain().await.is_err() {
                 return;
             }
-            // The tasks this turn spawned or woke have not run yet — they
-            // only do once we yield. Let them, retire the ones that finished,
-            // and send what they wrote. A select on "output ready" is what
-            // replaces this, later.
-            runtime::yield_now().await;
-            self.protocol.sweep();
-            if self.flush().await.is_err() {
-                return;
-            }
-            // The flushes above carried the GOAWAY, if there was one. An
-            // invalid preface queued nothing, so it closed in silence (§3.4).
+            // The drain carried the GOAWAY, if there was one. An invalid
+            // preface queued nothing, so it closed in silence (§3.4).
             if self.is_closing() {
                 return;
             }
         }
-        let _ = self.flush().await;
+        let _ = self.drain().await;
+    }
+
+    /// Sends what this turn produced, and keeps sending while the tasks it
+    /// woke keep writing. Returns once they have nothing more: done, or
+    /// parked on flow control.
+    ///
+    /// One flush is not enough now that the output is bounded — a task may
+    /// have parked on a full buffer, and a flush is the only thing that
+    /// gives it room again, so the loop has to come back for what it wrote
+    /// next. A response larger than `OUTPUT_HIGH_WATER` therefore leaves in
+    /// several sends before we read again, where it used to be buffered
+    /// whole and sent in one: the same starvation of `recv` as before, for
+    /// bounded memory. A select on "output ready" is what unties the two,
+    /// later.
+    async fn drain(&mut self) -> io::Result<()> {
+        loop {
+            self.flush().await?;
+            // The tasks this turn spawned or woke — and the ones the flush
+            // just gave room to — have not run yet; they only do once we
+            // yield. Let them, then retire the ones that finished.
+            runtime::yield_now().await;
+            self.protocol.sweep();
+            if self.protocol.shared().output_is_empty() {
+                return Ok(());
+            }
+        }
     }
 
     /// Once true, nothing more should be read: a connection error has been
@@ -81,17 +99,21 @@ impl<T: Transport> Connection<T> {
         self.protocol.is_closing()
     }
 
-    /// Sends everything written since the last turn, as one write. The
-    /// buffer comes back with its capacity intact.
+    /// Sends everything written since the last flush, as one gather write.
+    /// The segments come back with their capacity intact, for the writers
+    /// waiting on the room they free.
+    ///
+    /// `may_hold` is `false`: a send that frees its buffers only at the
+    /// kernel's notification holds them against the high-water mark for a
+    /// round trip, which is throughput this connection has no way of
+    /// knowing it can spare.
     pub async fn flush(&mut self) -> io::Result<()> {
-        let buf = self.protocol.shared().take_output();
-        if buf.is_empty() {
-            self.protocol.shared().restore_output(buf);
+        if self.protocol.shared().output_is_empty() {
             return Ok(());
         }
-        let (result, mut bufs) = self.transport.send(vec![buf], false).await;
-        let buf = bufs.pop().expect("send hands back the buffer it was given");
-        self.protocol.shared().restore_output(buf);
+        let bufs = self.protocol.shared().take_output();
+        let (result, bufs) = self.transport.send(bufs, false).await;
+        self.protocol.shared().restore_output(bufs);
         result
     }
 
