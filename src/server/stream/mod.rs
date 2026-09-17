@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::task::{Poll, Waker};
+use std::time::{Duration, SystemTime};
 
 use http::header;
 
@@ -22,6 +23,14 @@ mod stream_window;
 /// response. `no_more_input` and `no_more_output` track them one each;
 /// both set is the closed state the sweep retires.
 pub struct Stream {
+    /// When the peer's HEADERS opened this stream.
+    ///
+    /// The runtime's clock, not the OS's: the event loop samples
+    /// `SystemTime::now()` once per scheduler pass and the timewheel keeps
+    /// it, so every stream opened in that pass reads the same cached value
+    /// and opening one costs no clock call of its own. Fresh to within a
+    /// pass, which is finer than anything a stream deadline cares about.
+    created_at: SystemTime,
     header: Box<Headers>,
     /// §8.1: the trailers, if the request had any. Written once by the
     /// connection at END_STREAM, taken once by the task after the body. The
@@ -74,6 +83,7 @@ impl Stream {
         };
 
         Ok(Self {
+            created_at: runtime::runtime::now(),
             window: StreamWindow::from(settings),
             header,
             trailers: Cell::new(None),
@@ -84,6 +94,23 @@ impl Stream {
             unreleased: Cell::new(0),
             waker: RefCell::new(None),
         })
+    }
+
+    /// When this stream was opened.
+    pub fn created_at(&self) -> SystemTime {
+        self.created_at
+    }
+
+    /// How long this stream has been open, read off the same cached clock.
+    ///
+    /// That clock is the wall clock, so it can step backwards under NTP; an
+    /// age that would come out negative reads as zero instead. Nothing that
+    /// asks a stream its age — a deadline, a slow-request counter — is worth
+    /// failing a request over a clock adjustment.
+    pub fn age(&self) -> Duration {
+        runtime::runtime::now()
+            .duration_since(self.created_at)
+            .unwrap_or_default()
     }
 
     /// A WINDOW_UPDATE on this stream. The task may be waiting on exactly
