@@ -30,6 +30,20 @@ use crate::shared::codec::{
 /// is exactly the second kind. A lifetime cap, so a long-lived client that
 /// legitimately cancels a lot will hit it; a rate is the refinement.
 const FAULT_LIMIT: u32 = 100;
+
+/// Control frames a peer may send in a row without making any progress on a
+/// request. PING and SETTINGS each force a frame straight back
+/// (CVE-2019-9512, CVE-2019-9515) and every one of them costs a decode, so a
+/// peer sending nothing else spends our output and our CPU while asking for
+/// nothing.
+///
+/// A burst rather than a lifetime total, unlike `FAULT_LIMIT`: a HEADERS or a
+/// DATA clears it, so a connection doing real work never approaches it. That
+/// is what keeps the legitimate cases out — a long download is a stream of
+/// WINDOW_UPDATEs, but it is a stream of DATA too. A flood reaches this in
+/// milliseconds; a keepalive PING every 10s on a wholly idle connection would
+/// need a day. A rate is still the proper refinement, as for `FAULT_LIMIT`.
+const CONTROL_FRAME_BURST: u32 = 10_000;
 use runtime::{Handle, spawn};
 use rustc_hash::FxHashMap;
 
@@ -51,6 +65,9 @@ pub struct Protocol {
     closing: bool,
     /// Stream errors so far, against `FAULT_LIMIT`.
     faults: u32,
+    /// Control frames since the last request frame, against
+    /// `CONTROL_FRAME_BURST`.
+    control_frames: u32,
 }
 
 struct Streams {
@@ -265,6 +282,7 @@ impl Protocol {
             preface_seen: false,
             closing: false,
             faults: 0,
+            control_frames: 0,
         }
     }
 
@@ -324,6 +342,24 @@ impl Protocol {
         self.streams.remove(stream_id.into(), &self.shared);
         self.shared
             .write_frame(|out| encode_rst_stream(out, stream_id, error_code));
+    }
+
+    /// §5.4.1 for a peer that sends control frames and nothing else. A frame
+    /// that carries a request — HEADERS, its CONTINUATIONs, DATA — is what
+    /// counts as progress and clears the burst; everything else adds to it,
+    /// including a type the decoder is going to ignore.
+    fn count_control_frame(&mut self, kind: FrameKind) {
+        match kind {
+            FrameKind::Data | FrameKind::Headers | FrameKind::Continuation => {
+                self.control_frames = 0;
+            }
+            _ => {
+                self.control_frames += 1;
+                if self.control_frames > CONTROL_FRAME_BURST {
+                    self.fail_connection(ENHANCE_YOUR_CALM, "too many control frames");
+                }
+            }
+        }
     }
 
     fn count_fault(&mut self, reason: &'static str) {
@@ -559,6 +595,8 @@ impl FrameHandler for Protocol {
     /// SETTINGS — and not an ACK, which it cannot legitimately send before
     /// having seen ours.
     fn on_frame(&mut self, kind: FrameKind, _stream_id: StreamId, _length: u32, flags: u8) {
+        self.count_control_frame(kind);
+
         if !std::mem::take(&mut self.expect_settings) {
             return;
         }
