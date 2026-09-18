@@ -29,7 +29,17 @@ use super::{
 ///
 /// Each is a whole connection through the simulated ring, so the cost is real
 /// but small — the clock is virtual, and nothing sleeps.
-const SEEDS: u64 = 512;
+///
+/// `DST_SEEDS` lowers it for Miri, where every memory access is checked and a
+/// connection costs seconds rather than microseconds. A handful of seeds under
+/// Miri is worth more than all of them under the ordinary runner: the point
+/// there is the aliasing in `StreamMap`, which any seed exercises.
+fn seeds() -> u64 {
+    std::env::var("DST_SEEDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512)
+}
 
 /// splitmix64: a few lines, no dependency, and the same sequence everywhere.
 struct Rng(u64);
@@ -96,7 +106,7 @@ fn scenario(seed: u64) -> (Vec<Scripted>, usize) {
 /// got its response.
 #[test]
 fn every_split_and_spacing_is_served_in_full() {
-    for seed in 0..SEEDS {
+    for seed in 0..seeds() {
         // A thread per seed, because the buffer ring is a thread-local that
         // may be installed once: every `#[test]` gets a fresh thread for free,
         // and a loop inside one does not.
