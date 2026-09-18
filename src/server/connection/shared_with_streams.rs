@@ -234,10 +234,20 @@ impl ConnectionWindow {
 impl SharedConnection {
     pub fn new(header_table_size: u32, max_frame_size: u32) -> Self {
         Self {
-            encoder: RefCell::new(Encoder::new(
-                header_table_size as usize,
-                header_table_size as usize,
-            )),
+            // The two arguments are not the same quantity. `max_size` is the
+            // dynamic table's size in *bytes* (§4.1, where every entry costs
+            // its name, its value and 32 bytes of overhead); `capacity` is a
+            // number of *entries* to index up front. Passing the byte size as
+            // the entry count asked for an index of 4096 entries where 4096
+            // bytes can hold at most 128 — and `Table::new` rounds that to a
+            // raw capacity of 8192 and `vec![None; 8192]` memsets it, so every
+            // one of those 192 KiB was resident, per connection, before the
+            // connection had served anything.
+            //
+            // Zero is what `Encoder::default()` passes: the table allocates on
+            // its first insert and grows from 8, which is what `reserve_one`
+            // is there for.
+            encoder: RefCell::new(Encoder::new(header_table_size as usize, 0)),
             max_frame_size: Cell::new(max_frame_size),
             // §6.9.2: both halves start at 65535 and SETTINGS never moves
             // them. The gap up to `CONNECTION_RECV_WINDOW` is announced by a
