@@ -37,12 +37,20 @@ pub(super) const FAULT_LIMIT: u32 = 100;
 /// peer sending nothing else spends our output and our CPU while asking for
 /// nothing.
 ///
-/// A burst rather than a lifetime total, unlike `FAULT_LIMIT`: a HEADERS or a
-/// DATA clears it, so a connection doing real work never approaches it. That
-/// is what keeps the legitimate cases out — a long download is a stream of
-/// WINDOW_UPDATEs, but it is a stream of DATA too. A flood reaches this in
-/// milliseconds; a keepalive PING every 10s on a wholly idle connection would
-/// need a day. A rate is still the proper refinement, as for `FAULT_LIMIT`.
+/// A burst rather than a lifetime total, unlike `FAULT_LIMIT`: a request
+/// frame that carries something clears it, so a connection doing real work
+/// never approaches it. An upload is a stream of DATA and clears it
+/// constantly; a flood reaches this in milliseconds; a keepalive PING every
+/// 10s on a wholly idle connection would need a day.
+///
+/// The exception, and the cost of the rule, is a *download*: the peer
+/// receives DATA and answers WINDOW_UPDATE, so nothing it sends is progress.
+/// A client leaving its stream window at the §6.9.2 default and crediting it
+/// back half a window at a time spends one unit per 32 KiB and trips this
+/// somewhere past 300 MB. The clients that matter announce a large window
+/// instead of a chatty one, so it is a bound on the conservative client
+/// rather than a common case — but the budget cannot tell it from a flood,
+/// which is the strongest argument for the rate this wants to become.
 pub(super) const CONTROL_FRAME_BURST: u32 = 10_000;
 use runtime::{Handle, spawn};
 use rustc_hash::FxHashMap;
@@ -345,20 +353,44 @@ impl Protocol {
     }
 
     /// §5.4.1 for a peer that sends control frames and nothing else. A frame
-    /// that carries a request — HEADERS, its CONTINUATIONs, DATA — is what
-    /// counts as progress and clears the burst; everything else adds to it,
-    /// including a type the decoder is going to ignore.
-    fn count_control_frame(&mut self, kind: FrameKind) {
-        match kind {
-            FrameKind::Data | FrameKind::Headers | FrameKind::Continuation => {
-                self.control_frames = 0;
-            }
-            _ => {
-                self.control_frames += 1;
-                if self.control_frames > CONTROL_FRAME_BURST {
-                    self.fail_connection(ENHANCE_YOUR_CALM, "too many control frames");
-                }
-            }
+    /// that carries a request is what counts as progress and clears the
+    /// burst; everything else adds to it, including a type the decoder is
+    /// going to ignore.
+    ///
+    /// Carrying a request means carrying *something*. A zero-length DATA
+    /// frame spends no flow control — §6.9 accounts nothing for it — and a
+    /// zero-length CONTINUATION adds nothing to the header block that
+    /// `MAX_HEADER_BLOCK_SIZE` bounds, so neither is ever refused by the
+    /// limit that looks like it should catch them: one counts bytes the
+    /// frame does not spend, the other bytes it does not carry. Both cost us
+    /// a decode, a dispatch and a wake, and buy the peer nothing. That is
+    /// CVE-2019-9518, and the empty-fragment form of CVE-2024-27316. Neither
+    /// may clear the budget, or a peer interleaving them escapes it.
+    ///
+    /// They are not refused, only counted. All three are legal frames —
+    /// §6.1 requires a zero-length DATA to carry END_STREAM at the end of a
+    /// body that fell on a frame boundary, and a header block may be split
+    /// anywhere — so what separates use from abuse is the volume, which is
+    /// what a budget is for.
+    ///
+    /// END_STREAM is the one exception: it closes the peer's half, which is
+    /// progress on any reading, and a stream can only be closed once.
+    fn count_control_frame(&mut self, kind: FrameKind, length: u32, flags: u8) {
+        // §6.1: END_STREAM is 0x1 on DATA.
+        let advances_a_request = match kind {
+            FrameKind::Data => length > 0 || flags & 0x1 != 0,
+            FrameKind::Headers | FrameKind::Continuation => length > 0,
+            _ => false,
+        };
+
+        if advances_a_request {
+            self.control_frames = 0;
+            return;
+        }
+
+        self.control_frames += 1;
+        if self.control_frames > CONTROL_FRAME_BURST {
+            self.fail_connection(ENHANCE_YOUR_CALM, "too many control frames");
         }
     }
 
@@ -625,8 +657,8 @@ impl FrameHandler for Protocol {
     /// §3.4 is checked: the first frame after the client preface must be its
     /// SETTINGS — and not an ACK, which it cannot legitimately send before
     /// having seen ours.
-    fn on_frame(&mut self, kind: FrameKind, _stream_id: StreamId, _length: u32, flags: u8) {
-        self.count_control_frame(kind);
+    fn on_frame(&mut self, kind: FrameKind, _stream_id: StreamId, length: u32, flags: u8) {
+        self.count_control_frame(kind, length, flags);
 
         if !std::mem::take(&mut self.expect_settings) {
             return;

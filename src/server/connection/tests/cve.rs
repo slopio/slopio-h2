@@ -12,8 +12,8 @@
 use runtime_core::deterministic_testing::ReadEvent;
 
 use super::{
-    FLAG_END_HEADERS, FLAG_END_STREAM, Frame, GET_BLOCK, GOAWAY, HEADERS, PREFACE, PRIORITY,
-    RST_STREAM, SETTINGS, deliveries, frame, pings, run_connection,
+    CONTINUATION, FLAG_END_HEADERS, FLAG_END_STREAM, Frame, GET_BLOCK, GOAWAY, HEADERS, PREFACE,
+    PRIORITY, RST_STREAM, SETTINGS, WINDOW_UPDATE, deliveries, frame, pings, run_connection,
 };
 use crate::shared::codec::types::ENHANCE_YOUR_CALM;
 
@@ -158,22 +158,13 @@ fn rapid_reset() {
 
 /// CVE-2019-9518 — a flood of empty frames on an open stream.
 ///
-/// This one is **not** defended against, and the test says what happens
-/// rather than what should. An empty DATA frame costs the peer nothing: §6.9
-/// accounts zero bytes against both windows, so no credit is spent and no
-/// WINDOW_UPDATE is ever owed. It costs us a decode, a dispatch, and a
-/// wake of the handler task, which finds nothing to read and parks again.
-///
-/// Worse, it *clears* the control-frame budget. `count_control_frame` reads
-/// DATA as progress on a request, which a zero-length DATA frame is not — so
-/// a peer that interleaves empty DATA frames escapes the budget that stops
-/// every other flood here.
-///
-/// The fix is one line in `count_control_frame`: progress is a request frame
-/// that carries something, so a DATA frame of length zero belongs in the
-/// budget rather than clearing it.
+/// An empty DATA frame costs the peer nothing: §6.9 accounts zero bytes
+/// against both windows, so no credit is spent and no WINDOW_UPDATE is ever
+/// owed. It costs us a decode, a dispatch and a wake of the handler task,
+/// which finds nothing to read and parks again. Flow control cannot see it,
+/// so the control budget is what has to.
 #[test]
-fn empty_frames_flood_is_not_yet_bounded() {
+fn empty_data_flood() {
     let mut bytes = PREFACE.to_vec();
     bytes.extend_from_slice(&frame(SETTINGS, 0, 0, &[]));
     // A stream left open: no END_STREAM, so DATA may keep arriving.
@@ -184,11 +175,63 @@ fn empty_frames_flood_is_not_yet_bounded() {
     let mut inbound = deliveries(&bytes);
     inbound.push(ReadEvent::Eof);
 
-    let written = run_connection(inbound, |_, _| {});
+    let (code, reason) =
+        goaway(&run_connection(inbound, |_, _| {})).expect("the flood was answered with a GOAWAY");
+    assert_eq!(code, ENHANCE_YOUR_CALM);
+    assert_eq!(reason, "too many control frames");
+}
 
-    assert!(
-        goaway(&written).is_none(),
-        "this is the gap: twice the control budget in empty DATA frames, and \
-         the connection is still open because each one reset the count",
-    );
+/// CVE-2024-27316 — the CONTINUATION flood, with empty fragments.
+///
+/// `MAX_HEADER_BLOCK_SIZE` already bounds this attack in its usual form: a
+/// header block that keeps growing without END_HEADERS is cut off at twice
+/// the decoded limit. But that cap counts *bytes*, and a zero-length
+/// fragment adds none — so an endless stream of empty CONTINUATIONs never
+/// reaches it, while costing a decode and a dispatch each.
+///
+/// A fragment that carries nothing is not progress, so the control budget
+/// is what catches this form — the byte cap catches the other.
+#[test]
+fn continuation_flood_with_empty_fragments() {
+    let mut bytes = preface();
+    // A header block deliberately left open: no END_HEADERS, ever.
+    bytes.extend_from_slice(&frame(HEADERS, 0, 1, GET_BLOCK));
+    for _ in 0..super::super::protocol::CONTROL_FRAME_BURST * 2 {
+        bytes.extend_from_slice(&frame(CONTINUATION, 0, 1, &[]));
+    }
+    let mut inbound = deliveries(&bytes);
+    inbound.push(ReadEvent::Eof);
+
+    let (code, reason) =
+        goaway(&run_connection(inbound, |_, _| {})).expect("the flood was answered with a GOAWAY");
+    assert_eq!(code, ENHANCE_YOUR_CALM);
+    assert_eq!(reason, "too many control frames");
+}
+
+/// Not a CVE: the cost of the budget, stated as a test.
+///
+/// A download is the one legitimate exchange where the peer sends nothing
+/// but control frames — it receives DATA and answers WINDOW_UPDATE, over and
+/// over, and nothing it sends ever counts as progress. A client that leaves
+/// its stream window at the §6.9.2 default of 65535 and credits it back half
+/// a window at a time therefore spends one budget unit per 32 KiB received,
+/// and trips `CONTROL_FRAME_BURST` somewhere past 300 MB.
+///
+/// The clients that matter avoid it by announcing a large window instead of
+/// a chatty one — curl and nghttp2 both do — so this is a bound on the
+/// conservative client, not a common case. It is recorded here because the
+/// budget cannot tell it apart from a flood, and a reader deserves the
+/// number rather than the reassurance.
+#[test]
+fn a_download_that_only_ever_sends_window_updates_trips_the_budget() {
+    let mut bytes = preface();
+    for _ in 0..super::super::protocol::CONTROL_FRAME_BURST + 1 {
+        bytes.extend_from_slice(&frame(WINDOW_UPDATE, 0, 0, &32_768u32.to_be_bytes()));
+    }
+    let mut inbound = deliveries(&bytes);
+    inbound.push(ReadEvent::Eof);
+
+    let (code, _) = goaway(&run_connection(inbound, |_, _| {}))
+        .expect("the budget cannot tell a chatty download from a flood");
+    assert_eq!(code, ENHANCE_YOUR_CALM);
 }

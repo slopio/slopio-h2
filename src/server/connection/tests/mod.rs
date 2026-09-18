@@ -32,6 +32,7 @@ const DATA: u8 = 0x0;
 const HEADERS: u8 = 0x1;
 const SETTINGS: u8 = 0x4;
 const PRIORITY: u8 = 0x2;
+const CONTINUATION: u8 = 0x9;
 const RST_STREAM: u8 = 0x3;
 const PING: u8 = 0x6;
 const GOAWAY: u8 = 0x7;
