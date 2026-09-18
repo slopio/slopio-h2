@@ -121,20 +121,16 @@ pub const ACTIVE_TICKS: u32 = 6;
 /// short to carry its kind, on the grounds that nine bytes taking seconds is
 /// pathological whatever it turns out to introduce.
 ///
-/// Enforced twice over, and it needs both. The tick count catches a peer that
-/// goes silent mid-frame. `Connection::partial_since` catches the one that does
-/// not: a peer dribbling a byte every four seconds resets the tick count for
-/// ever, and only a budget measured from when the half-sent state *began* ends
-/// it. That peer is slowloris exactly.
+/// Wall clock from when the half-sent state began, and not a count of silent
+/// ticks like the other two, because sending more of the same frame must not
+/// refill it — a peer dribbling a byte every four seconds resets a silence
+/// count for ever and is exactly the attack. Measuring the budget instead
+/// covers the silent peer too, so this is the only bound the partial case
+/// needs.
 ///
-/// 2 ticks of 5s: ten seconds. Nothing legitimate starts a frame and then
-/// waits — the bytes were already written by a peer that had them.
-pub const PARTIAL_TICKS: u32 = 2;
-
-/// The wall-clock form of [`PARTIAL_TICKS`], for the budget that a dribbling
-/// peer cannot reset.
-pub const PARTIAL_TIMEOUT: Duration =
-    Duration::from_secs(DEADLINE_TICK.as_secs() * PARTIAL_TICKS as u64);
+/// Ten seconds. Nothing legitimate starts a frame and then waits: the bytes
+/// were already written by a peer that had them.
+pub const PARTIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often live streams are swept for one that is starving.
 ///
@@ -193,35 +189,24 @@ impl<T: Transport> Connection<T> {
     /// stream task while we wait on `recv` only leaves with the next inbound
     /// chunk; a select on "output ready" is what fixes that, later.
     pub async fn run(mut self) {
-        // Expiries in a row with nothing from the peer. Any byte resets it,
-        // so this counts silence and not time.
-        let mut expiries = 0;
+        // Ticks in a row with nothing from the peer. Any byte resets it, so
+        // this counts silence and not time.
+        let mut silent_ticks = 0;
         loop {
-            // Read fresh each turn: what the peer owes us changes with what it
-            // has half-sent, and a connection that was idle a moment ago is
-            // mid-header now.
-            let Some(allowed) = self.read_deadline() else {
-                // The budget for a half-sent frame is spent, and no arming
-                // would help: more of the same frame is what it would buy.
+            if self.wait_expired(silent_ticks) {
+                // §6.8: say so rather than vanishing. The GOAWAY is queued, so
+                // it needs the drain to carry it.
                 self.protocol.time_out();
                 let _ = self.drain().await;
                 return;
-            };
+            }
             match timeout(DEADLINE_TICK, self.recv()).await {
+                // Nothing arrived. Nothing is drained either: the loop's rule
+                // that output leaves with the next inbound chunk is not changed
+                // by a tick passing.
                 Err(()) => {
-                    expiries += 1;
-                    if expiries < allowed {
-                        // Not the whole wait yet. Nothing is drained here, as
-                        // nothing was read — the loop's existing rule that
-                        // output leaves with the next inbound chunk is not
-                        // changed by a deadline that has not expired.
-                        continue;
-                    }
-                    // §6.8: say so rather than vanishing. The GOAWAY is queued,
-                    // so it needs the drain below to reach the peer.
-                    self.protocol.time_out();
-                    let _ = self.drain().await;
-                    return;
+                    silent_ticks += 1;
+                    continue;
                 }
                 // Half-close: the peer sends no more, but is still owed
                 // whatever is queued.
@@ -231,14 +216,11 @@ impl<T: Transport> Connection<T> {
                 Ok(Some(Err(_))) => return,
                 Ok(Some(Ok(()))) => {}
             }
-            expiries = 0;
+            silent_ticks = 0;
             self.sweep_if_due();
-            if self.drain().await.is_err() {
-                return;
-            }
-            // The drain carried the GOAWAY, if there was one. An invalid
-            // preface queued nothing, so it closed in silence (§3.4).
-            if self.is_closing() {
+            // The drain carries the GOAWAY, if there was one. An invalid
+            // preface queued nothing, so it closes in silence (§3.4).
+            if self.drain().await.is_err() || self.is_closing() {
                 return;
             }
         }
@@ -282,23 +264,28 @@ impl<T: Transport> Connection<T> {
     /// `MultiRecv` queues its completions in a buffer it owns and `poll_next`
     /// drains that queue, so the multishot stays armed and nothing is lost
     /// between one poll and the next.
-    /// How many consecutive [`DEADLINE_TICK`]s of silence the peer may have,
-    /// or `None` when it has already run out of time.
-    fn read_deadline(&mut self) -> Option<u32> {
+    /// Whether the peer has run out of time to say something.
+    ///
+    /// Two clocks, because two different things are bounded. A half-sent frame
+    /// gets a wall-clock budget from when it started, which more of the same
+    /// frame does not refill. Everything else gets a count of silent ticks,
+    /// which any byte resets — and that is right there, because a peer sending
+    /// real frames is a peer making progress.
+    #[inline]
+    fn wait_expired(&mut self, silent_ticks: u32) -> bool {
         if !self.decoder.preface_seen() || self.decoder.header_pending() {
             let now = runtime::runtime::now();
             let since = *self.partial_since.get_or_insert(now);
             // Floors at zero on a clock that stepped backwards, as
-            // `Stream::age` does, so a clock adjustment cannot close a
-            // connection.
-            let waited = now.duration_since(since).unwrap_or_default();
-            return (waited < PARTIAL_TIMEOUT).then_some(PARTIAL_TICKS);
+            // `Stream::age` does, so an adjustment cannot close a connection.
+            return now.duration_since(since).unwrap_or_default() >= PARTIAL_TIMEOUT;
         }
         self.partial_since = None;
-        Some(match self.protocol.has_live_streams() {
+        let allowed = match self.protocol.has_live_streams() {
             true => ACTIVE_TICKS,
             false => IDLE_TICKS,
-        })
+        };
+        silent_ticks >= allowed
     }
 
     /// Sweeps for starving streams, a few seconds apart at most.
