@@ -226,10 +226,9 @@ impl<T: Transport> Connection<T> {
                 // Half-close: the peer sends no more, but is still owed
                 // whatever is queued.
                 Ok(None) => break,
-                Ok(Some(Err(e))) => {
-                    eprintln!("transport error: {e}");
-                    return;
-                }
+                // Transport failure: nowhere left to send a GOAWAY, so drop it
+                // as silently as the clean EOF above.
+                Ok(Some(Err(_))) => return,
                 Ok(Some(Ok(()))) => {}
             }
             expiries = 0;
