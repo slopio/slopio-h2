@@ -1,7 +1,9 @@
 use std::io;
+use std::time::Duration;
 
 use crate::server::connection::protocol::Protocol;
 use crate::shared::{codec::frames::FrameDecoder, transport::Transport};
+use runtime::runtime::time::timeout;
 use runtime_streams::StreamExt;
 
 mod output;
@@ -16,6 +18,29 @@ pub const MAX_CONCURRENT_STREAMS: u32 = 64;
 
 pub const CONNECTION_INITIAL_WINDOW_SIZE: u32 = 65_535;
 pub const CONNECTION_RECV_WINDOW: u32 = 1024 * 1024;
+
+/// How long one gather-write may stall before the connection is closed.
+///
+/// This bounds the whole write, not one submission: `send_vectored_all` loops
+/// over short sends itself, so a peer that accepts a byte at a time does not
+/// get a fresh deadline per byte — the queued output has to be gone within
+/// this, or the peer is not a receiver we keep.
+///
+/// It is a stall bound rather than a budget for the connection's life. Each
+/// flush that completes moved every queued byte, which is progress, so a fast
+/// peer never approaches this however long it stays connected.
+///
+/// The defence it is here for is not the memory of one connection — the
+/// high-water mark already bounds that. It is the buffer ring, which is shared
+/// by every connection on the worker: a loop parked in `send` stops popping
+/// its inbound completions, and each unpopped completion pins one ring buffer
+/// until the driver pauses the recv at 32 of them. A handful of peers that
+/// stop reading can therefore empty a 512-slot ring, and a recv that finds it
+/// empty fails ENOBUFS, which this runtime does not resubmit — so the
+/// connection that dies is whichever one drew the empty ring, not the one that
+/// caused it. Five seconds is far longer than any receiver that is actually
+/// reading needs, and short enough that the ring is not held hostage.
+pub const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One HTTP/2 connection: bytes come in through `transport`, `decoder` cuts
 /// them into frames, and each frame is dispatched into `protocol`.
@@ -115,9 +140,24 @@ impl<T: Transport> Connection<T> {
             return Ok(());
         }
         let bufs = self.protocol.shared().take_output();
-        let (result, bufs) = self.transport.send(bufs, false).await;
-        self.protocol.shared().restore_output(bufs);
-        result
+        // Bound before the match rather than inside it: the send borrows
+        // `self.transport`, and a match scrutinee's temporaries live to the end
+        // of the match, where the arms want `self.protocol` back.
+        let sent = timeout(FLUSH_TIMEOUT, self.transport.send(bufs, false)).await;
+        match sent {
+            Ok((result, bufs)) => {
+                self.protocol.shared().restore_output(bufs);
+                result
+            }
+            // The segments do not come back, and must not: `timeout` drops the
+            // send, and a dropped send moves its chunks and the kernel-visible
+            // `msghdr` into the driver's keepalive slot so the kernel can
+            // finish reading them after the cancel CQE. Freeing them here is
+            // what would be unsound. `Output` goes on counting them against
+            // `in_flight`, which costs nothing, because this error is what ends
+            // the connection.
+            Err(()) => Err(io::ErrorKind::TimedOut.into()),
+        }
     }
 
     /// Takes one chunk off the transport and dispatches every frame in it.

@@ -29,11 +29,14 @@
 
 mod cve;
 
+use std::time::Duration;
+
 use runtime_core::deterministic_testing::{
     FakeRing, FakeRingHandle, ReadEvent, WriteEvent, simulated_socket,
 };
 use runtime_core::runtime::RuntimeInner;
 
+use super::FLUSH_TIMEOUT;
 use crate::server::connection::Connection;
 use crate::shared::transport::PlainMessages;
 
@@ -321,6 +324,47 @@ fn a_broken_pipe_ends_the_connection_without_writing_more() {
     // send's buffers still came back through `restore_output` on the error
     // path — the borrow would have panicked otherwise.
     assert!(written.is_empty(), "the peer received nothing: {written:?}");
+}
+
+#[test]
+fn a_receiver_that_never_takes_the_write_is_dropped_at_the_flush_timeout() {
+    let written = run_connection(
+        vec![ReadEvent::Data(a_get()), ReadEvent::Eof],
+        // A send the peer never completes — the slow receiver, in the shape
+        // that costs us most: the loop parks in `send` and stops popping its
+        // inbound completions, each of which pins a ring buffer shared with
+        // every other connection on the worker.
+        |handle, fd| {
+            handle.on_write(
+                fd,
+                WriteEvent::All.after(FLUSH_TIMEOUT + Duration::from_secs(60)),
+            )
+        },
+    );
+
+    // Nothing reached the peer: the ring records a write when it completes,
+    // and this one was cancelled at the deadline instead. Virtual time, so the
+    // five seconds cost the test nothing.
+    //
+    // What this pins is the release of the ring buffers, which is the reason
+    // the timeout exists — the connection dying is only how it is done.
+    assert!(
+        written.is_empty(),
+        "the send was cancelled, so the peer got nothing: {written:?}"
+    );
+}
+
+#[test]
+fn a_receiver_that_reads_within_the_timeout_is_served_normally() {
+    let written = run_connection(
+        vec![ReadEvent::Data(a_get()), ReadEvent::Eof],
+        // Slow, but inside the deadline: a receiver that is actually reading
+        // must not be cut off, or the timeout is a bug and not a defence.
+        |handle, fd| handle.on_write(fd, WriteEvent::All.after(FLUSH_TIMEOUT / 2)),
+    );
+
+    assert_eq!(written.len(), 5, "served in full: {written:?}");
+    assert_eq!(written[4].payload, b"read 0 bytes\n");
 }
 
 #[test]
