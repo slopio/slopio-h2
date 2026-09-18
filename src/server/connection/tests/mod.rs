@@ -11,6 +11,8 @@
 //! reproducible: a test that drove the ring while the loop ran would depend
 //! on when a task happened to be polled.
 
+mod cve;
+
 use runtime_core::deterministic_testing::{
     FakeRing, FakeRingHandle, ReadEvent, WriteEvent, simulated_socket,
 };
@@ -29,6 +31,8 @@ const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const DATA: u8 = 0x0;
 const HEADERS: u8 = 0x1;
 const SETTINGS: u8 = 0x4;
+const PRIORITY: u8 = 0x2;
+const RST_STREAM: u8 = 0x3;
 const PING: u8 = 0x6;
 const GOAWAY: u8 = 0x7;
 const WINDOW_UPDATE: u8 = 0x8;
@@ -41,7 +45,7 @@ const FLAG_END_HEADERS: u8 = 0x4;
 /// table entries, so the block needs no literal encoding.
 const GET_BLOCK: &[u8] = &[0x82, 0x86, 0x84];
 
-fn frame(kind: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+pub(super) fn frame(kind: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(9 + payload.len());
     out.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
     out.push(kind);
@@ -52,11 +56,11 @@ fn frame(kind: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct Frame {
-    kind: u8,
-    flags: u8,
-    stream_id: u32,
-    payload: Vec<u8>,
+pub(super) struct Frame {
+    pub(super) kind: u8,
+    pub(super) flags: u8,
+    pub(super) stream_id: u32,
+    pub(super) payload: Vec<u8>,
 }
 
 /// Every frame the peer would have received, in order. Takes the whole byte
@@ -88,7 +92,7 @@ fn frames(bytes: &[u8]) -> Vec<Frame> {
 
 /// Runs one connection to completion over a scripted peer, and hands back
 /// every frame it wrote.
-fn run_connection(
+pub(super) fn run_connection(
     inbound: Vec<ReadEvent>,
     script: impl FnOnce(&FakeRingHandle, i32),
 ) -> Vec<Frame> {
@@ -117,26 +121,31 @@ fn run_connection(
     frames(&handle.writes(fd).concat())
 }
 
-/// `n` PING frames, split across deliveries the ring's buffers can hold: a
-/// delivery longer than a buffer is a short read, so the rest would be lost
-/// rather than continued. How the payload divides is what the reader sees.
-fn pings(n: u32) -> Vec<ReadEvent> {
-    let mut events = Vec::new();
-    let mut chunk = Vec::new();
+/// Cuts a byte stream into deliveries the ring's buffers can hold.
+///
+/// A delivery longer than a buffer is a short read, so the rest would be
+/// lost rather than continued — how the payload divides is what the reader
+/// sees, and the simulator says so rather than truncating in silence. Frame
+/// boundaries are deliberately not respected: the decoder reassembles across
+/// chunks, and a test that only ever fed it whole frames would never say so.
+pub(super) fn deliveries(bytes: &[u8]) -> Vec<ReadEvent> {
+    bytes
+        .chunks(15_000)
+        .map(|chunk| ReadEvent::Data(chunk.to_vec()))
+        .collect()
+}
+
+/// `n` PING frames, delivered in ring-sized pieces.
+pub(super) fn pings(n: u32) -> Vec<ReadEvent> {
+    let mut bytes = Vec::new();
     for _ in 0..n {
-        chunk.extend_from_slice(&frame(PING, 0, 0, b"flooding"));
-        if chunk.len() > 15_000 {
-            events.push(ReadEvent::Data(std::mem::take(&mut chunk)));
-        }
+        bytes.extend_from_slice(&frame(PING, 0, 0, b"flooding"));
     }
-    if !chunk.is_empty() {
-        events.push(ReadEvent::Data(chunk));
-    }
-    events
+    deliveries(&bytes)
 }
 
 /// A client preface, its mandatory SETTINGS, and one GET.
-fn a_get() -> Vec<u8> {
+pub(super) fn a_get() -> Vec<u8> {
     let mut bytes = PREFACE.to_vec();
     bytes.extend_from_slice(&frame(SETTINGS, 0, 0, &[]));
     bytes.extend_from_slice(&frame(

@@ -29,7 +29,7 @@ use crate::shared::codec::{
 /// piles up either is the same problem, and Rapid Reset (CVE-2023-44487)
 /// is exactly the second kind. A lifetime cap, so a long-lived client that
 /// legitimately cancels a lot will hit it; a rate is the refinement.
-const FAULT_LIMIT: u32 = 100;
+pub(super) const FAULT_LIMIT: u32 = 100;
 
 /// Control frames a peer may send in a row without making any progress on a
 /// request. PING and SETTINGS each force a frame straight back
