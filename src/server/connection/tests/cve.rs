@@ -12,8 +12,9 @@
 use runtime_core::deterministic_testing::ReadEvent;
 
 use super::{
-    CONTINUATION, FLAG_END_HEADERS, FLAG_END_STREAM, Frame, GET_BLOCK, GOAWAY, HEADERS, PREFACE,
-    PRIORITY, RST_STREAM, SETTINGS, WINDOW_UPDATE, deliveries, frame, pings, run_connection,
+    CONTINUATION, FLAG_END_HEADERS, FLAG_END_STREAM, Frame, GET_BLOCK, GOAWAY, HEADERS, PING,
+    PREFACE, PRIORITY, RST_STREAM, SETTINGS, WINDOW_UPDATE, deliveries, frame, pings,
+    run_connection,
 };
 use crate::shared::codec::types::ENHANCE_YOUR_CALM;
 
@@ -241,21 +242,29 @@ fn a_download_that_only_ever_sends_window_updates_trips_the_budget() {
 /// Firefox did exactly that for years. Ten times `ODD_FRAME_BURST` of them
 /// is fine, because each request clears the count — which is the whole
 /// reason the budget is a burst rather than a lifetime total.
+///
+/// Delivered in batches under `MAX_CONCURRENT_STREAMS`, because a
+/// conforming client respects the limit we advertised (§5.1.2) and because
+/// the map only drains between chunks: the tasks that answer a request run
+/// when the loop yields, which is once per inbound chunk.
 #[test]
 fn a_priority_frame_per_request_is_not_a_flood() {
-    let mut bytes = preface();
+    let mut inbound = deliveries(&preface());
     let mut id = 1u32;
-    for _ in 0..super::super::protocol::ODD_FRAME_BURST * 10 {
-        bytes.extend_from_slice(&frame(PRIORITY, 0, id, &[0, 0, 0, 0, 15]));
-        bytes.extend_from_slice(&frame(
-            HEADERS,
-            FLAG_END_HEADERS | FLAG_END_STREAM,
-            id,
-            GET_BLOCK,
-        ));
-        id += 2;
+    for _ in 0..20 {
+        let mut batch = Vec::new();
+        for _ in 0..50 {
+            batch.extend_from_slice(&frame(PRIORITY, 0, id, &[0, 0, 0, 0, 15]));
+            batch.extend_from_slice(&frame(
+                HEADERS,
+                FLAG_END_HEADERS | FLAG_END_STREAM,
+                id,
+                GET_BLOCK,
+            ));
+            id += 2;
+        }
+        inbound.push(ReadEvent::Data(batch));
     }
-    let mut inbound = deliveries(&bytes);
     inbound.push(ReadEvent::Eof);
 
     let written = run_connection(inbound, |_, _| {});
@@ -263,4 +272,42 @@ fn a_priority_frame_per_request_is_not_a_flood() {
         goaway(&written).is_none(),
         "a priority frame that comes with a request is not a pointless one",
     );
+    assert_eq!(
+        written.iter().filter(|f| f.kind == HEADERS).count(),
+        1000,
+        "every request was answered"
+    );
+}
+
+/// §5.1.2 — a peer that fills the stream map and keeps asking.
+///
+/// A HEADERS frame refused for want of a slot still carries a header block,
+/// so `FrameWorth` reads it as progress and it clears both budgets. Left
+/// uncounted, that is a peer holding every defence at zero for as long as it
+/// likes while paying an HPACK decode and a RST_STREAM of ours per attempt.
+/// §5.1.2 makes exceeding the advertised limit a stream error, so the fault
+/// budget is what counts it.
+#[test]
+fn a_peer_that_keeps_asking_past_the_stream_limit_is_closed() {
+    let mut bytes = preface();
+    let mut id = 1u32;
+    // Fill the map: no END_STREAM, so every one of these stays open.
+    for _ in 0..super::super::MAX_CONCURRENT_STREAMS {
+        bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, id, GET_BLOCK));
+        id += 2;
+    }
+    // Every one of these can only be refused, and pings between them no
+    // longer buy the peer a reset of the count.
+    for _ in 0..super::super::protocol::FAULT_LIMIT + 1 {
+        bytes.extend_from_slice(&frame(PING, 0, 0, b"reset_me"));
+        bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, id, GET_BLOCK));
+        id += 2;
+    }
+    let mut inbound = deliveries(&bytes);
+    inbound.push(ReadEvent::Eof);
+
+    let written = run_connection(inbound, |_, _| {});
+    let (code, reason) = goaway(&written).expect("the peer was closed on");
+    assert_eq!(code, ENHANCE_YOUR_CALM);
+    assert_eq!(reason, "too many refused streams");
 }

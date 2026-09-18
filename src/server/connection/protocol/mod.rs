@@ -595,7 +595,23 @@ impl FrameHandler for Protocol {
             .streams
             .create(&self.peer_settings, &self.shared, headers)
         {
+            // §5.1.2: a HEADERS frame that takes the peer past the
+            // concurrency limit we advertised is a stream error, and a
+            // refusal is a request frame that made no progress however full
+            // its header block was. Both make it something the budgets have
+            // to see — a peer that fills the map and then keeps asking
+            // otherwise holds them at zero for as long as it likes, since
+            // `FrameWorth` reads the block and calls it progress.
+            //
+            // The `Refused` that `recv_data` raises stays uncounted: that
+            // one is a body still in flight when we reset its stream, a race
+            // rather than a demand, and counting it would cost a fault per
+            // frame of a refused POST.
+            let refused = matches!(rejected, Rejected::Refused(_));
             self.reject(id, rejected);
+            if refused {
+                self.count_fault("too many refused streams");
+            }
         }
     }
 
