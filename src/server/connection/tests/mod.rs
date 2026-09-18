@@ -80,6 +80,31 @@ pub(super) struct Frame {
     pub(super) payload: Vec<u8>,
 }
 
+/// The fields of an encoded header block, by name. `:status` keeps its
+/// colon, so a pseudo-header and a field of the same name stay distinct.
+fn decode_block(payload: &[u8]) -> std::collections::HashMap<String, String> {
+    use crate::shared::hpack::{Decoder, Header};
+    use bytes::BytesMut;
+
+    let mut buf = BytesMut::from(payload);
+    let mut cursor = std::io::Cursor::new(&mut buf);
+    let mut out = std::collections::HashMap::new();
+    Decoder::new(4096)
+        .decode(&mut cursor, |header| {
+            let (name, value) = match header {
+                Header::Field { name, value } => (
+                    name.as_str().to_owned(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                ),
+                Header::Status(status) => (":status".to_owned(), status.as_str().to_owned()),
+                other => (format!("{other:?}"), String::new()),
+            };
+            out.insert(name, value);
+        })
+        .expect("the block we just encoded decodes");
+    out
+}
+
 /// Every frame the peer would have received, in order. Takes the whole byte
 /// stream rather than one write at a time: where a flush lands is the
 /// connection's business, not the protocol's.
@@ -202,6 +227,18 @@ fn a_request_is_answered_through_the_whole_loop() {
     assert_eq!(written[3].kind, HEADERS);
     assert_eq!(written[3].stream_id, 1);
     assert_eq!(written[3].flags & FLAG_END_HEADERS, FLAG_END_HEADERS);
+
+    // RFC 9110 §6.6.1: an origin server with a clock sends `Date`. Decoded
+    // rather than matched on the bytes, since HPACK is free to Huffman it.
+    let head = decode_block(&written[3].payload);
+    assert_eq!(head.get(":status").map(String::as_str), Some("200"));
+    let date = head.get("date").expect("the response carries a Date");
+    assert_eq!(
+        date.len(),
+        29,
+        "IMF-fixdate is fixed width (§5.6.7): {date}"
+    );
+    assert!(date.ends_with(" GMT"), "not IMF-fixdate: {date}");
 
     assert_eq!(written[4].kind, DATA);
     assert_eq!(written[4].stream_id, 1);

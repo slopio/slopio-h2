@@ -2,13 +2,14 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 
-use http::{HeaderMap, StatusCode};
+use http::{HeaderMap, StatusCode, header};
 
 use crate::server::STREAM_ID;
 use crate::server::connection::output::Output;
 use crate::server::connection::stream_map::StreamMap;
 use crate::server::connection::{CONNECTION_INITIAL_WINDOW_SIZE, CONNECTION_RECV_WINDOW};
 use crate::server::stream::Stream;
+use crate::shared::date;
 use crate::shared::{
     codec::frames::{
         encode::{
@@ -282,13 +283,22 @@ impl SharedConnection {
         fields: &HeaderMap,
         end_stream: bool,
     ) {
+        // RFC 9110 §6.6.1: an origin server with a clock sends `Date` on
+        // every 2xx, 3xx and 4xx — which is every response this writes. Here
+        // rather than in the handler because conformance is not a thing a
+        // handler should have to remember, and skipped when the handler set
+        // one of its own, since two would be a message with two dates.
+        let date = (!fields.contains_key(header::DATE)).then(|| Header::Field {
+            name: Some(header::DATE),
+            value: date::now(),
+        });
+
         // §8.3: the response pseudo-header comes before every ordinary field.
-        let headers =
-            std::iter::once(Header::Status(status)).chain(fields.iter().map(|(name, value)| {
-                Header::Field {
-                    name: Some(name.clone()),
-                    value: value.clone(),
-                }
+        let headers = std::iter::once(Header::Status(status))
+            .chain(date)
+            .chain(fields.iter().map(|(name, value)| Header::Field {
+                name: Some(name.clone()),
+                value: value.clone(),
             }));
         let mut block = Vec::new();
         self.encoder.borrow_mut().encode(headers, &mut block);
