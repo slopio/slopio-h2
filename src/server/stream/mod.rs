@@ -20,8 +20,9 @@ mod stream_window;
 ///
 /// A stream has two halves that close independently (§5.1): the peer's, by
 /// its END_STREAM on DATA or trailers, and ours, by the END_STREAM of our
-/// response. `no_more_input` and `no_more_output` track them one each;
-/// both set is the closed state the sweep retires.
+/// response. `no_more_input` and `no_more_output` track them one each; both
+/// set is the closed state that lets the connection take the stream out of
+/// its map.
 pub struct Stream {
     /// When the peer's HEADERS opened this stream.
     ///
@@ -164,16 +165,19 @@ impl Stream {
         self.unreleased.replace(0)
     }
 
-    /// The task has written its whole response. Only our half: the stream
-    /// leaves the map once the peer's half is closed too.
+    /// Our half is done. Called by the stream's `StreamToken` on the way
+    /// out, so it happens however the task ends — returning, reset, or going
+    /// down with its connection. Only our half: the stream leaves the map
+    /// once the peer's is closed too.
     pub fn end_output(&self) {
         self.no_more_output.set(true);
     }
 
-    /// Both halves done — what the sweep retires. A task that answered
-    /// before the peer finished sending keeps the stream here until its
-    /// END_STREAM, or a reset, arrives; §8.1 lets us hurry that along with
-    /// a RST_STREAM(NO_ERROR) after a complete response, later.
+    /// Both halves done, which is what lets the connection remove the
+    /// stream. A task that answered before the peer finished sending keeps
+    /// the stream in the map until its END_STREAM, or a reset, arrives;
+    /// §8.1 lets us hurry that along with a RST_STREAM(NO_ERROR) after a
+    /// complete response, later.
     pub fn is_closed(&self) -> bool {
         self.no_more_output.get() && self.no_more_input.get()
     }

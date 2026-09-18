@@ -6,10 +6,10 @@ use runtime_streams::StreamExt;
 
 mod output;
 mod protocol;
-#[cfg(test)]
-mod tests;
 pub(crate) mod settings;
 mod shared_with_streams;
+#[cfg(test)]
+mod tests;
 
 pub const MAX_CONCURRENT_STREAMS: u32 = 64;
 
@@ -87,7 +87,7 @@ impl<T: Transport> Connection<T> {
             // just gave room to — have not run yet; they only do once we
             // yield. Let them, then retire the ones that finished.
             runtime::yield_now().await;
-            self.protocol.sweep();
+            self.protocol.retire_finished();
             if self.protocol.shared().output_is_empty() {
                 return Ok(());
             }

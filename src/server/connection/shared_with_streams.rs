@@ -1,8 +1,10 @@
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::task::{Poll, Waker};
 
 use http::{HeaderMap, StatusCode};
 
+use crate::server::STREAM_ID;
 use crate::server::connection::output::Output;
 use crate::server::connection::{CONNECTION_INITIAL_WINDOW_SIZE, CONNECTION_RECV_WINDOW};
 use crate::server::stream::Stream;
@@ -38,6 +40,60 @@ pub struct SharedConnection {
     /// once per turn of the connection loop, and bounded: past
     /// `OUTPUT_HIGH_WATER` a body writer waits for a flush.
     output: RefCell<Output>,
+    /// Streams whose task has ended, waiting for the connection to take them
+    /// out of its map. Pushed by a `StreamToken` going out of scope and by
+    /// the END_STREAM that closes the peer's half — the two events that can
+    /// leave a stream with nothing left to do, in either order.
+    retired: RefCell<Vec<STREAM_ID>>,
+}
+
+/// What a stream task holds for as long as it runs, and what cleans up when
+/// it stops — however it stops. Returning normally, being reset by the peer,
+/// going down with its connection: all of them drop this.
+///
+/// The connection used to ask instead, walking every live stream once per
+/// turn of its loop to see which had finished. A task knows when it is done
+/// and nothing else does, so it is the task that says so.
+pub struct StreamToken {
+    id: StreamId,
+    stream: Rc<Stream>,
+    shared: Rc<SharedConnection>,
+}
+
+impl StreamToken {
+    pub fn new(id: StreamId, stream: Rc<Stream>, shared: Rc<SharedConnection>) -> Self {
+        Self { id, stream, shared }
+    }
+
+    pub fn id(&self) -> StreamId {
+        self.id
+    }
+
+    pub fn stream(&self) -> &Rc<Stream> {
+        &self.stream
+    }
+
+    pub fn shared(&self) -> &Rc<SharedConnection> {
+        &self.shared
+    }
+}
+
+impl Drop for StreamToken {
+    /// Our half of the stream is over (§5.1): the task wrote whatever it was
+    /// going to. Whatever body bytes it never consumed still hold connection
+    /// credit, and they go back here — `take_unreleased` zeroes as it reads,
+    /// so the removal that follows can safely ask again for whatever arrived
+    /// in between.
+    ///
+    /// The id goes on the retired list rather than out of the map directly:
+    /// the map is the connection's, and a task cannot touch it while the
+    /// connection may be in the middle of a frame.
+    fn drop(&mut self) {
+        self.stream.end_output();
+        self.shared
+            .release_stream_credit(self.stream.take_unreleased());
+        self.shared.retire(self.id.into());
+    }
 }
 
 /// Reached through the `Rc` every stream task holds, so its counters live
@@ -157,6 +213,7 @@ impl SharedConnection {
                 send_waiters: RefCell::new(Vec::new()),
             },
             output: RefCell::new(Output::new()),
+            retired: RefCell::new(Vec::new()),
         }
     }
 
@@ -331,6 +388,28 @@ impl SharedConnection {
             self.write_frame(|out| encode_window_update(out, stream_id, increment));
         }
         if let Some(increment) = self.window.release(taken) {
+            self.write_frame(|out| encode_window_update(out, StreamId::ZERO, increment));
+        }
+    }
+
+    /// Puts a stream up for removal from the connection's map. Both halves
+    /// report here — the task through its [`StreamToken`], the peer's
+    /// END_STREAM through the connection — because either may be the last to
+    /// finish, and only the connection can tell.
+    pub fn retire(&self, id: STREAM_ID) {
+        self.retired.borrow_mut().push(id);
+    }
+
+    /// The streams reported since the last call.
+    pub(crate) fn take_retired(&self) -> Vec<STREAM_ID> {
+        std::mem::take(&mut self.retired.borrow_mut())
+    }
+
+    /// Hands the peer back connection-level credit, writing the
+    /// WINDOW_UPDATE on stream 0 when enough has piled up. The frame goes
+    /// out beside the ledger entry, never after it.
+    pub fn release_stream_credit(&self, len: u32) {
+        if let Some(increment) = self.window.release(len) {
             self.write_frame(|out| encode_window_update(out, StreamId::ZERO, increment));
         }
     }
