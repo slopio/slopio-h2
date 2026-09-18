@@ -82,7 +82,7 @@ fn settings_flood() {
 fn priority_flood() {
     let mut bytes = preface();
     // §6.3: exclusive bit + dependency id, then weight.
-    for _ in 0..super::super::protocol::CONTROL_FRAME_BURST + 1 {
+    for _ in 0..super::super::protocol::ODD_FRAME_BURST + 1 {
         bytes.extend_from_slice(&frame(PRIORITY, 0, 1, &[0, 0, 0, 0, 15]));
     }
     let mut inbound = deliveries(&bytes);
@@ -169,7 +169,7 @@ fn empty_data_flood() {
     bytes.extend_from_slice(&frame(SETTINGS, 0, 0, &[]));
     // A stream left open: no END_STREAM, so DATA may keep arriving.
     bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, GET_BLOCK));
-    for _ in 0..super::super::protocol::CONTROL_FRAME_BURST * 2 {
+    for _ in 0..super::super::protocol::ODD_FRAME_BURST + 1 {
         bytes.extend_from_slice(&frame(0x0, 0, 1, &[]));
     }
     let mut inbound = deliveries(&bytes);
@@ -178,7 +178,7 @@ fn empty_data_flood() {
     let (code, reason) =
         goaway(&run_connection(inbound, |_, _| {})).expect("the flood was answered with a GOAWAY");
     assert_eq!(code, ENHANCE_YOUR_CALM);
-    assert_eq!(reason, "too many control frames");
+    assert_eq!(reason, "too many pointless frames");
 }
 
 /// CVE-2024-27316 — the CONTINUATION flood, with empty fragments.
@@ -196,7 +196,7 @@ fn continuation_flood_with_empty_fragments() {
     let mut bytes = preface();
     // A header block deliberately left open: no END_HEADERS, ever.
     bytes.extend_from_slice(&frame(HEADERS, 0, 1, GET_BLOCK));
-    for _ in 0..super::super::protocol::CONTROL_FRAME_BURST * 2 {
+    for _ in 0..super::super::protocol::ODD_FRAME_BURST + 1 {
         bytes.extend_from_slice(&frame(CONTINUATION, 0, 1, &[]));
     }
     let mut inbound = deliveries(&bytes);
@@ -205,7 +205,7 @@ fn continuation_flood_with_empty_fragments() {
     let (code, reason) =
         goaway(&run_connection(inbound, |_, _| {})).expect("the flood was answered with a GOAWAY");
     assert_eq!(code, ENHANCE_YOUR_CALM);
-    assert_eq!(reason, "too many control frames");
+    assert_eq!(reason, "too many pointless frames");
 }
 
 /// Not a CVE: the cost of the budget, stated as a test.
@@ -234,4 +234,33 @@ fn a_download_that_only_ever_sends_window_updates_trips_the_budget() {
     let (code, _) = goaway(&run_connection(inbound, |_, _| {}))
         .expect("the budget cannot tell a chatty download from a flood");
     assert_eq!(code, ENHANCE_YOUR_CALM);
+}
+
+/// The cost the strict budget must not have: a client still speaking the
+/// RFC 7540 priority scheme sends a PRIORITY frame with every request, and
+/// Firefox did exactly that for years. Ten times `ODD_FRAME_BURST` of them
+/// is fine, because each request clears the count — which is the whole
+/// reason the budget is a burst rather than a lifetime total.
+#[test]
+fn a_priority_frame_per_request_is_not_a_flood() {
+    let mut bytes = preface();
+    let mut id = 1u32;
+    for _ in 0..super::super::protocol::ODD_FRAME_BURST * 10 {
+        bytes.extend_from_slice(&frame(PRIORITY, 0, id, &[0, 0, 0, 0, 15]));
+        bytes.extend_from_slice(&frame(
+            HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            id,
+            GET_BLOCK,
+        ));
+        id += 2;
+    }
+    let mut inbound = deliveries(&bytes);
+    inbound.push(ReadEvent::Eof);
+
+    let written = run_connection(inbound, |_, _| {});
+    assert!(
+        goaway(&written).is_none(),
+        "a priority frame that comes with a request is not a pointless one",
+    );
 }

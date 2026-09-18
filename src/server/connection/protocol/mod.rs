@@ -52,6 +52,63 @@ pub(super) const FAULT_LIMIT: u32 = 100;
 /// rather than a common case — but the budget cannot tell it from a flood,
 /// which is the strongest argument for the rate this wants to become.
 pub(super) const CONTROL_FRAME_BURST: u32 = 10_000;
+
+/// Frames a peer may send in a row that a conforming one has no reason to
+/// send at all.
+///
+/// Far stricter than `CONTROL_FRAME_BURST` because the two bound different
+/// things. A PING is a keepalive and a WINDOW_UPDATE is how a download
+/// proceeds: legal, purposeful, and legitimately voluminous, so their budget
+/// has to be generous enough for the honest case — which is what leaves it
+/// too generous for frames that have no honest case. An empty CONTINUATION
+/// fragment is not a keepalive. Nothing a well-behaved peer does produces
+/// one, so a hundred in a row with no request between them is already a peer
+/// worth closing on, and a hundred is the same number `FAULT_LIMIT` allows
+/// for the same reason.
+///
+/// A burst cleared by progress, like the other, which is what keeps the one
+/// real user of these out of it: a client still speaking the RFC 7540
+/// priority scheme sends a PRIORITY frame per request, and the request
+/// clears the count.
+pub(super) const ODD_FRAME_BURST: u32 = 100;
+
+/// What a frame is worth to the connection, read off its type, length and
+/// flags — which is all `on_frame` has, and all the budgets need.
+enum FrameWorth {
+    /// Advances a request. Clears both budgets.
+    Progress,
+    /// Legal, purposeful and floodable: a keepalive PING, the SETTINGS of a
+    /// preface, the WINDOW_UPDATEs of a download.
+    Control,
+    /// Legal and purposeless — a frame that costs us a decode and a dispatch
+    /// and carries the peer nothing.
+    Odd,
+}
+
+impl FrameWorth {
+    fn of(kind: FrameKind, length: u32, flags: u8) -> Self {
+        match kind {
+            // §6.1: END_STREAM is 0x1. A zero-length DATA frame that ends
+            // the body is progress — `write_data` emits exactly that — and
+            // one that does not says nothing, while flow control accounts
+            // nothing for it either (CVE-2019-9518).
+            FrameKind::Data if length > 0 || flags & 0x1 != 0 => Self::Progress,
+            // A fragment carrying nothing adds nothing to the header block
+            // `MAX_HEADER_BLOCK_SIZE` bounds, so that cap never sees one
+            // however many arrive (CVE-2024-27316).
+            FrameKind::Headers | FrameKind::Continuation if length > 0 => Self::Progress,
+            FrameKind::Data | FrameKind::Headers | FrameKind::Continuation => Self::Odd,
+            // RFC 9218 deprecated the RFC 7540 priority scheme and we
+            // implement neither: the decoder validates a PRIORITY frame and
+            // emits nothing at all (CVE-2019-9513).
+            FrameKind::Priority => Self::Odd,
+            // §4.1: an unknown type MUST be ignored, which is what makes it
+            // free to send and not free to receive.
+            FrameKind::Unknown(_) => Self::Odd,
+            _ => Self::Control,
+        }
+    }
+}
 use runtime::{Handle, spawn};
 use rustc_hash::FxHashMap;
 
@@ -76,6 +133,9 @@ pub struct Protocol {
     /// Control frames since the last request frame, against
     /// `CONTROL_FRAME_BURST`.
     control_frames: u32,
+    /// Purposeless frames since the last request frame, against
+    /// `ODD_FRAME_BURST`.
+    odd_frames: u32,
 }
 
 struct Streams {
@@ -291,6 +351,7 @@ impl Protocol {
             closing: false,
             faults: 0,
             control_frames: 0,
+            odd_frames: 0,
         }
     }
 
@@ -352,44 +413,29 @@ impl Protocol {
             .write_frame(|out| encode_rst_stream(out, stream_id, error_code));
     }
 
-    /// §5.4.1 for a peer that sends control frames and nothing else. A frame
-    /// that carries a request is what counts as progress and clears the
-    /// burst; everything else adds to it, including a type the decoder is
-    /// going to ignore.
+    /// §5.4.1 for a peer that is not making requests.
     ///
-    /// Carrying a request means carrying *something*. A zero-length DATA
-    /// frame spends no flow control — §6.9 accounts nothing for it — and a
-    /// zero-length CONTINUATION adds nothing to the header block that
-    /// `MAX_HEADER_BLOCK_SIZE` bounds, so neither is ever refused by the
-    /// limit that looks like it should catch them: one counts bytes the
-    /// frame does not spend, the other bytes it does not carry. Both cost us
-    /// a decode, a dispatch and a wake, and buy the peer nothing. That is
-    /// CVE-2019-9518, and the empty-fragment form of CVE-2024-27316. Neither
-    /// may clear the budget, or a peer interleaving them escapes it.
-    ///
-    /// They are not refused, only counted. All three are legal frames —
-    /// §6.1 requires a zero-length DATA to carry END_STREAM at the end of a
-    /// body that fell on a frame boundary, and a header block may be split
-    /// anywhere — so what separates use from abuse is the volume, which is
-    /// what a budget is for.
-    ///
-    /// END_STREAM is the one exception: it closes the peer's half, which is
-    /// progress on any reading, and a stream can only be closed once.
-    fn count_control_frame(&mut self, kind: FrameKind, length: u32, flags: u8) {
-        // §6.1: END_STREAM is 0x1 on DATA.
-        let advances_a_request = match kind {
-            FrameKind::Data => length > 0 || flags & 0x1 != 0,
-            FrameKind::Headers | FrameKind::Continuation => length > 0,
-            _ => false,
-        };
-
-        if advances_a_request {
-            self.control_frames = 0;
-            return;
+    /// Two budgets watch the same stream of frames: a generous one for
+    /// control frames, which have honest uses at volume, and a strict one
+    /// for frames that have none. An odd frame spends both — it is not
+    /// progress either — so the strict budget is simply the one that runs
+    /// out first, and its message is the one the peer hears.
+    fn count_frame(&mut self, kind: FrameKind, length: u32, flags: u8) {
+        match FrameWorth::of(kind, length, flags) {
+            FrameWorth::Progress => {
+                self.control_frames = 0;
+                self.odd_frames = 0;
+            }
+            FrameWorth::Control => self.control_frames += 1,
+            FrameWorth::Odd => {
+                self.control_frames += 1;
+                self.odd_frames += 1;
+            }
         }
 
-        self.control_frames += 1;
-        if self.control_frames > CONTROL_FRAME_BURST {
+        if self.odd_frames > ODD_FRAME_BURST {
+            self.fail_connection(ENHANCE_YOUR_CALM, "too many pointless frames");
+        } else if self.control_frames > CONTROL_FRAME_BURST {
             self.fail_connection(ENHANCE_YOUR_CALM, "too many control frames");
         }
     }
@@ -658,7 +704,7 @@ impl FrameHandler for Protocol {
     /// SETTINGS — and not an ACK, which it cannot legitimately send before
     /// having seen ours.
     fn on_frame(&mut self, kind: FrameKind, _stream_id: StreamId, length: u32, flags: u8) {
-        self.count_control_frame(kind, length, flags);
+        self.count_frame(kind, length, flags);
 
         if !std::mem::take(&mut self.expect_settings) {
             return;
