@@ -16,8 +16,24 @@
 use popple_h2::server::{Server, ServerSettings, ServerTransport};
 use runtime::main_thread_with;
 
-// 16 KiB buffers × 2048 slots — the ring every inbound read lands in.
-runtime::define_buf_ring!(MyBufRing, bgid = 1, buffer_size = 16384, ring_size = 2048);
+// 64 KiB buffers × 512 slots — the ring every inbound read lands in.
+//
+// The buffer size is what a request body pays: a chunk is one dispatch
+// through the decoder and one wake of the stream task, so four times the
+// buffer is a quarter of the per-chunk cost. Measured on 1 MiB uploads, one
+// core, ingest against buffer size: 3.09 GB/s at 4 KiB, 4.52 at 16 KiB, 5.41
+// at 32 KiB, 6.20 at 64 KiB, 6.26 at 128 KiB — a knee at 64. Request rate on
+// small responses is flat across all of them (1.80-1.83M req/s, four runs
+// each), so this costs nothing on the other side.
+//
+// The slot count is what connections pay, and 32 MiB buys either. It is not
+// the throughput knob: 64 KiB × 2048 measured the same ingest as × 512 for
+// four times the memory. What it buys is headroom for connections that stop
+// being read — a long `drain` leaves a connection's inbound CQEs unpopped,
+// and each pins its buffer until the loop comes back. 512 slots served 512
+// connections here with no ENOBUFS, because the loop recycles each chunk as
+// soon as it is decoded.
+runtime::define_buf_ring!(MyBufRing, bgid = 1, buffer_size = 65536, ring_size = 512);
 
 fn main() {
     println!("listening on http://localhost:8080 (HTTP/2 cleartext, prior knowledge)");
