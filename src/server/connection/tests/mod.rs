@@ -10,6 +10,22 @@
 //! Declaring the world before the runtime starts is what makes these
 //! reproducible: a test that drove the ring while the loop ran would depend
 //! on when a task happened to be polled.
+//!
+//! They also run under Miri, which is where the `UnsafeCell` behind
+//! `StreamMap` is actually checked — a task removing its own entry while the
+//! connection is suspended is the aliasing this whole suite exercises by
+//! accident:
+//!
+//! ```text
+//! MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --lib server::connection
+//! ```
+//!
+//! Isolation has to come off because the timewheel samples the wall clock.
+//! Two tests report leaks at exit — the ones that end with streams still
+//! open: killing a task queues it for the scheduler to free, and `block_on`
+//! returns without popping the queue. That predates `StreamMap` (198
+//! allocations before it, 199 after, the one being the shared map a leaked
+//! token's `Weak` keeps alive) and belongs to the runtime's shutdown.
 
 mod cve;
 

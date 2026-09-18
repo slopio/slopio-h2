@@ -5,7 +5,7 @@ use http::{HeaderMap, StatusCode};
 use crate::server::connection::{
     CONNECTION_INITIAL_WINDOW_SIZE, CONNECTION_RECV_WINDOW, MAX_CONCURRENT_STREAMS,
     settings::Settings,
-    shared_with_streams::{SharedConnection, StreamToken},
+    shared_with_streams::{LiveStreams, SharedConnection, StreamToken, retire_if_closed},
 };
 use crate::server::{STREAM_ID, stream::Stream};
 use crate::shared::codec::{
@@ -110,8 +110,7 @@ impl FrameWorth {
         }
     }
 }
-use runtime::{Handle, spawn};
-use rustc_hash::FxHashMap;
+use runtime::spawn;
 
 /// The connection's side of the protocol: what every frame does to it.
 pub struct Protocol {
@@ -142,7 +141,9 @@ pub struct Protocol {
 struct Streams {
     last_client_stream_id: STREAM_ID,
     goaway_stream_id: Option<STREAM_ID>,
-    streams: FxHashMap<STREAM_ID, (Rc<Stream>, Handle<()>)>,
+    /// Shared with every stream task, so one can take itself out when it
+    /// ends rather than wait to be found.
+    streams: Rc<LiveStreams>,
 }
 
 enum Rejected {
@@ -190,9 +191,14 @@ impl Streams {
         }
 
         let stream = Rc::new(Stream::create(settings, headers).map_err(Rejected::Violation)?);
-        let token = StreamToken::new(id, Rc::clone(&stream), Rc::clone(shared));
+        let token = StreamToken::new(
+            id,
+            Rc::clone(&stream),
+            Rc::clone(shared),
+            Rc::downgrade(&self.streams),
+        );
         let handle = spawn(handle_stream(token));
-        self.streams.insert(raw, (stream, handle));
+        self.streams.insert(raw, stream, handle);
         Ok(())
     }
 
@@ -234,7 +240,7 @@ impl Streams {
         // `Violation`: a body in flight when we reset its stream would
         // otherwise count one fault per frame, and a refused POST or two
         // would trip `FAULT_LIMIT`.
-        let Some((stream, _)) = self.streams.get(&id) else {
+        let Some(stream) = self.streams.get(id) else {
             return Err(Rejected::Refused(STREAM_CLOSED));
         };
 
@@ -252,31 +258,6 @@ impl Streams {
             .map_err(Rejected::Violation)
     }
 
-    /// Takes out the streams that reported themselves done, if they are.
-    ///
-    /// Both halves report — the task by dropping its `StreamToken`, the peer
-    /// by its END_STREAM — and either may be last, so an id is only removed
-    /// once `is_closed` agrees. An id that arrives with the other half still
-    /// open is dropped here and reported again by whichever half closes
-    /// second.
-    ///
-    /// Costs what actually happened, where walking every live stream once
-    /// per turn of the loop cost what might have.
-    fn retire(&mut self, shared: &SharedConnection) {
-        for id in shared.take_retired() {
-            let Some((stream, _)) = self.streams.get(&id) else {
-                continue;
-            };
-            if !stream.is_closed() {
-                continue;
-            }
-            let (stream, _handle) = self.streams.remove(&id).expect("just looked it up");
-            // Whatever the token had not yet given back — body bytes that
-            // arrived after the task stopped reading.
-            shared.release_stream_credit(stream.take_unreleased());
-        }
-    }
-
     /// Every way out of the map. `kill` takes the handle by value, so the
     /// entry has to come out first; the task's future is dropped on the
     /// scheduler's next pass, which cancels whatever it had in flight. Safe
@@ -286,7 +267,7 @@ impl Streams {
     /// `None` when the id was never opened, which `reset_stream` still has
     /// to answer: REFUSED_STREAM is sent for streams that never existed.
     fn remove(&mut self, id: STREAM_ID, shared: &SharedConnection) -> Option<Rc<Stream>> {
-        let (stream, handle) = self.streams.remove(&id)?;
+        let (stream, handle) = self.streams.remove(id)?;
         handle.kill();
         // Body bytes the task never consumed still hold connection credit.
         release_connection_credit(shared, stream.take_unreleased());
@@ -297,8 +278,7 @@ impl Streams {
     /// stops the walk — the connection is over, the rest does not matter.
     fn adjust_send_windows(&self, delta: i32) -> Result<(), ()> {
         self.streams
-            .values()
-            .try_for_each(|(stream, _)| stream.adjust_send(delta))
+            .try_for_each(|stream| stream.adjust_send(delta))
     }
 
     /// An id absent from the map is a stream that closed and was removed: the
@@ -313,7 +293,7 @@ impl Streams {
             ));
         }
 
-        let Some((stream, _)) = self.streams.get(&id) else {
+        let Some(stream) = self.streams.get(id) else {
             return Ok(());
         };
         stream
@@ -337,7 +317,7 @@ impl Drop for Streams {
     /// is the connection's, so no stream task holds a borrow or a
     /// half-written frame.
     fn drop(&mut self) {
-        for (_, (_, handle)) in self.streams.drain() {
+        for (_stream, handle) in self.streams.take_all() {
             handle.kill();
         }
     }
@@ -358,7 +338,7 @@ impl Protocol {
             streams: Streams {
                 last_client_stream_id: 0,
                 goaway_stream_id: None,
-                streams: FxHashMap::default(),
+                streams: Rc::new(LiveStreams::new()),
             },
             expect_settings: false,
             preface_seen: false,
@@ -375,13 +355,6 @@ impl Protocol {
 
     pub(super) fn is_closing(&self) -> bool {
         self.closing
-    }
-
-    /// Takes the streams that reported themselves done out of the map. Once
-    /// per turn, after the tasks have had a chance to run and drop their
-    /// tokens.
-    pub(super) fn retire_finished(&mut self) {
-        self.streams.retire(&self.shared);
     }
 
     /// §5.4.1: a GOAWAY naming the last stream we took up, then no more
@@ -469,7 +442,7 @@ impl Protocol {
         match stream.recv_trailers(headers) {
             // §8.1: trailers carry END_STREAM, so this closes the peer's
             // half exactly as a final DATA frame would.
-            Ok(()) => self.shared.retire(id.into()),
+            Ok(()) => retire_if_closed(&self.streams.streams, &self.shared, id.into()),
             Err(violation) => self.fail_stream(id, violation),
         }
     }
@@ -580,9 +553,9 @@ impl FrameHandler for Protocol {
         );
 
         // The peer's half closing is the other half of what retires a
-        // stream; the task's token is the first.
+        // stream; the task's token is the first, and either may be last.
         if received.is_ok() && end_stream {
-            self.shared.retire(raw);
+            retire_if_closed(&self.streams.streams, &self.shared, raw);
         }
 
         if let Err(rejected) = received {
@@ -613,8 +586,7 @@ impl FrameHandler for Protocol {
         }
 
         // §8.1: an id already live takes these HEADERS as its trailers.
-        if let Some((stream, _)) = self.streams.streams.get(&raw) {
-            let stream = Rc::clone(stream);
+        if let Some(stream) = self.streams.streams.get(raw) {
             return self.on_trailers(stream, headers);
         }
 

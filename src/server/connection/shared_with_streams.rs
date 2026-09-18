@@ -6,6 +6,7 @@ use http::{HeaderMap, StatusCode};
 
 use crate::server::STREAM_ID;
 use crate::server::connection::output::Output;
+use crate::server::connection::stream_map::StreamMap;
 use crate::server::connection::{CONNECTION_INITIAL_WINDOW_SIZE, CONNECTION_RECV_WINDOW};
 use crate::server::stream::Stream;
 use crate::shared::{
@@ -18,6 +19,8 @@ use crate::shared::{
     },
     hpack::{Encoder, Header},
 };
+use runtime::Handle;
+use std::rc::Weak;
 
 /// Credit owed back to the peer before a WINDOW_UPDATE on stream 0 goes out.
 /// Half the window, as at stream level: the peer keeps the other half to
@@ -40,11 +43,30 @@ pub struct SharedConnection {
     /// once per turn of the connection loop, and bounded: past
     /// `OUTPUT_HIGH_WATER` a body writer waits for a flush.
     output: RefCell<Output>,
-    /// Streams whose task has ended, waiting for the connection to take them
-    /// out of its map. Pushed by a `StreamToken` going out of scope and by
-    /// the END_STREAM that closes the peer's half — the two events that can
-    /// leave a stream with nothing left to do, in either order.
-    retired: RefCell<Vec<STREAM_ID>>,
+}
+
+/// The connection's live streams. Each entry owns its stream and the handle
+/// of the task running it.
+pub type LiveStreams = StreamMap<Stream, Handle<()>>;
+
+/// Takes a stream out once both its halves are done (§5.1), handing back
+/// whatever connection credit it still held.
+///
+/// Called by whichever half closes last, which is why it checks rather than
+/// assumes: the task reports through its [`StreamToken`], the peer's
+/// END_STREAM reports through the connection, and either may be second.
+pub fn retire_if_closed(map: &LiveStreams, shared: &SharedConnection, id: STREAM_ID) {
+    if !map.get(id).is_some_and(|stream| stream.is_closed()) {
+        return;
+    }
+    let Some((stream, _handle)) = map.remove(id) else {
+        return;
+    };
+    // Body bytes no handler consumed still hold credit. `_handle` drops
+    // here, outside the map, which for a task retiring itself is that task
+    // detaching its own handle — sound because the scheduler holds a
+    // reference to the task for the whole poll its destructor runs in.
+    shared.release_stream_credit(stream.take_unreleased());
 }
 
 /// What a stream task holds for as long as it runs, and what cleans up when
@@ -58,11 +80,24 @@ pub struct StreamToken {
     id: StreamId,
     stream: Rc<Stream>,
     shared: Rc<SharedConnection>,
+    /// `Weak` because the map owns this token, by way of the handle of the
+    /// task that holds it: an `Rc` back would be a cycle neither ever leaves.
+    map: Weak<LiveStreams>,
 }
 
 impl StreamToken {
-    pub fn new(id: StreamId, stream: Rc<Stream>, shared: Rc<SharedConnection>) -> Self {
-        Self { id, stream, shared }
+    pub fn new(
+        id: StreamId,
+        stream: Rc<Stream>,
+        shared: Rc<SharedConnection>,
+        map: Weak<LiveStreams>,
+    ) -> Self {
+        Self {
+            id,
+            stream,
+            shared,
+            map,
+        }
     }
 
     pub fn id(&self) -> StreamId {
@@ -85,14 +120,15 @@ impl Drop for StreamToken {
     /// so the removal that follows can safely ask again for whatever arrived
     /// in between.
     ///
-    /// The id goes on the retired list rather than out of the map directly:
-    /// the map is the connection's, and a task cannot touch it while the
-    /// connection may be in the middle of a frame.
+    /// Then it takes itself out of the map, if the peer is done too. Safe to
+    /// do from here because a task only ever runs — and so only ever drops —
+    /// while the connection is suspended at an `await`, holding no reference
+    /// into the map; `StreamMap` is where that argument lives in full.
     fn drop(&mut self) {
         self.stream.end_output();
-        self.shared
-            .release_stream_credit(self.stream.take_unreleased());
-        self.shared.retire(self.id.into());
+        if let Some(map) = self.map.upgrade() {
+            retire_if_closed(&map, &self.shared, self.id.into());
+        }
     }
 }
 
@@ -213,7 +249,6 @@ impl SharedConnection {
                 send_waiters: RefCell::new(Vec::new()),
             },
             output: RefCell::new(Output::new()),
-            retired: RefCell::new(Vec::new()),
         }
     }
 
@@ -390,19 +425,6 @@ impl SharedConnection {
         if let Some(increment) = self.window.release(taken) {
             self.write_frame(|out| encode_window_update(out, StreamId::ZERO, increment));
         }
-    }
-
-    /// Puts a stream up for removal from the connection's map. Both halves
-    /// report here — the task through its [`StreamToken`], the peer's
-    /// END_STREAM through the connection — because either may be the last to
-    /// finish, and only the connection can tell.
-    pub fn retire(&self, id: STREAM_ID) {
-        self.retired.borrow_mut().push(id);
-    }
-
-    /// The streams reported since the last call.
-    pub(crate) fn take_retired(&self) -> Vec<STREAM_ID> {
-        std::mem::take(&mut self.retired.borrow_mut())
     }
 
     /// Hands the peer back connection-level credit, writing the

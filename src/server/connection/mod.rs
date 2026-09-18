@@ -8,6 +8,7 @@ mod output;
 mod protocol;
 pub(crate) mod settings;
 mod shared_with_streams;
+mod stream_map;
 #[cfg(test)]
 mod tests;
 
@@ -85,9 +86,9 @@ impl<T: Transport> Connection<T> {
             self.flush().await?;
             // The tasks this turn spawned or woke — and the ones the flush
             // just gave room to — have not run yet; they only do once we
-            // yield. Let them, then retire the ones that finished.
+            // yield. Let them. A task that ends takes itself out of the
+            // stream map as it goes, so there is nothing to collect after.
             runtime::yield_now().await;
-            self.protocol.retire_finished();
             if self.protocol.shared().output_is_empty() {
                 return Ok(());
             }
