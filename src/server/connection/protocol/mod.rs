@@ -43,7 +43,7 @@ const FAULT_LIMIT: u32 = 100;
 /// WINDOW_UPDATEs, but it is a stream of DATA too. A flood reaches this in
 /// milliseconds; a keepalive PING every 10s on a wholly idle connection would
 /// need a day. A rate is still the proper refinement, as for `FAULT_LIMIT`.
-const CONTROL_FRAME_BURST: u32 = 10_000;
+pub(super) const CONTROL_FRAME_BURST: u32 = 10_000;
 use runtime::{Handle, spawn};
 use rustc_hash::FxHashMap;
 

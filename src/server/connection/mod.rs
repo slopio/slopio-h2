@@ -6,6 +6,8 @@ use runtime_streams::StreamExt;
 
 mod output;
 mod protocol;
+#[cfg(test)]
+mod tests;
 pub(crate) mod settings;
 mod shared_with_streams;
 
