@@ -19,7 +19,7 @@ use crate::shared::codec::{
         stream_id::StreamId,
     },
     types::{
-        DecodeError, ENHANCE_YOUR_CALM, FLOW_CONTROL_ERROR, PROTOCOL_ERROR, REFUSED_STREAM,
+        DecodeError, ENHANCE_YOUR_CALM, FLOW_CONTROL_ERROR, NO_ERROR, PROTOCOL_ERROR, REFUSED_STREAM,
         STREAM_CLOSED, Setting, StreamViolation,
     },
 };
@@ -218,6 +218,15 @@ impl Streams {
     /// its padding; `padded_len` is what flow control accounts for. `Ok` is
     /// the payload buffered: only its padding is lost. On `Err` nothing was
     /// consumed.
+    /// Whether the stream under `id` is being fed too slowly to be a body.
+    /// A stream that has already gone answers `false`: there is nothing left
+    /// to reset.
+    fn body_is_starving(&self, id: STREAM_ID) -> bool {
+        self.streams
+            .get(id)
+            .is_some_and(|stream| stream.body_is_starving())
+    }
+
     fn recv_data(
         &mut self,
         id: STREAM_ID,
@@ -351,6 +360,25 @@ impl Protocol {
 
     pub(super) fn shared(&self) -> &SharedConnection {
         &self.shared
+    }
+
+    /// Whether any stream is open, which is what separates an idle connection
+    /// from one holding state on the peer's behalf.
+    pub(super) fn has_live_streams(&self) -> bool {
+        self.streams.streams.len() > 0
+    }
+
+    /// The peer said nothing for long enough. §6.8 GOAWAY rather than a
+    /// silent close, so the peer can tell a deadline from a broken network.
+    ///
+    /// NO_ERROR and not ENHANCE_YOUR_CALM: reaching the idle deadline is not
+    /// misbehaviour, it is the connection having served its purpose, and a
+    /// client that reconnects on NO_ERROR is doing the right thing. The peer
+    /// that *was* misbehaving — the one holding a half-sent frame — is told
+    /// the same thing, because the two are indistinguishable from here and
+    /// nothing is gained by guessing.
+    pub(super) fn time_out(&mut self) {
+        self.fail_connection(NO_ERROR, "idle too long");
     }
 
     pub(super) fn is_closing(&self) -> bool {
@@ -556,6 +584,16 @@ impl FrameHandler for Protocol {
         // stream; the task's token is the first, and either may be last.
         if received.is_ok() && end_stream {
             retire_if_closed(&self.streams.streams, &self.shared, raw);
+        }
+
+        // Judged on DATA because that is when the evidence changes, and only
+        // while the body is still coming: a peer that has sent END_STREAM owes
+        // nothing more, however slowly it got there. A stream that is starved
+        // of DATA entirely never reaches here at all — `ACTIVE_TICKS` is
+        // what collects that one, at the connection.
+        if received.is_ok() && !end_stream && self.streams.body_is_starving(raw) {
+            self.reset_stream(stream_id, ENHANCE_YOUR_CALM);
+            return self.count_fault("too many starved bodies");
         }
 
         if let Err(rejected) = received {

@@ -73,6 +73,69 @@ pub const CONNECTION_RECV_WINDOW: u32 = 1024 * 1024;
 /// once that day comes, since the rate is the thing actually meant.
 pub const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The one duration any read deadline is ever armed for.
+///
+/// Every wait below is a count of these rather than a timer of its own length,
+/// and that is a performance decision, not a stylistic one. The runtime keeps a
+/// store for exactly this duration, separate from its timewheel, and it is the
+/// only one a read can afford: a timer is armed and cancelled on *every* chunk,
+/// some 300k times a second per core, and a wheel entry is reclaimed when the
+/// wheel ticks past it rather than when it is cancelled. Arming 30s on the
+/// wheel at that rate measured 178 MB of RSS at 100 connections against 10 MB
+/// here — half a minute of dead slots, all live at once.
+///
+/// It also caps how long anything below can hold a connection: a deadline is
+/// only as precise as this, and all of them are multiples of it.
+pub const DEADLINE_TICK: Duration = Duration::from_secs(5);
+
+/// How long a peer with nothing outstanding may send nothing at all.
+///
+/// This is the keepalive policy, and it is ours to choose: HTTP/2 has no
+/// `Keep-Alive` header — §8.2.2 forbids it along with `Connection` — and the
+/// RFC sets no idle timeout anywhere. A connection is meant to be long-lived
+/// and §6.7 gives the peer PING to say so, so this only has to outlast a
+/// reasonable keepalive interval. Two minutes sits above the usual ones and
+/// below the NAT rebind windows that would strand a connection anyway.
+///
+/// 24 ticks of 5s: two minutes.
+pub const IDLE_TICKS: u32 = 24;
+
+/// How long a peer that has a stream open may send nothing.
+///
+/// Stricter than idle because the connection is holding state on its behalf: a
+/// live stream owns one of `MAX_CONCURRENT_STREAMS`, a receive window, and
+/// whatever its body has buffered. A peer that opens 64 streams and goes quiet
+/// is not idle, it is parked on everything the connection has.
+///
+/// 6 ticks of 5s: thirty seconds.
+pub const ACTIVE_TICKS: u32 = 6;
+
+/// How long a peer may leave something half-sent.
+///
+/// The slowloris deadline, and the strict one, because a half-sent thing is
+/// pathological rather than merely slow. Two states qualify: a preface that has
+/// not finished arriving, and a header block between its HEADERS and its
+/// CONTINUATION — which §6.10 makes worse than it looks, since no frame for any
+/// *other* stream may be interleaved, so one peer's unfinished block stops the
+/// whole connection. `FrameDecoder::header_pending` folds in a frame header too
+/// short to carry its kind, on the grounds that nine bytes taking seconds is
+/// pathological whatever it turns out to introduce.
+///
+/// Enforced twice over, and it needs both. The tick count catches a peer that
+/// goes silent mid-frame. `Connection::partial_since` catches the one that does
+/// not: a peer dribbling a byte every four seconds resets the tick count for
+/// ever, and only a budget measured from when the half-sent state *began* ends
+/// it. That peer is slowloris exactly.
+///
+/// 2 ticks of 5s: ten seconds. Nothing legitimate starts a frame and then
+/// waits — the bytes were already written by a peer that had them.
+pub const PARTIAL_TICKS: u32 = 2;
+
+/// The wall-clock form of [`PARTIAL_TICKS`], for the budget that a dribbling
+/// peer cannot reset.
+pub const PARTIAL_TIMEOUT: Duration =
+    Duration::from_secs(DEADLINE_TICK.as_secs() * PARTIAL_TICKS as u64);
+
 /// One HTTP/2 connection: bytes come in through `transport`, `decoder` cuts
 /// them into frames, and each frame is dispatched into `protocol`.
 ///
@@ -84,6 +147,15 @@ pub struct Connection<T: Transport> {
     transport: T,
     decoder: FrameDecoder,
     protocol: Protocol,
+    /// When the peer last entered a half-sent state, cleared when it leaves
+    /// one. `None` is a connection that owes us nothing in particular.
+    ///
+    /// The whole reason [`PARTIAL_TIMEOUT`] is measured from here and not from
+    /// the last byte: an inactivity deadline resets on every byte, so a peer
+    /// that dribbles just faster than it holds the connection for ever, which
+    /// is precisely what slowloris does. A budget for *finishing* what it
+    /// started cannot be reset by sending more of it.
+    partial_since: Option<std::time::SystemTime>,
 }
 
 impl<T: Transport> Connection<T> {
@@ -92,6 +164,7 @@ impl<T: Transport> Connection<T> {
             transport,
             decoder: FrameDecoder::new(),
             protocol: Protocol::new(),
+            partial_since: None,
         }
     }
 
@@ -102,17 +175,46 @@ impl<T: Transport> Connection<T> {
     /// stream task while we wait on `recv` only leaves with the next inbound
     /// chunk; a select on "output ready" is what fixes that, later.
     pub async fn run(mut self) {
+        // Expiries in a row with nothing from the peer. Any byte resets it,
+        // so this counts silence and not time.
+        let mut expiries = 0;
         loop {
-            match self.recv().await {
+            // Read fresh each turn: what the peer owes us changes with what it
+            // has half-sent, and a connection that was idle a moment ago is
+            // mid-header now.
+            let Some(allowed) = self.read_deadline() else {
+                // The budget for a half-sent frame is spent, and no arming
+                // would help: more of the same frame is what it would buy.
+                self.protocol.time_out();
+                let _ = self.drain().await;
+                return;
+            };
+            match timeout(DEADLINE_TICK, self.recv()).await {
+                Err(()) => {
+                    expiries += 1;
+                    if expiries < allowed {
+                        // Not the whole wait yet. Nothing is drained here, as
+                        // nothing was read — the loop's existing rule that
+                        // output leaves with the next inbound chunk is not
+                        // changed by a deadline that has not expired.
+                        continue;
+                    }
+                    // §6.8: say so rather than vanishing. The GOAWAY is queued,
+                    // so it needs the drain below to reach the peer.
+                    self.protocol.time_out();
+                    let _ = self.drain().await;
+                    return;
+                }
                 // Half-close: the peer sends no more, but is still owed
                 // whatever is queued.
-                None => break,
-                Some(Err(e)) => {
+                Ok(None) => break,
+                Ok(Some(Err(e))) => {
                     eprintln!("transport error: {e}");
                     return;
                 }
-                Some(Ok(())) => {}
+                Ok(Some(Ok(()))) => {}
             }
+            expiries = 0;
             if self.drain().await.is_err() {
                 return;
             }
@@ -149,6 +251,36 @@ impl<T: Transport> Connection<T> {
                 return Ok(());
             }
         }
+    }
+
+    /// How long the peer may say nothing, given what it has left half-said.
+    ///
+    /// Three states rather than one deadline, because the honest reasons for
+    /// silence differ by an order of magnitude between them. A peer with
+    /// nothing outstanding is entitled to sit there; a peer that stopped in the
+    /// middle of a frame is not.
+    ///
+    /// Dropping the read future is safe where dropping a send is not:
+    /// `MultiRecv` queues its completions in a buffer it owns and `poll_next`
+    /// drains that queue, so the multishot stays armed and nothing is lost
+    /// between one poll and the next.
+    /// How many consecutive [`DEADLINE_TICK`]s of silence the peer may have,
+    /// or `None` when it has already run out of time.
+    fn read_deadline(&mut self) -> Option<u32> {
+        if !self.decoder.preface_seen() || self.decoder.header_pending() {
+            let now = runtime::runtime::now();
+            let since = *self.partial_since.get_or_insert(now);
+            // Floors at zero on a clock that stepped backwards, as
+            // `Stream::age` does, so a clock adjustment cannot close a
+            // connection.
+            let waited = now.duration_since(since).unwrap_or_default();
+            return (waited < PARTIAL_TIMEOUT).then_some(PARTIAL_TICKS);
+        }
+        self.partial_since = None;
+        Some(match self.protocol.has_live_streams() {
+            true => ACTIVE_TICKS,
+            false => IDLE_TICKS,
+        })
     }
 
     /// Once true, nothing more should be read: a connection error has been

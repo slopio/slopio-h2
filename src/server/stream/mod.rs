@@ -15,6 +15,26 @@ use crate::{
 mod input_data;
 mod stream_window;
 
+/// How long a body is given before its rate is judged at all.
+///
+/// Covers the first round trip and the handler's first poll, so a stream is
+/// never failed for the time it took to get started. Five seconds is far more
+/// than either needs and costs an attacker five seconds a stream, which is not
+/// a budget worth having.
+const BODY_GRACE: Duration = Duration::from_secs(5);
+
+/// Bytes per second below which a request body is not slow but held.
+///
+/// This is a floor, not a service level, and it is set where it is because the
+/// honest slow case has to pass it comfortably: 256 B/s is about a fortieth of
+/// a 2G link, so any peer actually sending a body clears it by orders of
+/// magnitude. What it does not clear is the attack, which sends one byte per
+/// frame and per minute to hold a stream open for nothing.
+///
+/// Read with `BODY_GRACE`, this is what a peer must have sent by the time it
+/// is first judged: 1280 bytes at five seconds.
+const MIN_BODY_RATE: u64 = 256;
+
 /// Reached only through an `Rc` shared with the stream task, so everything the
 /// connection mutates while a frame is being decoded lives behind a `Cell`.
 ///
@@ -112,6 +132,41 @@ impl Stream {
         runtime::runtime::now()
             .duration_since(self.created_at)
             .unwrap_or_default()
+    }
+
+    /// Whether this stream's body is arriving too slowly to be a body.
+    ///
+    /// A rate and not a deadline, because a deadline cannot tell a large
+    /// upload from a slow one: 100 MB legitimately takes longer than 1 KB, and
+    /// any single duration that lets the first through lets a peer hold a
+    /// stream for exactly that long with one byte. Bytes over age says the
+    /// same thing about both.
+    ///
+    /// Nothing is judged before `BODY_GRACE`. A stream milliseconds old has no
+    /// meaningful rate — the first DATA frame of a perfectly healthy upload
+    /// arrives when it arrives — and dividing by an age near zero is how a
+    /// defence starts killing the requests it exists to protect.
+    ///
+    /// `age` is measured from the stream opening, not from the last frame, so
+    /// this is an average and not an instantaneous rate: a peer cannot bank
+    /// credit by starting fast and then stalling, which is what a
+    /// since-last-frame measure would allow. It also means the clock runs
+    /// while a handler is thinking, which is why the rate has to be set low
+    /// enough to be an insult rather than a service level.
+    ///
+    /// Fails open on a clock that stepped backwards: [`Stream::age`] floors at
+    /// zero, so the comparison reads as infinitely fast rather than as a
+    /// stalled peer.
+    pub fn body_is_starving(&self) -> bool {
+        let age = self.age();
+        if age < BODY_GRACE {
+            return false;
+        }
+        // Multiply rather than divide: `age` is at least `BODY_GRACE` here, so
+        // there is no division by zero to guard, and no rounding to argue
+        // about.
+        let owed = MIN_BODY_RATE.saturating_mul(age.as_secs());
+        self.received.get() < owed
     }
 
     /// A WINDOW_UPDATE on this stream. The task may be waiting on exactly

@@ -6,16 +6,18 @@
 //! costs itself — none of them is a malformed frame, which is why the frame
 //! decoder catches none of them and most defences here are budgets.
 //!
-//! Two kinds of test, and the difference matters when one changes colour.
-//! Most assert the defence that stops the attack: a budget, or — for the
-//! header-list pair and the HPACK bomb — the decoder counting what a block
-//! expands to rather than the bytes it read.
+//! Three kinds of defence appear here, and which one catches an attack is the
+//! interesting part. A *budget* counts frames and is cleared by progress,
+//! which is what stops the floods. A *size cap* counts what a header block
+//! expands to rather than the bytes it arrived in, which is what stops the
+//! bombs. A *deadline* measures time, and is the only thing that sees the
+//! slowloris group at the bottom — those peers send almost nothing, so no
+//! budget ever increments and no cap is ever approached.
 //!
-//! The slowloris group at the bottom asserts the opposite. Those attacks are
-//! not defended at all, and each test pins what happens today and names what
-//! would close it. They pass because nothing stops them, so a passing suite is
-//! not the same as a hardened server; the day a read deadline lands, those
-//! three fail and are the checklist for rewriting.
+//! The deadline tests come in pairs on purpose: the attack, and the honest
+//! peer that looks like it. A defence that cannot tell a slow upload from a
+//! held stream is not a defence, so `a_slow_but_honest_request_body_is_served`
+//! is as load-bearing as the attack beside it.
 
 use std::time::Duration;
 
@@ -24,10 +26,11 @@ use runtime_core::deterministic_testing::{ReadEvent, Scripted};
 use super::{
     CONTINUATION, DATA, FLAG_END_HEADERS, FLAG_END_STREAM, Frame, GET_BLOCK, GOAWAY, HEADERS, PING,
     PREFACE, PRIORITY, RST_STREAM, SETTINGS, WINDOW_UPDATE, deliveries, frame, pings,
-    run_connection_timed,
-    run_connection,
+    run_connection, run_connection_timed,
 };
-use crate::shared::codec::types::{COMPRESSION_ERROR, ENHANCE_YOUR_CALM, REFUSED_STREAM};
+use crate::shared::codec::types::{
+    COMPRESSION_ERROR, ENHANCE_YOUR_CALM, NO_ERROR, REFUSED_STREAM,
+};
 
 /// The GOAWAY a connection was closed with, if it was.
 fn goaway(written: &[Frame]) -> Option<(u32, String)> {
@@ -486,51 +489,50 @@ fn made_you_reset() {
 // ---------------------------------------------------------------------------
 // Slowloris: the attacks that cost time rather than frames.
 //
-// Every budget above counts frames and is cleared by progress, so none of them
-// sees a peer whose whole method is to send almost nothing. These three assert
-// what happens today, which is nothing, and each names what would stop it.
-// They pass; that is the problem they record.
+// The budgets above all count frames and are cleared by progress, so none of
+// them sees a peer whose whole method is to send almost nothing. These are the
+// deadlines instead, and each names the state it is measuring.
 // ---------------------------------------------------------------------------
 
-/// Slowloris — the 24-byte preface, one byte every half hour.
+/// Slowloris proper — a preface dribbled a byte at a time, *faster* than the
+/// deadline it is trying to outlast.
 ///
-/// Budgets increment in `on_frame`, which only fires on a *complete* frame, so
-/// a peer that never finishes one is never counted. Twelve hours here, and the
-/// connection is as welcome at the end as at the start.
+/// Five seconds between bytes against a ten-second budget, which is the whole
+/// point: an inactivity timer resets on every byte and would never fire here,
+/// so this peer would hold the connection for the two minutes its preface
+/// takes and then start on a header block. `PARTIAL_TIMEOUT` is spent from the
+/// moment the half-sent state began and sending more of the same does not
+/// refill it.
 ///
-/// `FrameDecoder::header_pending` already knows this shape — its comment says
-/// "nine bytes that take seconds to arrive are pathological whatever they turn
-/// out to introduce" — and has no callers. A deadline on the preface, read off
-/// the same clock `Stream::created_at` uses, is what would close this.
+/// Nothing is written back: §3.4 answers an unfinished preface with silence,
+/// not a GOAWAY, so the absence of frames *is* the connection being dropped —
+/// a peer that got its preface in would have had our SETTINGS.
 #[test]
-fn slowloris_a_dribbled_preface_is_never_closed() {
-    let half_hour = Duration::from_secs(1800);
-    // Growing delays: `after` counts from the moment the op is armed, so equal
-    // ones would all land together and the peer would not be slow at all.
-    let mut inbound: Vec<Scripted> = PREFACE
+fn slowloris_a_dribbled_preface_is_cut_off() {
+    let gap = Duration::from_secs(5);
+    let inbound: Vec<Scripted> = PREFACE
         .iter()
         .enumerate()
-        .map(|(i, byte)| ReadEvent::Data(vec![*byte]).after(half_hour * (i as u32 + 1)))
+        .map(|(i, byte)| ReadEvent::Data(vec![*byte]).after(gap * (i as u32 + 1)))
         .collect();
-    inbound.push(ReadEvent::Eof.after(half_hour * (PREFACE.len() as u32 + 1)));
 
     let written = run_connection_timed(inbound, |_, _| {});
 
-    assert_eq!(
-        goaway(&written),
-        None,
-        "twelve hours of one byte each and nothing objected"
+    assert!(
+        written.is_empty(),
+        "dropped mid-preface, in silence: {written:?}"
     );
 }
 
-/// The same peer, having finished its preface and stopped: a connection held
-/// open for a day without a single request.
+/// The same peer once its preface is in, holding a connection open having
+/// asked for nothing.
 ///
-/// It costs us ~11.5 KiB of connection state, an fd and a slab entry, and
-/// there is no idle deadline to reclaim any of it. What would close this is an
-/// age check on a connection that has never opened a stream.
+/// Closed after `IDLE_TICKS` with NO_ERROR: an idle connection is not
+/// misbehaving, it is finished, and a client that reconnects on NO_ERROR is
+/// doing the right thing. This is the keepalive policy — HTTP/2 has no header
+/// for it and the RFC sets no deadline, so it is ours to pick.
 #[test]
-fn an_idle_connection_is_never_closed() {
+fn an_idle_connection_is_closed_when_the_keepalive_runs_out() {
     let written = run_connection_timed(
         vec![
             ReadEvent::Data(preface()).into(),
@@ -539,19 +541,19 @@ fn an_idle_connection_is_never_closed() {
         |_, _| {},
     );
 
-    assert_eq!(goaway(&written), None, "a day idle and still welcome");
+    let (code, _) = goaway(&written).expect("an idle connection is closed, and told so");
+    assert_eq!(code, NO_ERROR);
 }
 
-/// A HEADERS that never ends, which is worse than an idle connection: §6.10
-/// forbids any frame between a HEADERS and its CONTINUATION, so this blocks
-/// every *other* stream on the connection too, not just its own.
+/// A HEADERS that never ends — worse than idle, because §6.10 forbids any
+/// frame between a HEADERS and its CONTINUATION, so this blocks every *other*
+/// stream on the connection and not just its own.
 ///
-/// One frame, then silence, and the connection is stuck for as long as the
-/// peer likes. `header_pending()` is exactly the predicate for this and is
-/// still uncalled; a deadline on a pending header block is what would close
-/// it.
+/// Caught by the same budget as the dribbled preface, and for the same reason:
+/// `header_pending()` is the predicate, and it was written for this long
+/// before anything called it.
 #[test]
-fn an_unfinished_header_block_holds_the_connection_open() {
+fn an_unfinished_header_block_is_cut_off() {
     let mut bytes = preface();
     // No END_HEADERS, and no CONTINUATION will ever come.
     bytes.extend_from_slice(&frame(HEADERS, 0, 1, GET_BLOCK));
@@ -564,9 +566,69 @@ fn an_unfinished_header_block_holds_the_connection_open() {
         |_, _| {},
     );
 
-    assert_eq!(goaway(&written), None, "a day mid-header and still open");
+    let (code, _) = goaway(&written).expect("a block that never ends is not waited on for ever");
+    assert_eq!(code, NO_ERROR);
+}
+
+/// A request body arriving a byte at a time: the upload side of the same idea,
+/// and the one the connection deadlines cannot see, since the peer is sending
+/// constantly and the connection is never idle.
+///
+/// What catches it is the stream's own rate — bytes over age — which is why it
+/// has to be a rate and not a deadline: this peer is indistinguishable from a
+/// large upload by any measure that only asks how long the stream has been
+/// open.
+#[test]
+fn a_dribbled_request_body_is_reset() {
+    let mut open = preface();
+    // No END_STREAM: a body is coming.
+    open.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, GET_BLOCK));
+
+    let second = Duration::from_secs(1);
+    let mut inbound: Vec<Scripted> = vec![ReadEvent::Data(open).into()];
+    // One byte a second, well under `MIN_BODY_RATE`, for long enough to pass
+    // `BODY_GRACE` and be judged.
+    for i in 1..30u32 {
+        inbound.push(ReadEvent::Data(frame(DATA, 0, 1, b"x")).after(second * i));
+    }
+    inbound.push(ReadEvent::Eof.after(second * 30));
+
+    let written = run_connection_timed(inbound, |_, _| {});
+
+    let reset = written
+        .iter()
+        .find(|f| f.kind == RST_STREAM)
+        .expect("a starved body is reset");
+    assert_eq!(
+        u32::from_be_bytes(reset.payload[..4].try_into().unwrap()),
+        ENHANCE_YOUR_CALM
+    );
+}
+
+/// The same shape at an honest rate, which must be served: a defence that
+/// cannot tell a slow upload from a held stream is not a defence, it is an
+/// outage. 4 KiB a second against a 256 B/s floor.
+#[test]
+fn a_slow_but_honest_request_body_is_served() {
+    let mut open = preface();
+    open.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, GET_BLOCK));
+
+    let second = Duration::from_secs(1);
+    let mut inbound: Vec<Scripted> = vec![ReadEvent::Data(open).into()];
+    let chunk = vec![b'x'; 4096];
+    for i in 1..12u32 {
+        inbound.push(ReadEvent::Data(frame(DATA, 0, 1, &chunk)).after(second * i));
+    }
+    inbound.push(ReadEvent::Data(frame(DATA, FLAG_END_STREAM, 1, b"")).after(second * 12));
+
+    let written = run_connection_timed(inbound, |_, _| {});
+
     assert!(
         !written.iter().any(|f| f.kind == RST_STREAM),
-        "and the half-open stream was never reclaimed: {written:?}"
+        "an honest upload is not reset: {written:?}"
+    );
+    assert!(
+        written.iter().any(|f| f.kind == HEADERS),
+        "and it gets its response: {written:?}"
     );
 }

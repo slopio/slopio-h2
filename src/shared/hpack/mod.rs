@@ -6,6 +6,8 @@
 
 mod decoder;
 mod encoder;
+#[cfg(test)]
+mod microbench;
 pub(crate) mod header;
 pub(crate) mod huffman;
 mod table;
