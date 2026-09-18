@@ -32,7 +32,7 @@ mod cve;
 use std::time::Duration;
 
 use runtime_core::deterministic_testing::{
-    FakeRing, FakeRingHandle, ReadEvent, WriteEvent, simulated_socket,
+    FakeRing, FakeRingHandle, ReadEvent, Scripted, WriteEvent, simulated_socket,
 };
 use runtime_core::runtime::RuntimeInner;
 
@@ -139,6 +139,19 @@ fn frames(bytes: &[u8]) -> Vec<Frame> {
 /// every frame it wrote.
 pub(super) fn run_connection(
     inbound: Vec<ReadEvent>,
+    script: impl FnOnce(&FakeRingHandle, i32),
+) -> Vec<Frame> {
+    run_connection_timed(inbound.into_iter().map(Into::into).collect(), script)
+}
+
+/// As [`run_connection`], with every delivery's arrival time declared.
+///
+/// `ReadEvent::after` holds a completion back from the moment the op is armed,
+/// not from the delivery before it, so a peer that dribbles is written with
+/// delays that grow — the timeline is ordered by due time, and equal delays
+/// would land together. The clock is virtual, so a test may spend hours.
+pub(super) fn run_connection_timed(
+    inbound: Vec<Scripted>,
     script: impl FnOnce(&FakeRingHandle, i32),
 ) -> Vec<Frame> {
     let (fake, handle) = FakeRing::builder().virtual_time().build();
