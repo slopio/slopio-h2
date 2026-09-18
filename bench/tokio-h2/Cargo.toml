@@ -8,6 +8,7 @@ bytes = "1"
 h2 = "0.4"
 http = "1"
 tokio = { version = "1", features = ["full"] }
+socket2 = { version = "0.5", features = ["all"] }
 
 # popple-h2 gets mimalloc whether it asks for it or not — `runtime` installs it
 # as the global allocator. Comparing its memory against a glibc-malloc tokio

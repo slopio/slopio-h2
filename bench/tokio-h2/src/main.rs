@@ -38,20 +38,56 @@ fn main() {
         .build()
         .unwrap();
 
-    println!("tokio+h2 on :{port}, {threads} worker thread(s)");
-    rt.block_on(serve(port));
+    // Defaults match popple-h2: one listener per worker, 1024 backlog each.
+    let listeners: usize = env::var("LISTENERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(threads);
+    let backlog: i32 = env::var("BACKLOG")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024);
+
+    println!("tokio+h2 on :{port}, {threads} worker(s), {listeners} listener(s), backlog {backlog}");
+    rt.block_on(serve(port, listeners, backlog));
 }
 
-async fn serve(port: u16) {
-    let listener = TcpListener::bind(("0.0.0.0", port)).await.unwrap();
-    loop {
-        match listener.accept().await {
-            Ok((socket, _)) => {
-                tokio::spawn(connection(socket));
+/// One `SO_REUSEPORT` listener per accept task, with an explicit backlog.
+///
+/// Not a detail: popple-h2's `MultiAccept` sets `SO_REUSEPORT` and binds one
+/// listener per worker, so a single-listener tokio is being compared on accept
+/// capacity as much as on request handling. At 20 000 connections that showed
+/// up as 68 462 `ListenOverflows` against popple's 4 903, and the dropped SYNs
+/// come back as client retransmit backoff — a 7s tail that has nothing to do
+/// with how fast a request is served.
+fn listener_for(port: u16, backlog: i32) -> TcpListener {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+    socket.set_reuse_address(true).unwrap();
+    socket.set_reuse_port(true).unwrap();
+    socket.set_nonblocking(true).unwrap();
+    socket
+        .bind(&std::net::SocketAddr::from(([0, 0, 0, 0], port)).into())
+        .unwrap();
+    socket.listen(backlog).unwrap();
+    TcpListener::from_std(std::net::TcpListener::from(socket)).unwrap()
+}
+
+async fn serve(port: u16, listeners: usize, backlog: i32) {
+    for _ in 0..listeners {
+        let listener = listener_for(port, backlog);
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((socket, _)) => {
+                        tokio::spawn(connection(socket));
+                    }
+                    Err(e) => eprintln!("accept: {e}"),
+                }
             }
-            Err(e) => eprintln!("accept: {e}"),
-        }
+        });
     }
+    std::future::pending::<()>().await
 }
 
 /// Nagle off, as io_uring sends on the popple-h2 side are not batched by the
