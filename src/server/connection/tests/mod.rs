@@ -228,17 +228,16 @@ fn a_request_is_answered_through_the_whole_loop() {
     assert_eq!(written[3].stream_id, 1);
     assert_eq!(written[3].flags & FLAG_END_HEADERS, FLAG_END_HEADERS);
 
-    // RFC 9110 §6.6.1: an origin server with a clock sends `Date`. Decoded
-    // rather than matched on the bytes, since HPACK is free to Huffman it.
+    // Decoded rather than matched on the bytes, since HPACK is free to
+    // Huffman a value. §8.3: the status is the only field a response must
+    // carry, and the placeholder handler sets none of its own.
     let head = decode_block(&written[3].payload);
     assert_eq!(head.get(":status").map(String::as_str), Some("200"));
-    let date = head.get("date").expect("the response carries a Date");
     assert_eq!(
-        date.len(),
-        29,
-        "IMF-fixdate is fixed width (§5.6.7): {date}"
+        head.len(),
+        1,
+        "nothing is added to a response head: {head:?}"
     );
-    assert!(date.ends_with(" GMT"), "not IMF-fixdate: {date}");
 
     assert_eq!(written[4].kind, DATA);
     assert_eq!(written[4].stream_id, 1);

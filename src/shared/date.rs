@@ -48,6 +48,10 @@ pub fn now() -> HeaderValue {
 /// `Sun, 06 Nov 1994 08:49:37 GMT` — IMF-fixdate (§5.6.7), from seconds since
 /// the epoch. Always 29 bytes: the day of month is zero-padded and the year
 /// is four digits, which is what makes the width fixed.
+///
+/// Four digits is also the format's own ceiling, so this is right up to
+/// 9999-12-31 and wraps to 0000 after it. Eight thousand years of margin,
+/// and no way to do better without leaving IMF-fixdate.
 fn imf_fixdate(secs: u64) -> [u8; 29] {
     const DAY: u64 = 86_400;
     const WEEKDAYS: [&[u8; 3]; 7] = [b"Thu", b"Fri", b"Sat", b"Sun", b"Mon", b"Tue", b"Wed"];
