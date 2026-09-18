@@ -382,19 +382,30 @@ fn a_receiver_that_reads_within_the_timeout_is_served_normally() {
 }
 
 #[test]
-fn a_ring_out_of_buffers_ends_the_connection_in_silence() {
+fn a_ring_out_of_buffers_does_not_end_the_connection() {
     let written = run_connection(
         vec![ReadEvent::Data(a_get()), ReadEvent::Error(libc::ENOBUFS)],
         |_handle, _fd| {},
     );
 
     // The request in hand was answered before the ring ran dry.
-    assert_eq!(written.len(), 5);
+    assert_eq!(written[3].kind, HEADERS);
+    assert_eq!(written[4].payload, b"read 0 bytes\n");
 
-    // And then nothing: ENOBUFS is not in `CompletionError::can_continue`,
-    // so it reaches the loop as a fatal transport error and the connection
-    // is dropped mid-stream with no GOAWAY. This pins today's behaviour
-    // rather than endorsing it — a GOAWAY(INTERNAL_ERROR) would be kinder,
-    // and treating ENOBUFS as resubmittable kinder still.
-    assert!(!written.iter().any(|f| f.kind == GOAWAY));
+    // And the dry ring did not end it. The ring is shared by every connection
+    // on the worker, so an empty one says another connection is holding the
+    // buffers, not that this peer is gone — the runtime classifies it
+    // `ContinueLater` and the loop yields until one comes back.
+    //
+    // What closes this connection is the read deadline, two minutes later,
+    // because the script has nothing after the error. A GOAWAY(NO_ERROR)
+    // saying "idle too long" is the shape of an ordinary goodbye, where this
+    // test used to assert a silent drop mid-stream.
+    let goaway = written.last().expect("a connection that ends says so");
+    assert_eq!(goaway.kind, GOAWAY);
+    assert_eq!(
+        u32::from_be_bytes(goaway.payload[4..8].try_into().unwrap()),
+        0, // NO_ERROR
+    );
+    assert_eq!(&goaway.payload[8..], b"idle too long");
 }

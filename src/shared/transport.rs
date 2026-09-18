@@ -9,7 +9,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use runtime::io_driver::operations::sockets::multi_recv::CompletionError;
+use runtime::io_driver::operations::sockets::multi_recv::{CompletionError, Continuation};
 use runtime::io_driver::operations::sockets::send_vectored::send_vectored_all;
 use runtime::io_driver::operations::sockets::send_vectored_zc::send_vectored_all_zc;
 use runtime::net::{BorrowedBuffer, BufRingSpec, IoBuf, MultiRecv, SocketWrapper};
@@ -22,7 +22,7 @@ use runtime_streams::Stream;
 /// kernel-decrypted TLS record). Chunk boundaries carry no meaning — the
 /// frame decoder reassembles across them. `None` is a clean peer close; `Err`
 /// is a transport failure (RST, AEAD failure, ...).
-pub trait Transport: Stream<Item = io::Result<Self::Buf>> + Unpin {
+pub trait Transport: Stream<Item = Result<Self::Buf, RecvError>> + Unpin {
     /// One inbound chunk. `AsRef<[u8]>` is the only thing the decoder needs.
     type Buf: AsRef<[u8]>;
 
@@ -78,14 +78,15 @@ impl<R: BufRingSpec, const ZC: bool> PlainMessages<R, ZC> {
 impl<R: BufRingSpec, const ZC: bool> Unpin for PlainMessages<R, ZC> {}
 
 impl<R: BufRingSpec, const ZC: bool> Stream for PlainMessages<R, ZC> {
-    type Item = io::Result<BorrowedBuffer<R>>;
+    type Item = Result<BorrowedBuffer<R>, RecvError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // `MultiRecv` already folds EOF into `None` and swallows the
-        // resubmittable errors; only the fatal ones reach us.
+        // `MultiRecv` folds EOF into `None` and retries the failures that a
+        // re-arm alone fixes. What reaches us is the rest, and it is not all
+        // fatal — hence `RecvError` rather than a bare `io::Error`.
         Pin::new(&mut self.get_mut().recv)
             .poll_next(cx)
-            .map(|item| item.map(|r| r.map_err(completion_to_io)))
+            .map(|item| item.map(|r| r.map_err(RecvError::from)))
     }
 }
 
@@ -118,6 +119,33 @@ impl<R: BufRingSpec> Transport for PlainMessages<R, true> {
                 true => send_vectored_all_zc(self.recv.socket(), bufs).await,
                 false => send_vectored_all(self.recv.socket(), bufs).await,
             }
+        }
+    }
+}
+
+/// Why a chunk did not arrive, split by whether the connection is over.
+///
+/// The distinction is the runtime's — it classifies every completion as
+/// re-armable now, re-armable later, or finished — and flattening it into one
+/// `io::Error` is what used to make a dry buffer ring look like a dead socket.
+pub enum RecvError {
+    /// Nothing more will come: the peer is gone, or the op cannot be re-armed.
+    Fatal(io::Error),
+    /// The op is still armable, but only once a resource someone else holds
+    /// comes back. In practice: the buffer ring was empty, and it refills when
+    /// another connection on this worker recycles. Nothing a poll of *this*
+    /// stream does brings that about, so the caller has to come back rather
+    /// than spin — and coming back is all it takes.
+    Later,
+}
+
+impl From<CompletionError> for RecvError {
+    fn from(e: CompletionError) -> Self {
+        match e.continuation() {
+            // `MultiRecv` handles this one itself and never hands it up; if
+            // that changes, treating it as retryable is still right.
+            Continuation::Continue | Continuation::ContinueLater => Self::Later,
+            Continuation::NotContinue => Self::Fatal(completion_to_io(e)),
         }
     }
 }

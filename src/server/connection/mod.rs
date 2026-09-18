@@ -2,7 +2,10 @@ use std::io;
 use std::time::Duration;
 
 use crate::server::connection::protocol::Protocol;
-use crate::shared::{codec::frames::FrameDecoder, transport::Transport};
+use crate::shared::{
+    codec::frames::FrameDecoder,
+    transport::{RecvError, Transport},
+};
 use runtime::runtime::time::timeout;
 use runtime_streams::StreamExt;
 
@@ -147,6 +150,22 @@ pub const PARTIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// few seconds apart it does not register.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Empty-ring reads in a row before a connection gives up.
+///
+/// The buffer ring is shared by every connection on the worker, and a poll
+/// that finds it empty is told to come back rather than that the peer is gone.
+/// Coming back means yielding: buffers return when the other connections are
+/// polled and drop theirs, which is the next pass. So a handful of passes is
+/// all a transient shortage needs, and a count rather than a deadline is the
+/// right shape — the question is whether progress is being made elsewhere, not
+/// how much time has gone by.
+///
+/// Bounded because the retry is not free: each one re-arms the multishot and
+/// costs an SQE, so a ring that never refills would spin. Sixteen passes of
+/// every other connection on the worker making no progress at all is a worker
+/// in trouble, and dropping one connection is the lesser harm.
+pub const MAX_DRY_READS: u32 = 16;
+
 /// One HTTP/2 connection: bytes come in through `transport`, `decoder` cuts
 /// them into frames, and each frame is dispatched into `protocol`.
 ///
@@ -192,6 +211,9 @@ impl<T: Transport> Connection<T> {
         // Ticks in a row with nothing from the peer. Any byte resets it, so
         // this counts silence and not time.
         let mut silent_ticks = 0;
+        // Dry reads in a row. Reset by anything that arrives, so this counts a
+        // ring that will not refill, not one that was briefly empty.
+        let mut dry_reads = 0;
         loop {
             if self.wait_expired(silent_ticks) {
                 // §6.8: say so rather than vanishing. The GOAWAY is queued, so
@@ -211,12 +233,27 @@ impl<T: Transport> Connection<T> {
                 // Half-close: the peer sends no more, but is still owed
                 // whatever is queued.
                 Ok(None) => break,
+                // The ring was empty, not the connection. Yielding is the
+                // whole remedy: a buffer comes back when another connection on
+                // this worker recycles one, which happens when it is polled,
+                // which is what yielding lets happen. Bounded, because a ring
+                // that stays dry would otherwise spin — every retry re-arms the
+                // op and costs an SQE.
+                Ok(Some(Err(RecvError::Later))) => {
+                    if dry_reads == MAX_DRY_READS {
+                        return;
+                    }
+                    dry_reads += 1;
+                    runtime::yield_now().await;
+                    continue;
+                }
                 // Transport failure: nowhere left to send a GOAWAY, so drop it
                 // as silently as the clean EOF above.
-                Ok(Some(Err(_))) => return,
+                Ok(Some(Err(RecvError::Fatal(_)))) => return,
                 Ok(Some(Ok(()))) => {}
             }
             silent_ticks = 0;
+            dry_reads = 0;
             self.sweep_if_due();
             // The drain carries the GOAWAY, if there was one. An invalid
             // preface queued nothing, so it closes in silence (§3.4).
@@ -368,7 +405,7 @@ impl<T: Transport> Connection<T> {
     /// rates, not waiting on the peer. It would be worth something on a
     /// connection that is actually stalling for credit, which is not the
     /// shape a benchmark produces.
-    pub async fn recv(&mut self) -> Option<io::Result<()>> {
+    pub async fn recv(&mut self) -> Option<Result<(), RecvError>> {
         let chunk = match self.transport.next().await? {
             Ok(chunk) => chunk,
             Err(e) => return Some(Err(e)),
