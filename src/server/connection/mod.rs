@@ -126,6 +126,24 @@ impl<T: Transport> Connection<T> {
     /// Chunk boundaries mean nothing: a frame split across two chunks is
     /// reassembled by the decoder, which also keeps the header block a
     /// CONTINUATION is still completing.
+    ///
+    /// The dispatch is not interrupted, and that is a decision rather than
+    /// an oversight. Every frame in the chunk is handled before anything
+    /// else runs, so a stream task cannot consume — and so cannot hand the
+    /// peer its credit back — until the whole chunk is through. Feeding the
+    /// decoder in slices with a `yield_now` between them is the obvious fix,
+    /// costs nothing to write since the decoder already reassembles across
+    /// calls, and loses: on 1 MiB uploads, one core, ingest by slice size —
+    /// 5.42-5.48 GB/s for the whole chunk at once, 5.27-5.45 at 32 KiB,
+    /// 4.83-5.12 at 16 KiB, 4.69-5.04 at 8 KiB. Monotonic, and the same
+    /// shape as shrinking the ring buffer, which loses for the same reason:
+    /// what a dispatch costs to enter is larger than what earlier credit
+    /// buys.
+    ///
+    /// Earlier credit buys little because the loop is CPU-bound at these
+    /// rates, not waiting on the peer. It would be worth something on a
+    /// connection that is actually stalling for credit, which is not the
+    /// shape a benchmark produces.
     pub async fn recv(&mut self) -> Option<io::Result<()>> {
         let chunk = match self.transport.next().await? {
             Ok(chunk) => chunk,
