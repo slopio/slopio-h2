@@ -3,6 +3,21 @@
 A connection-count sweep. The question it answers is what a connection costs —
 in throughput, in latency, and in memory — not what a single request costs.
 
+## Conformance
+
+h2spec 2.0.0 against `examples/bench_server`, both suites clean:
+
+```sh
+PORT=8090 ./target/release/examples/bench_server &
+h2spec -h 127.0.0.1 -p 8090 --timeout 5       # 145 tests, 145 passed
+h2spec -h 127.0.0.1 -p 8090 --timeout 5 -S    # 146 tests, 146 passed (strict)
+```
+
+Worth knowing what it does not say: both runs finish in ~0.05s, so no read
+deadline and no stream sweep ever comes near firing. h2spec covers frame
+handling, HPACK and error codes against a conforming peer; whether the defences
+misfire is `src/server/connection/tests/` and nothing else.
+
 ## Running it
 
 ```sh

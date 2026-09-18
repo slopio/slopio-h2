@@ -28,6 +28,7 @@
 //! token's `Weak` keeps alive) and belongs to the runtime's shutdown.
 
 mod cve;
+mod dst;
 
 use std::time::Duration;
 
