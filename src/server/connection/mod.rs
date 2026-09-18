@@ -38,8 +38,39 @@ pub const CONNECTION_RECV_WINDOW: u32 = 1024 * 1024;
 /// stop reading can therefore empty a 512-slot ring, and a recv that finds it
 /// empty fails ENOBUFS, which this runtime does not resubmit — so the
 /// connection that dies is whichever one drew the empty ring, not the one that
-/// caused it. Five seconds is far longer than any receiver that is actually
-/// reading needs, and short enough that the ring is not held hostage.
+/// caused it. What protects the ring is that the stall *ends*; how soon
+/// matters much less than that there is a bound at all.
+///
+/// What this is not is a judgement about the peer, and it is worth being exact
+/// about why, because the obvious reading of it is wrong. Flow control is a
+/// promise about buffer space: a peer advertising a window asserts it has
+/// somewhere to put those bytes, and one that advertises what it will not
+/// drain has broken that promise. A blocked `send` is not evidence of it.
+/// `send` completes when the *local* socket buffer accepts the bytes, and that
+/// buffer drains at the speed of the network — so a peer that stopped reading
+/// and a peer on a slow link stall us identically, and nothing at this level
+/// can tell them apart. `tcpi_snd_wnd == 0` from `TCP_INFO` is what actually
+/// distinguishes them: a receiver that has closed its window is not draining,
+/// and that is provable rather than inferred.
+///
+/// So what this constant really sets is a minimum bandwidth. A flush carries
+/// at most `OUTPUT_HIGH_WATER`, since body writers park at that mark, which
+/// makes the floor `OUTPUT_HIGH_WATER / FLUSH_TIMEOUT` in the worst case:
+///
+/// | flush | implied floor |
+/// |-------|---------------|
+/// | ~50 B, today's placeholder response | ~10 B/s |
+/// | 16 KiB, one segment | ~3.2 KB/s |
+/// | 256 KiB, a full high-water flush | ~52 KB/s (~420 kbit/s) |
+///
+/// The floor rises with the size of the flush, so this is strictest on the
+/// largest transfers — which are the ones most likely to be slow for honest
+/// reasons. That is backwards, and it is tolerable only because responses are
+/// currently tiny: at 50 bytes a flush this fires on nothing but a peer that
+/// has genuinely stopped reading. A handler that streams a real body turns the
+/// same constant into a 420 kbit/s service requirement that no caller agreed
+/// to. `max(FLUSH_TIMEOUT, bytes / MIN_SEND_RATE)` is the honest shape of it
+/// once that day comes, since the rate is the thing actually meant.
 pub const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One HTTP/2 connection: bytes come in through `transport`, `decoder` cuts
