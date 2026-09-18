@@ -414,6 +414,9 @@ impl SharedConnection {
                     out.extend_from_slice(frame);
                 });
                 sent += quota;
+                // On the stream too: `sent` here is this call's cursor, and
+                // the check needs the stream's whole response.
+                stream.note_sent(quota);
 
                 if last {
                     return Poll::Ready(());

@@ -35,6 +35,29 @@ const BODY_GRACE: Duration = Duration::from_secs(5);
 /// is first judged: 1280 bytes at five seconds.
 const MIN_BODY_RATE: u64 = 256;
 
+/// How long a response is given, from its first byte, before its rate is
+/// judged.
+///
+/// Measured from the first byte and not from the stream opening, which is the
+/// difference between judging the peer and judging ourselves: everything
+/// before that first byte is the handler thinking — a query, a file, an
+/// upstream — and a stream whose clock started at the request would fail its
+/// own check whenever the backend was slow. There is no equivalent dead time
+/// inbound, which is why [`BODY_GRACE`] can start where it does.
+const SEND_GRACE: Duration = Duration::from_secs(5);
+
+/// Bytes per second below which a peer is not receiving a response, it is
+/// holding one.
+///
+/// Set against the same reasoning as [`MIN_BODY_RATE`] and with the same
+/// caveat: a floor on how fast we will serve is a service level, not an abuse
+/// signal, because nothing at this layer can tell a phone on a bad train line
+/// from an attacker — both advertise small windows and drain slowly. So it is
+/// pitched as an insult rather than a threshold. The attack it answers credits
+/// a byte at a time; 256 B/s is thousands of times more than that and far
+/// below anything a real client sustains.
+const MIN_SEND_RATE: u64 = 256;
+
 /// Reached only through an `Rc` shared with the stream task, so everything the
 /// connection mutates while a frame is being decoded lives behind a `Cell`.
 ///
@@ -71,6 +94,18 @@ pub struct Stream {
     /// Body bytes taken so far, padding excluded. Doubles as the write cursor
     /// of a pre-allocated buffer.
     received: Cell<u64>,
+    /// Response body bytes handed to the peer.
+    ///
+    /// Counted where `write_data` writes a frame, which is the point the peer
+    /// controls: that loop only advances by what the stream and connection
+    /// windows have credited, so this measures the peer's pace and not ours.
+    sent: Cell<u64>,
+    /// When the first response byte went out, or `None` before that.
+    ///
+    /// The clock [`Stream::output_is_starving`] runs on. `None` also *is* the
+    /// "not started" state, so a handler that has produced nothing yet is
+    /// never judged.
+    sending_since: Cell<Option<SystemTime>>,
     /// Body bytes taken from the connection window and not yet consumed by
     /// the task — still holding credit. Whatever is left when the stream
     /// goes must be given back, or the connection window shrinks for good.
@@ -112,6 +147,8 @@ impl Stream {
             no_more_output: Cell::new(false),
             input: RefCell::new(input),
             received: Cell::new(0),
+            sent: Cell::new(0),
+            sending_since: Cell::new(None),
             unreleased: Cell::new(0),
             waker: RefCell::new(None),
         })
@@ -167,6 +204,42 @@ impl Stream {
         // about.
         let owed = MIN_BODY_RATE.saturating_mul(age.as_secs());
         self.received.get() < owed
+    }
+
+    /// The id the peer opened this stream with.
+    pub fn id(&self) -> crate::shared::codec::frames::stream_id::StreamId {
+        self.header.stream_id()
+    }
+
+    /// Records `n` response body bytes as having gone to the peer, starting
+    /// the send clock on the first of them.
+    pub fn note_sent(&self, n: usize) {
+        if self.sending_since.get().is_none() {
+            self.sending_since.set(Some(runtime::runtime::now()));
+        }
+        self.sent.set(self.sent.get() + n as u64);
+    }
+
+    /// Whether the peer is taking its response too slowly to be receiving it.
+    ///
+    /// The mirror of [`Stream::body_is_starving`], and it has to exist
+    /// separately because the two measure opposite directions: `received`
+    /// counts what arrives, and a peer that metes out a response with
+    /// one-byte WINDOW_UPDATEs sends us nothing to count.
+    ///
+    /// Answers `false` until the first byte is written — see [`SEND_GRACE`].
+    pub fn output_is_starving(&self) -> bool {
+        let Some(since) = self.sending_since.get() else {
+            return false;
+        };
+        // Floors at zero on a clock that stepped backwards, as `age` does.
+        let elapsed = runtime::runtime::now()
+            .duration_since(since)
+            .unwrap_or_default();
+        if elapsed < SEND_GRACE {
+            return false;
+        }
+        self.sent.get() < MIN_SEND_RATE.saturating_mul(elapsed.as_secs())
     }
 
     /// A WINDOW_UPDATE on this stream. The task may be waiting on exactly

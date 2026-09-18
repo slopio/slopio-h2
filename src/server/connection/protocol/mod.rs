@@ -456,6 +456,35 @@ impl Protocol {
         }
     }
 
+    /// Resets every stream that is starving in either direction.
+    ///
+    /// The event-driven checks cannot see the cases that matter most. A body
+    /// is judged when DATA arrives, so a stream that never sends any is never
+    /// judged; a response is judged where it is written, so a peer that
+    /// credits nothing leaves the writer parked and the check unreached. Both
+    /// are the shape an attacker picks, and both need something that runs
+    /// without the peer's help.
+    ///
+    /// Bounded by `MAX_CONCURRENT_STREAMS` — 64 — and run a few seconds apart,
+    /// against a clock the scheduler already sampled.
+    pub(super) fn sweep_starving_streams(&mut self) {
+        // Collected first: resetting walks into the map to remove the entry,
+        // and doing that inside `try_for_each` would re-enter the borrow it
+        // is contracted not to.
+        let mut starving: Vec<StreamId> = Vec::new();
+        let _ = self.streams.streams.try_for_each(|stream| {
+            if stream.body_is_starving() || stream.output_is_starving() {
+                starving.push(stream.id());
+            }
+            Ok::<(), ()>(())
+        });
+
+        for id in starving {
+            self.reset_stream(id, ENHANCE_YOUR_CALM);
+            self.count_fault("too many starved streams");
+        }
+    }
+
     fn count_fault(&mut self, reason: &'static str) {
         self.faults += 1;
         if self.faults > FAULT_LIMIT {

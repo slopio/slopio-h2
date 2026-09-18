@@ -136,6 +136,21 @@ pub const PARTIAL_TICKS: u32 = 2;
 pub const PARTIAL_TIMEOUT: Duration =
     Duration::from_secs(DEADLINE_TICK.as_secs() * PARTIAL_TICKS as u64);
 
+/// How often live streams are swept for one that is starving.
+///
+/// The per-stream rates are checked where the evidence arrives — a body on its
+/// DATA, a response where it is written — and neither fires for the peer that
+/// sends nothing at all, which is the one worth catching. This is what runs
+/// without the peer's help.
+///
+/// Driven off inbound chunks rather than a timer, deliberately: a connection
+/// with no traffic at all is the read deadline's business, and arming a second
+/// timer per connection is the cost that made the read deadline expensive
+/// before it was counted in ticks. The sweep is at most
+/// `MAX_CONCURRENT_STREAMS` comparisons against an already-sampled clock, so a
+/// few seconds apart it does not register.
+pub const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+
 /// One HTTP/2 connection: bytes come in through `transport`, `decoder` cuts
 /// them into frames, and each frame is dispatched into `protocol`.
 ///
@@ -156,6 +171,8 @@ pub struct Connection<T: Transport> {
     /// is precisely what slowloris does. A budget for *finishing* what it
     /// started cannot be reset by sending more of it.
     partial_since: Option<std::time::SystemTime>,
+    /// When the streams were last swept for a starving one.
+    last_swept: std::time::SystemTime,
 }
 
 impl<T: Transport> Connection<T> {
@@ -165,6 +182,7 @@ impl<T: Transport> Connection<T> {
             decoder: FrameDecoder::new(),
             protocol: Protocol::new(),
             partial_since: None,
+            last_swept: runtime::runtime::now(),
         }
     }
 
@@ -215,6 +233,7 @@ impl<T: Transport> Connection<T> {
                 Ok(Some(Ok(()))) => {}
             }
             expiries = 0;
+            self.sweep_if_due();
             if self.drain().await.is_err() {
                 return;
             }
@@ -281,6 +300,22 @@ impl<T: Transport> Connection<T> {
             true => ACTIVE_TICKS,
             false => IDLE_TICKS,
         })
+    }
+
+    /// Sweeps for starving streams, a few seconds apart at most.
+    ///
+    /// After the dispatch rather than before: the chunk just decoded may have
+    /// been the DATA that a starving stream needed, and judging it on evidence
+    /// one turn stale would reset a stream that had just made progress.
+    fn sweep_if_due(&mut self) {
+        let now = runtime::runtime::now();
+        let due = now
+            .duration_since(self.last_swept)
+            .is_ok_and(|since| since >= SWEEP_INTERVAL);
+        if due {
+            self.last_swept = now;
+            self.protocol.sweep_starving_streams();
+        }
     }
 
     /// Once true, nothing more should be read: a connection error has been

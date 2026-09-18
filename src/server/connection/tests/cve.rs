@@ -632,3 +632,134 @@ fn a_slow_but_honest_request_body_is_served() {
         "and it gets its response: {written:?}"
     );
 }
+
+/// A client preface whose SETTINGS advertise `initial_window_size`, so a
+/// response of any size stalls after that many bytes.
+fn preface_with_window(initial: u32) -> Vec<u8> {
+    let mut payload = vec![0x00, 0x04]; // SETTINGS_INITIAL_WINDOW_SIZE
+    payload.extend_from_slice(&initial.to_be_bytes());
+    let mut bytes = PREFACE.to_vec();
+    bytes.extend_from_slice(&frame(SETTINGS, 0, 0, &payload));
+    bytes
+}
+
+/// CVE-2019-9511, Data Dribble — ask for a response, then refuse to take it.
+///
+/// The download half of the slowloris family, and the one the other defences
+/// are blind to. Nothing arrives to count, so the body rate never fires; the
+/// writer parks inside `write_data` with no credit, so the send-side check is
+/// never reached either; and with the peer's window at zero nothing is ever
+/// queued, so `FLUSH_TIMEOUT` has no send to time out. A PING every few
+/// seconds keeps the read deadline from expiring and costs one unit of a
+/// budget of ten thousand.
+///
+/// What ends it is the sweep, which runs on the peer's chunks but not on the
+/// peer's cooperation.
+#[test]
+fn data_dribble_a_response_the_peer_will_not_take() {
+    let mut bytes = preface_with_window(1);
+    bytes.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        GET_BLOCK,
+    ));
+
+    let second = Duration::from_secs(1);
+    let written = run_connection_timed(
+        vec![
+            ReadEvent::Data(bytes).into(),
+            // Keepalive, and what drives the sweep: legal, cheap, and useless.
+            ReadEvent::Data(frame(PING, 0, 0, b"keepaliv")).after(second * 6),
+            ReadEvent::Data(frame(PING, 0, 0, b"keepaliv")).after(second * 12),
+            ReadEvent::Eof.after(second * 18),
+        ],
+        |_, _| {},
+    );
+
+    let reset = written
+        .iter()
+        .find(|f| f.kind == RST_STREAM)
+        .expect("a response the peer will not take is not held open for it");
+    assert_eq!(reset.stream_id, 1);
+    assert_eq!(
+        u32::from_be_bytes(reset.payload[..4].try_into().unwrap()),
+        ENHANCE_YOUR_CALM
+    );
+}
+
+/// The same tiny window, taken properly: a peer with little buffer that keeps
+/// crediting is a peer being served, not an attack.
+///
+/// The pair matters more than the attack beside it. A send-rate floor that
+/// cannot tell a small receive buffer from a held stream is an outage.
+#[test]
+fn a_small_window_that_keeps_crediting_is_served() {
+    let mut bytes = preface_with_window(1);
+    bytes.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        GET_BLOCK,
+    ));
+
+    let second = Duration::from_secs(1);
+    let written = run_connection_timed(
+        vec![
+            ReadEvent::Data(bytes).into(),
+            // Enough credit for the rest of the body, well inside the grace.
+            ReadEvent::Data(frame(WINDOW_UPDATE, 0, 1, &100u32.to_be_bytes())).after(second),
+            ReadEvent::Eof.after(second * 12),
+        ],
+        |_, _| {},
+    );
+
+    assert!(
+        !written.iter().any(|f| f.kind == RST_STREAM),
+        "a peer that credits is served: {written:?}"
+    );
+    assert!(
+        written
+            .iter()
+            .any(|f| f.kind == DATA && f.payload.ends_with(b"bytes\n")),
+        "and gets its whole body: {written:?}"
+    );
+}
+
+/// A request body that never starts — the inbound case the DATA-driven check
+/// cannot see, since it is only reached by a DATA frame arriving.
+///
+/// Costs the peer one HEADERS and buys a stream slot, its receive window, and
+/// a buffer sized by the `content-length` it declared, for as long as it keeps
+/// the connection awake.
+#[test]
+fn a_request_body_that_never_arrives_is_reclaimed() {
+    // `content-length` with no END_STREAM: a body is promised and never sent.
+    let mut block = GET_BLOCK.to_vec();
+    // Literal without indexing, new name "content-length", value "16384".
+    block.push(0x00);
+    block.push(14);
+    block.extend_from_slice(b"content-length");
+    block.push(5);
+    block.extend_from_slice(b"16384");
+
+    let mut bytes = preface();
+    bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, &block));
+
+    let second = Duration::from_secs(1);
+    let written = run_connection_timed(
+        vec![
+            ReadEvent::Data(bytes).into(),
+            ReadEvent::Data(frame(PING, 0, 0, b"keepaliv")).after(second * 6),
+            ReadEvent::Data(frame(PING, 0, 0, b"keepaliv")).after(second * 12),
+            ReadEvent::Eof.after(second * 18),
+        ],
+        |_, _| {},
+    );
+
+    let reset = written
+        .iter()
+        .find(|f| f.kind == RST_STREAM)
+        .expect("a promised body that never arrives does not hold its slot");
+    assert_eq!(reset.stream_id, 1);
+}
