@@ -52,6 +52,20 @@ impl InputData {
         Self::Uncapped { data: Vec::new() }
     }
 
+    /// The capacity here is `BUFFER_ONESHOT_LIMIT`'s second and unrelated
+    /// job, and it is not the body's size — a drained buffer holds what one
+    /// turn of the connection loop delivered to *this* stream, which the
+    /// handler then takes in full. The declared length would be the obvious
+    /// thing to reserve instead, and it is the wrong thing: measured on 64
+    /// KiB bodies it changed nothing (5.32-5.38 GB/s against 5.41-5.49), and
+    /// it would hold `MAX_CONCURRENT_STREAMS` × the stream window — 4 MiB a
+    /// connection where this is 1 MiB.
+    ///
+    /// It changes nothing because a chunk is shared: concurrent streams take
+    /// a frame or two each from it, so a buffer is drained long before it
+    /// grows. Only one stream receiving a whole 64 KiB chunk alone would
+    /// reallocate, and that case is latency-bound anyway — the server sits
+    /// at 45% of a core there.
     fn buffered_capped(len: usize) -> Self {
         Self::BufferedCapped {
             len,
