@@ -79,6 +79,7 @@ use crate::shared::codec::{
 /// whatever a peer asks for.
 pub const MAX_ENCODER_TABLE_SIZE: u32 = 4_096;
 
+#[derive(Clone, Debug)]
 pub struct Settings {
     /// 0x01 — max size of the HPACK dynamic table. Default 4096.
     pub header_table_size: u32,
