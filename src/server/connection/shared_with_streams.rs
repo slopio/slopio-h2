@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 
@@ -42,7 +42,35 @@ pub struct SharedConnection {
     /// it was written, in segments of a fixed size. Sent as one gather write
     /// once per turn of the connection loop, and bounded: past
     /// `OUTPUT_HIGH_WATER` a body writer waits for a flush.
-    output: RefCell<Output>,
+    ///
+    /// # Safety
+    ///
+    /// Reached through an `Rc` by the connection and by every stream task, so
+    /// it cannot be `&mut` and needs interior mutability. An `UnsafeCell`
+    /// rather than a `RefCell` for the same reason as [`StreamMap`]: the
+    /// runtime is single-threaded and this is `!Send`, so what has to hold is
+    /// only that no two references overlap in time.
+    ///
+    /// Two rules make that so, and the methods below are written to enforce
+    /// them rather than ask:
+    ///
+    /// **No reference escapes the call that made it.** Every accessor below
+    /// does its `unsafe` inside one expression and returns an owned value or a
+    /// copy — `usize`, `bool`, `Vec<Vec<u8>>`. None hands out a `&Output`, so
+    /// none can be live at the next suspension.
+    ///
+    /// **Nothing re-enters under the borrow.** The only code that runs while a
+    /// reference exists is `Output`'s own, plus the `encode` closure in
+    /// [`Self::write_frame`] — which is handed the segment's `Vec<u8>` and not
+    /// the connection, so it has nothing to re-enter through.
+    ///
+    /// The rule this replaces was enforced by `RefCell` panicking. It is now a
+    /// convention, and the change most likely to break it is turning one of
+    /// the `poll_fn`s that write here into an `async fn`: a guard held across
+    /// an `.await` becomes part of the future and outlives the poll. There is
+    /// no such guard today because a `poll_fn` closure must return `Poll`
+    /// before it suspends.
+    output: UnsafeCell<Output>,
 }
 
 /// The connection's live streams. Each entry owns its stream and the handle
@@ -258,7 +286,7 @@ impl SharedConnection {
                 pending_release: Cell::new(0),
                 send_waiters: RefCell::new(Vec::new()),
             },
-            output: RefCell::new(Output::new()),
+            output: UnsafeCell::new(Output::new()),
         }
     }
 
@@ -274,7 +302,9 @@ impl SharedConnection {
     /// shared.write_frame(|out| encode_rst_stream(out, stream_id, CANCEL));
     /// ```
     pub fn write_frame(&self, encode: impl FnOnce(&mut Vec<u8>)) {
-        self.output.borrow_mut().write(encode);
+        // SAFETY: the reference dies with the expression, and `encode` is
+        // handed a segment rather than the connection, so it cannot re-enter.
+        unsafe { (*self.output.get()).write(encode) }
     }
 
     /// Writes a response head, split over CONTINUATION frames when the
@@ -377,7 +407,9 @@ impl SharedConnection {
                 }
 
                 let credit = stream.available_send().min(self.window.available_send()) as usize;
-                let room = self.output.borrow().data_room();
+                // SAFETY: the reference dies with the expression, and
+                // `data_room` cannot re-enter.
+                let room = unsafe { (*self.output.get()).data_room() };
                 let quota = remaining
                     .len()
                     .min(self.max_frame_size.get() as usize)
@@ -396,7 +428,9 @@ impl SharedConnection {
                         self.window.wait_send(cx.waker());
                     }
                     if room == 0 {
-                        self.output.borrow_mut().wait_room(cx.waker());
+                        // SAFETY: the reference dies with the expression;
+                        // cloning a waker cannot re-enter.
+                        unsafe { (*self.output.get()).wait_room(cx.waker()) }
                     }
                     return Poll::Pending;
                 }
@@ -461,21 +495,27 @@ impl SharedConnection {
     /// counted against the high-water mark until they are, and the writers
     /// waiting on that room are woken there.
     pub(crate) fn take_output(&self) -> Vec<Vec<u8>> {
-        self.output.borrow_mut().take()
+        // SAFETY: the reference dies with the expression, and the chain is
+        // handed back owned.
+        unsafe { (*self.output.get()).take() }
     }
 
     /// Takes the sent segments back. Whatever a task wrote while they were
     /// in flight is already the next link of the chain — there is nothing
     /// to move.
     pub(crate) fn restore_output(&self, sent: Vec<Vec<u8>>) {
-        self.output.borrow_mut().restore(sent);
+        // SAFETY: the reference dies with the expression. `restore` wakes the
+        // writers waiting for room, and a wake queues a task rather than
+        // running one, so nothing re-enters here.
+        unsafe { (*self.output.get()).restore(sent) }
     }
 
     /// Nothing queued to send. The connection loop drains until this holds:
     /// with a bounded output, a task may be parked waiting for room, and
     /// only a flush gives it any.
     pub(crate) fn output_is_empty(&self) -> bool {
-        self.output.borrow().is_empty()
+        // SAFETY: the reference dies with the expression.
+        unsafe { (*self.output.get()).is_empty() }
     }
 
     /// Takes the peer's new `SETTINGS_MAX_FRAME_SIZE`.
