@@ -60,6 +60,25 @@ use crate::shared::codec::{
     types::{FLOW_CONTROL_ERROR, PROTOCOL_ERROR, Setting},
 };
 
+/// The largest HPACK dynamic table we will keep for encoding, whatever the
+/// peer offers.
+///
+/// §6.5.2 lets a peer name any `u32` here, and it is an *allowance* rather
+/// than an instruction: §4.2 says an encoder may use less, and this one does.
+/// Taking the number at face value means a peer sends `0xFFFFFFFF` and the
+/// table it caps never evicts — growing by an entry for every distinct header
+/// this server emits, for the life of the connection, times the number of
+/// connections. One `Date` per second is enough to make that unbounded.
+///
+/// 4096 is the §6.5.2 default, and the reason for not going higher is that the
+/// cost is per connection and the benefit is not. An entry costs its name, its
+/// value and 32 bytes, so this bounds the table at ~128 entries and its index
+/// at a few KiB — against 20 000 connections, which is the scale this server is
+/// measured at. Raising it is a memory decision to make against a measured
+/// compression gain on real response headers, not something to concede to
+/// whatever a peer asks for.
+pub const MAX_ENCODER_TABLE_SIZE: u32 = 4_096;
+
 pub struct Settings {
     /// 0x01 — max size of the HPACK dynamic table. Default 4096.
     pub header_table_size: u32,
@@ -92,9 +111,12 @@ impl Settings {
     /// this is meant to be called in a loop with no deduplication.
     pub fn apply(&mut self, setting: Setting) -> Result<(), InvalidSetting> {
         match setting {
-            // Any u32 is legal: it caps our HPACK encoder's dynamic table,
-            // and using less than allowed is always permitted.
-            Setting::HeaderTableSize(value) => self.header_table_size = value,
+            // Any u32 is legal, and using less than allowed is permitted —
+            // which is the whole point, since the allowance is what a peer
+            // controls and the memory is what we pay.
+            Setting::HeaderTableSize(value) => {
+                self.header_table_size = value.min(MAX_ENCODER_TABLE_SIZE)
+            }
 
             Setting::EnablePush(value) => {
                 self.enable_push = as_bool(value, "ENABLE_PUSH must be 0 or 1")?;

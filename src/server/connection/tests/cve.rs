@@ -763,3 +763,28 @@ fn a_request_body_that_never_arrives_is_reclaimed() {
         .expect("a promised body that never arrives does not hold its slot");
     assert_eq!(reset.stream_id, 1);
 }
+
+/// A peer naming a 4 GiB HPACK table is told a number, not obeyed.
+///
+/// §6.5.2 lets it ask for any `u32`, and the value caps the dynamic table this
+/// server encodes *its own* responses against. Taken at face value the table
+/// never evicts: it grows by an entry for every distinct header emitted, for
+/// the life of the connection, times however many connections there are. Six
+/// bytes of SETTINGS buying unbounded growth is the shape of the thing.
+///
+/// §4.2 says an encoder may use less than it is offered, so this one does.
+#[test]
+fn a_peer_cannot_name_an_unbounded_hpack_table() {
+    use crate::server::connection::settings::{MAX_ENCODER_TABLE_SIZE, Settings};
+    use crate::shared::codec::types::Setting;
+
+    let mut settings = Settings::default();
+    // §6.5.2: any u32 is legal to ask for, so this must not be an error.
+    assert!(settings.apply(Setting::HeaderTableSize(u32::MAX)).is_ok());
+    assert_eq!(settings.header_table_size, MAX_ENCODER_TABLE_SIZE);
+
+    // And a modest one is still honoured, so the clamp is a ceiling rather
+    // than a constant.
+    assert!(settings.apply(Setting::HeaderTableSize(512)).is_ok());
+    assert_eq!(settings.header_table_size, 512);
+}
