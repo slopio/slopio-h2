@@ -31,7 +31,23 @@ pub struct SharedConnection {
     /// Connection-level by definition: every header block on the connection
     /// feeds the same dynamic table, so they have to be encoded in the order
     /// they go on the wire or the peer's decoder drifts.
-    encoder: RefCell<Encoder>,
+    ///
+    /// # Safety
+    ///
+    /// Behind the same `Rc` as [`Self::output`] and shared with the same
+    /// writers, so it needs the same interior mutability and holds to the same
+    /// two rules — no reference escapes the call, nothing re-enters under it.
+    ///
+    /// It is the easier of the two. There is one access, it is a temporary in
+    /// a single statement, and [`Self::write_headers`] is a plain `fn`: there
+    /// is no suspension point in the function at all, so no reference can
+    /// survive one. What `encode` runs under the reference is the header
+    /// iterator, which clones names and values out of a `HeaderMap` and cannot
+    /// reach back here, and a local `Vec<u8>` that aliases nothing.
+    ///
+    /// The caveat is [`Self::output`]'s: making `write_headers` async would
+    /// put a reference into a future, and nothing would say so.
+    encoder: UnsafeCell<Encoder>,
     /// The peer's SETTINGS_MAX_FRAME_SIZE: the largest payload we may emit.
     max_frame_size: Cell<u32>,
     /// Shared because a stream task has to read it before writing: §6.9.1
@@ -275,7 +291,7 @@ impl SharedConnection {
             // Zero is what `Encoder::default()` passes: the table allocates on
             // its first insert and grows from 8, which is what `reserve_one`
             // is there for.
-            encoder: RefCell::new(Encoder::new(header_table_size as usize, 0)),
+            encoder: UnsafeCell::new(Encoder::new(header_table_size as usize, 0)),
             max_frame_size: Cell::new(max_frame_size),
             // §6.9.2: both halves start at 65535 and SETTINGS never moves
             // them. The gap up to `CONNECTION_RECV_WINDOW` is announced by a
@@ -338,7 +354,10 @@ impl SharedConnection {
                 }
             }));
         let mut block = Vec::new();
-        self.encoder.borrow_mut().encode(headers, &mut block);
+        // SAFETY: the reference dies with the expression. `encode` runs the
+        // header iterator, which clones out of a `HeaderMap`, and writes into
+        // a local that aliases nothing — neither can re-enter.
+        unsafe { (*self.encoder.get()).encode(headers, &mut block) };
 
         // Never zero: §6.5.2 floors max_frame_size at 2^14, but `chunks`
         // panics on zero and the value came off the wire.
