@@ -90,6 +90,19 @@ async fn serve(port: u16, listeners: usize, backlog: i32) {
     std::future::pending::<()>().await
 }
 
+/// Bytes a sized request is answered from. Sliced, never allocated — the same
+/// reasoning as the popple-h2 side, and the same 64 KiB for the same reason.
+static FILLER: [u8; 64 * 1024] = [b'x'; 64 * 1024];
+
+/// How many bytes `/<n>` asks for, if it asks for a number.
+///
+/// Matches popple-h2 exactly, so a payload sweep points both servers at the
+/// same URL and varies one thing.
+fn requested_size(path: &str) -> Option<usize> {
+    let n: usize = path.strip_prefix('/')?.parse().ok()?;
+    (n > 0).then(|| n.min(FILLER.len()))
+}
+
 /// Nagle off, as io_uring sends on the popple-h2 side are not batched by the
 /// kernel either. With it on, a one-frame response waits for an ack.
 async fn connection(socket: TcpStream) {
@@ -108,6 +121,7 @@ async fn connection(socket: TcpStream) {
 
         // A task per stream, as popple-h2 spawns one per stream.
         tokio::spawn(async move {
+            let size = requested_size(request.uri().path());
             let mut body = request.into_body();
             let mut received = 0usize;
             while let Some(chunk) = body.data().await {
@@ -121,7 +135,10 @@ async fn connection(socket: TcpStream) {
             let Ok(mut stream) = respond.send_response(response, false) else {
                 return;
             };
-            let payload = Bytes::from(format!("read {received} bytes\n"));
+            let payload = match size {
+                Some(n) => Bytes::from_static(&FILLER[..n]),
+                None => Bytes::from(format!("read {received} bytes\n")),
+            };
             let _ = stream.send_data(payload, true);
         });
     }

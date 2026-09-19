@@ -30,6 +30,16 @@ CONNS="1000 20000" ./bench/run.sh
 Needs `h2load` (`nghttp2-client`). `SERVER_CORES`, `LOAD_CORES`, `STREAMS`,
 `DURATION` and `RING` are the knobs; results land in `bench/results/`.
 
+Response size comes from the URL rather than from either server's environment:
+`/1024` asks for a 1024-byte body, `/` for the echo. Both servers read it the
+same way and slice a static buffer, so a payload sweep points them at the same
+path and neither is restarted between sizes. Capped at 64 KiB — the default
+stream window — because past it a response needs a WINDOW_UPDATE to finish,
+which is a different thing to measure.
+
+    h2load ... http://127.0.0.1:8080/10240          # 10 KiB responses
+    h2load ... -d body.bin http://127.0.0.1:8080/5120   # POST, 5 KiB back
+
 ## What is held equal
 
 Both servers answer the same bytes — `200`, `read 0 bytes\n`, no `Date`, no
@@ -159,31 +169,45 @@ buffer size in `examples/server.rs`.
 The read deadline costs nothing measurable anywhere in that table — it is ahead
 at 1, 2 and 8, behind at 4 and 64, by less than the spread between runs.
 
-## The buffer ring runs out before the server does
+## The buffer ring empties, and nothing is dropped for it
 
-At 20 000 connections on the shipped `64x512` ring, the server drops ~2 500
-connections per run with `transport error: No buffer space available`. It is not
-the deadline: the commit before it drops 2 057, 4 028 and 2 055 across three
-runs. It is the ring being shared by every connection on a worker, exactly as
-`FLUSH_TIMEOUT`'s comment describes — a connection whose loop is not popping its
-completions pins a buffer until the driver pauses its recv, and a recv that
-finds the ring empty fails ENOBUFS, which the runtime does not resubmit.
+The ring is shared by every connection on a worker, so at high connection
+counts it does run dry — more sockets with data in flight than there are slots,
+no misbehaviour required. At 20 000 connections on the shipped `64x512` ring
+that happens 1 652 and 1 996 times across two runs.
 
-`RING=` is the knob, and the whole effect is the slot count:
+What it costs is nothing. Each of those is one `yield_now` and a retry, because
+an empty ring means another connection is holding buffers and not that this peer
+is gone — the runtime classifies it `ContinueLater` and `MAX_DRY_READS` bounds
+how long the loop will wait. Not one connection was dropped, and the bound was
+never approached:
 
-| ring | req/s | ENOBUFS | peak RSS |
-|------|-------|---------|----------|
-| 64x512 (32 MiB/worker) | 260 016 | 2 495 | 366 MB |
-| 16x4096 (64 MiB/worker) | 261 220 | **0** | 445 MB |
-| 16x16384 (256 MiB/worker) | 262 093 | **0** | 544 MB |
+| | dry reads | dropped | deepest retry (of 16) |
+|---|---|---|---|
+| 2 cores, 20 000 conns | 1 652 / 1 996 | **0** | — |
+| 1 core, 10 000 conns | 14 442 | **0** | 6 |
+| 1 core, 20 000 conns | 2 986 | **0** | 1 |
 
-79 MB buys every connection at 20 000, for no throughput at all. The default is
-sized for the connection counts in the sweep above and not for these.
+Single core is the harder case: 20 000 connections share *one* ring rather than
+one per worker. It holds.
 
-One crash was seen, once, in a 20 000-connection run: a worker thread panicked
-and `thread_per_core_with` unwrapped the join. It did not reproduce in six
-further runs across both binaries and its cause is not established — recorded
-here because a panic takes the process down, not because it is understood.
+Before that, ENOBUFS was fatal and the same load dropped ~2 500 connections a
+run — and `RING=16x4096` was the answer, at 79 MB for the bigger slot count. It
+is no longer needed for that. What a larger ring still buys is fewer dry reads,
+which is a latency argument rather than a correctness one, and this benchmark
+has not measured it.
+
+None of that was visible from the client: h2load reported `0 failed, 0 errored`
+through every run that was dropping thousands of connections, because it
+re-established them silently. It was only visible in the server log, and only
+until that log line was removed. Nothing counts these now — if the ring starts
+running tight in a real deployment, there is no way to find out.
+
+One crash was seen, once, in a 20 000-connection run, before `Ring::add` learned
+to submit on a full queue. Understood and fixed since: the submission queue is
+4 096 entries and a scheduler pass polls every runnable task before flushing, so
+enough connections waking at once overflowed it and the `unwrap` took the
+process down.
 
 ## The memory column
 

@@ -211,6 +211,11 @@ impl Stream {
         self.header.stream_id()
     }
 
+    /// The request's `:path`.
+    pub fn path(&self) -> Option<&str> {
+        self.header.pseudo().path.as_deref()
+    }
+
     /// Records `n` response body bytes as having gone to the peer, starting
     /// the send clock on the first of them.
     pub fn note_sent(&self, n: usize) {

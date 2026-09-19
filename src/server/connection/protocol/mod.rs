@@ -542,6 +542,25 @@ fn is_malformed_request(headers: &Headers) -> bool {
 ///
 /// A panic here would take the whole process down — the runtime does not
 /// catch task panics.
+/// Bytes a sized request is answered from.
+///
+/// Sliced, never allocated: a benchmark that asks for a 10 KiB body and gets a
+/// `vec![]` per request is measuring the allocator. 64 KiB because that is the
+/// default stream window — past it a response needs a WINDOW_UPDATE to finish,
+/// which is a different thing to measure and wants asking for on purpose.
+static FILLER: [u8; 64 * 1024] = [b'x'; 64 * 1024];
+
+/// How many bytes `/<n>` asks for, if it asks for a number.
+///
+/// The size comes from the request rather than from the process, so one server
+/// serves every payload a benchmark wants without being restarted, and the two
+/// sides of a comparison are told what to send by the same URL. Anything else —
+/// `/`, a real path — gets the echo below.
+fn requested_size(path: Option<&str>) -> Option<usize> {
+    let n: usize = path?.strip_prefix('/')?.parse().ok()?;
+    (n > 0).then(|| n.min(FILLER.len()))
+}
+
 /// The placeholder handler: `200` and a fixed body, whatever the request.
 async fn handle_stream(token: StreamToken) {
     let (shared, stream, id) = (token.shared(), token.stream(), token.id());
@@ -565,9 +584,14 @@ async fn handle_stream(token: StreamToken) {
         }
     };
 
-    let body = format!("read {received} bytes\n");
     shared.write_headers(id, StatusCode::OK, &HeaderMap::new(), false);
-    shared.write_data(id, stream, body.as_bytes(), true).await;
+    match requested_size(stream.path()) {
+        Some(n) => shared.write_data(id, stream, &FILLER[..n], true).await,
+        None => {
+            let body = format!("read {received} bytes\n");
+            shared.write_data(id, stream, body.as_bytes(), true).await
+        }
+    }
     // No `end_output` here: dropping the token is what ends our half, and
     // it happens however the task ends, not only when it ends well.
 }
