@@ -8,8 +8,6 @@
 //!
 //! Only the connection-level frames are handled yet. Streams come next.
 
-use std::cell::RefCell;
-
 use crate::shared::codec::{
     frames::{
         FrameHandler, SettingsIter,
@@ -19,7 +17,8 @@ use crate::shared::codec::{
     },
     types::{DecodeError, ErrorScope, PROTOCOL_ERROR, StreamViolation},
 };
-use crate::shared::connection::{output::Output, settings::Settings};
+use crate::shared::connection::{STREAM_ID, output::Output, settings::Settings};
+use crate::shared::hpack::Encoder;
 
 /// How far the handshake has got.
 ///
@@ -41,10 +40,34 @@ impl Handshake {
     }
 }
 
+/// §5.1.1: the first stream a client may open.
+const FIRST_CLIENT_STREAM: STREAM_ID = 1;
+
+/// §5.1.1: ids are 31 bits, and one past the last usable odd one is where a
+/// client has to stop and open a new connection.
+const MAX_STREAM_ID: STREAM_ID = (1 << 31) - 1;
+
 pub(super) struct Protocol {
-    /// Frames waiting to go out. Shared shape with the server's, and the same
-    /// module.
-    pub(super) output: RefCell<Output>,
+    /// Frames waiting to go out.
+    ///
+    /// A plain field, where the server needs a cell: its output is reached
+    /// through an `Rc` by every stream task, and this one is owned outright by
+    /// the `Connection` that flushes it. That stops being true the day a
+    /// request body is written by a task of its own, and the cell can come
+    /// back then — putting it in now would be guessing at a shape that does
+    /// not exist.
+    pub(super) output: Output,
+    /// Connection-level by definition: every block on the connection feeds the
+    /// same dynamic table, so they have to be encoded in the order they go on
+    /// the wire or the peer's decoder drifts.
+    pub(super) encoder: Encoder,
+    /// §5.1.1: the id the next request will use. Odd, and only ever forward —
+    /// a client that reused one would be reopening a stream the peer considers
+    /// closed.
+    next_stream_id: STREAM_ID,
+    /// Streams opened and not yet finished, against the peer's
+    /// `max_concurrent_streams`.
+    live_streams: u32,
     /// What the server told us it will accept.
     pub(super) peer_settings: Settings,
     pub(super) handshake: Handshake,
@@ -59,7 +82,10 @@ pub(super) struct Protocol {
 impl Protocol {
     pub(super) fn new() -> Self {
         Self {
-            output: RefCell::new(Output::new()),
+            output: Output::new(),
+            encoder: Encoder::default(),
+            next_stream_id: FIRST_CLIENT_STREAM,
+            live_streams: 0,
             peer_settings: Settings::default(),
             handshake: Handshake::default(),
             closing: false,
@@ -71,8 +97,36 @@ impl Protocol {
         self.closing
     }
 
-    pub(super) fn write_frame(&self, encode: impl FnOnce(&mut Vec<u8>)) {
-        self.output.borrow_mut().write(encode);
+    pub(super) fn write_frame(&mut self, encode: impl FnOnce(&mut Vec<u8>)) {
+        self.output.write(encode);
+    }
+
+    /// Takes the next stream id, or `None` when there are none left.
+    ///
+    /// §5.1.1: a client's ids are odd and strictly increasing, so they run out
+    /// — and running out is not an error, it is the connection being finished.
+    /// A client that has exhausted them opens another one; there is no
+    /// recycling, because the peer remembers every id it has seen.
+    ///
+    /// Also `None` past the peer's `max_concurrent_streams`, which §5.1.2
+    /// makes the peer's to set and ours to respect. Opening one anyway earns a
+    /// REFUSED_STREAM, and a refusal we could have predicted is worse than a
+    /// wait.
+    pub(super) fn open_stream(&mut self) -> Option<StreamId> {
+        let allowed = self.peer_settings.max_concurrent_streams.unwrap_or(u32::MAX);
+        if self.live_streams >= allowed {
+            return None;
+        }
+        if self.next_stream_id > MAX_STREAM_ID {
+            return None;
+        }
+
+        let id = self.next_stream_id;
+        // Odd to odd. The peer is the only one who opens the even ones, and it
+        // has told us it will not (§8.2, and we asked for no push).
+        self.next_stream_id = self.next_stream_id.saturating_add(2);
+        self.live_streams += 1;
+        Some(StreamId::from(id))
     }
 
     /// Ends the connection, saying why. §6.8: a client sends GOAWAY like a

@@ -4,8 +4,9 @@
 //! caller's buffer; no allocation beyond the buffer's own growth. Designed
 //! to feed `ConnectionWriter::append`.
 //!
-//! The HEADERS block itself is HPACK-encoded by `StreamShared::write_headers`;
-//! only the 9-byte frame headers and the control frames live here.
+//! HPACK encoding happens at the caller, which knows whether it is writing a
+//! request or a response; what an already-encoded block is *cut into* is here,
+//! because that is the same at both ends.
 
 use bytes::BufMut;
 
@@ -135,5 +136,43 @@ fn setting_id_value(s: Setting) -> (u16, u32) {
         Setting::MaxFrameSize(v) => (0x5, v),
         Setting::MaxHeaderListSize(v) => (0x6, v),
         Setting::Unknown { id, value } => (id, value),
+    }
+}
+
+/// Writes an encoded header block as a HEADERS frame and however many
+/// CONTINUATIONs the peer's `max_frame_size` makes necessary.
+///
+/// Shared by both ends: a request block and a response block differ in the
+/// pseudo-headers the caller put at their front, and in nothing that happens
+/// here. §6.10 forbids any other frame between a HEADERS and its
+/// CONTINUATIONs, which is why the whole block is written in one call rather
+/// than left to a caller to interleave by accident.
+///
+/// `limit` must not be zero — §6.5.2 floors `max_frame_size` at 2^14, but the
+/// value came off the wire and `chunks` panics on zero.
+pub fn encode_header_block(
+    out: &mut Vec<u8>,
+    stream_id: StreamId,
+    block: &[u8],
+    limit: usize,
+    end_stream: bool,
+) {
+    let mut fragments = block.chunks(limit.max(1));
+    // An empty block is legal — `chunks` yields nothing for it.
+    let first = fragments.next().unwrap_or(&[]);
+    let mut rest = fragments.peekable();
+
+    // END_HEADERS belongs on the last frame of the block, so a block that
+    // continues gets the fragment header instead.
+    if rest.peek().is_none() {
+        encode_headers_header(out, stream_id, first.len(), end_stream);
+    } else {
+        encode_headers_fragment_header(out, stream_id, first.len(), end_stream);
+    }
+    out.extend_from_slice(first);
+
+    while let Some(fragment) = rest.next() {
+        encode_continuation_header(out, stream_id, fragment.len(), rest.peek().is_none());
+        out.extend_from_slice(fragment);
     }
 }

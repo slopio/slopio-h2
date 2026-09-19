@@ -23,7 +23,7 @@ fn main() {
 
     main_thread_with::<ClientRing, _>(async move {
         match client::connect::<ClientRing>(addr).await {
-            Ok(conn) => {
+            Ok(mut conn) => {
                 let peer = conn.peer_settings();
                 println!("connected to {addr}");
                 println!("  the server accepts:");
@@ -33,6 +33,17 @@ fn main() {
                 println!("    max_header_list_size    {:?}", peer.max_header_list_size);
                 println!("    header_table_size       {}", peer.header_table_size);
                 println!("    enable_push             {}", peer.enable_push);
+
+                // And one request on it. The response is not read yet — this
+                // says the head went out and was accepted, nothing more.
+                let request = http::Request::get("http://localhost/")
+                    .body(())
+                    .expect("a valid request");
+                match conn.send_request(&request, true).await {
+                    Ok(Some(id)) => println!("  sent a request on stream {}", u32::from(id)),
+                    Ok(None) => println!("  no stream could be opened"),
+                    Err(e) => eprintln!("  request failed: {e}"),
+                }
             }
             Err(e) => eprintln!("could not connect to {addr}: {e}"),
         }

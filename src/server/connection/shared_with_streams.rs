@@ -11,10 +11,7 @@ use crate::server::connection::{CONNECTION_INITIAL_WINDOW_SIZE, CONNECTION_RECV_
 use crate::server::stream::Stream;
 use crate::shared::{
     codec::frames::{
-        encode::{
-            encode_continuation_header, encode_data_header, encode_headers_fragment_header,
-            encode_headers_header, encode_window_update,
-        },
+        encode::{encode_data_header, encode_header_block, encode_window_update},
         stream_id::StreamId,
     },
     hpack::{Encoder, Header},
@@ -363,26 +360,7 @@ impl SharedConnection {
         // panics on zero and the value came off the wire.
         let limit = (self.max_frame_size.get() as usize).max(1);
 
-        self.write_frame(|out| {
-            let mut fragments = block.chunks(limit);
-            // An empty block is legal — `chunks` yields nothing for it.
-            let first = fragments.next().unwrap_or(&[]);
-            let mut rest = fragments.peekable();
-
-            // END_HEADERS belongs on the last frame of the block, so a block
-            // that continues gets the fragment header instead.
-            if rest.peek().is_none() {
-                encode_headers_header(out, stream_id, first.len(), end_stream);
-            } else {
-                encode_headers_fragment_header(out, stream_id, first.len(), end_stream);
-            }
-            out.extend_from_slice(first);
-
-            while let Some(fragment) = rest.next() {
-                encode_continuation_header(out, stream_id, fragment.len(), rest.peek().is_none());
-                out.extend_from_slice(fragment);
-            }
-        });
+        self.write_frame(|out| encode_header_block(out, stream_id, &block, limit, end_stream));
     }
 
     /// Writes a response body as DATA frames, END_STREAM on the last one.

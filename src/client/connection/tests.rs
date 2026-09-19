@@ -23,6 +23,7 @@ use crate::shared::transport::PlainMessages;
 
 runtime_core::define_buf_ring!(TestRing, bgid = 9, buffer_size = 16384, ring_size = 4);
 
+const HEADERS: u8 = 0x1;
 const SETTINGS: u8 = 0x4;
 const PING: u8 = 0x6;
 const GOAWAY: u8 = 0x7;
@@ -218,4 +219,167 @@ fn a_silent_server_does_not_hold_the_connection_for_ever() {
     );
 
     assert!(result, "the deadline fired rather than the handshake finishing");
+}
+
+/// A request goes out as one HEADERS frame on stream 1, with the pseudo-headers
+/// §8.3 requires and in the order it requires them.
+#[test]
+fn a_request_opens_stream_one_and_carries_its_pseudo_headers() {
+    let (fake, handle) = FakeRing::builder().virtual_time().build();
+    let socket = simulated_socket();
+    let fd = socket.fd();
+    handle.on_multishot_read(
+        fd,
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Eof.after(Duration::from_millis(50)),
+        ],
+    );
+
+    let sent = RuntimeInner::simulated(fake).block_on::<TestRing, _>(
+        async move {
+            runtime_core::runtime::spawn(async move {
+                let mut conn =
+                    Connection::handshake(PlainMessages::<TestRing, false>::new(socket))
+                        .await
+                        .expect("the handshake completed");
+                let request = http::Request::get("http://example.test/hello")
+                    .body(())
+                    .unwrap();
+                conn.send_request(&request, true).await.expect("written")
+            })
+            .await
+        },
+        None,
+        |run| run(),
+    );
+
+    // §5.1.1: a client's first stream is 1.
+    assert_eq!(sent.map(u32::from), Some(1));
+
+    let written = handle.writes(fd).concat();
+    let head = find_frame(&written, HEADERS).expect("a HEADERS frame went out");
+    assert_eq!(head.stream_id, 1);
+    // §8.1: no body was offered, so the head ends the stream, and §4.3 wants
+    // the block whole — one frame, END_HEADERS set.
+    assert_eq!(head.flags & 0x1, 0x1, "END_STREAM");
+    assert_eq!(head.flags & 0x4, 0x4, "END_HEADERS");
+
+    let decoded = decode_block(&head.payload);
+    assert_eq!(decoded.get(":method").map(String::as_str), Some("GET"));
+    assert_eq!(decoded.get(":scheme").map(String::as_str), Some("http"));
+    assert_eq!(decoded.get(":path").map(String::as_str), Some("/hello"));
+    assert_eq!(
+        decoded.get(":authority").map(String::as_str),
+        Some("example.test"),
+        "§8.3.1: where a request carries what HTTP/1.1 put in Host"
+    );
+}
+
+/// §5.1.2: the peer's limit is the peer's to set and ours to respect. Asking
+/// past it earns a REFUSED_STREAM, and a refusal we could have predicted is
+/// worse than a wait.
+#[test]
+fn no_stream_is_opened_past_the_peers_concurrency_limit() {
+    let (fake, handle) = FakeRing::builder().virtual_time().build();
+    let socket = simulated_socket();
+    let fd = socket.fd();
+    // The server allows exactly one.
+    let mut opening = frame(SETTINGS, 0, 0, &[0x00, 0x03, 0x00, 0x00, 0x00, 0x01]);
+    opening.extend_from_slice(&frame(SETTINGS, FLAG_ACK, 0, &[]));
+    handle.on_multishot_read(
+        fd,
+        vec![
+            ReadEvent::Data(opening).after(Duration::from_millis(1)),
+            ReadEvent::Eof.after(Duration::from_millis(50)),
+        ],
+    );
+
+    let ids = RuntimeInner::simulated(fake).block_on::<TestRing, _>(
+        async move {
+            runtime_core::runtime::spawn(async move {
+                let mut conn =
+                    Connection::handshake(PlainMessages::<TestRing, false>::new(socket))
+                        .await
+                        .expect("the handshake completed");
+                let request = http::Request::get("http://example.test/").body(()).unwrap();
+                let first = conn.send_request(&request, true).await.expect("written");
+                let second = conn.send_request(&request, true).await.expect("written");
+                (first, second)
+            })
+            .await
+        },
+        None,
+        |run| run(),
+    );
+
+    assert_eq!(ids.0.map(u32::from), Some(1), "the one it allowed");
+    assert_eq!(ids.1, None, "and no more, without asking");
+}
+
+/// The frames the client wrote, parsed back.
+///
+/// The preface is skipped first: it is 24 bytes of magic string and not a
+/// frame, so a walker that starts at zero reads its bytes as a frame header
+/// and every offset after it is wrong.
+fn find_frame(bytes: &[u8], kind: u8) -> Option<Frame> {
+    let mut at = if bytes.starts_with(CLIENT_PREFACE) {
+        CLIENT_PREFACE.len()
+    } else {
+        0
+    };
+    while at + 9 <= bytes.len() {
+        let len = u32::from_be_bytes([0, bytes[at], bytes[at + 1], bytes[at + 2]]) as usize;
+        let end = at + 9 + len;
+        if end > bytes.len() {
+            return None;
+        }
+        if bytes[at + 3] == kind {
+            return Some(Frame {
+                flags: bytes[at + 4],
+                stream_id: u32::from_be_bytes([
+                    bytes[at + 5] & 0x7f,
+                    bytes[at + 6],
+                    bytes[at + 7],
+                    bytes[at + 8],
+                ]),
+                payload: bytes[at + 9..end].to_vec(),
+            });
+        }
+        at = end;
+    }
+    None
+}
+
+struct Frame {
+    flags: u8,
+    stream_id: u32,
+    payload: Vec<u8>,
+}
+
+/// The fields of an encoded block, by name.
+fn decode_block(payload: &[u8]) -> std::collections::HashMap<String, String> {
+    use crate::shared::hpack::{Decoder, Header};
+    use bytes::BytesMut;
+
+    let mut buf = BytesMut::from(payload);
+    let mut cursor = std::io::Cursor::new(&mut buf);
+    let mut out = std::collections::HashMap::new();
+    Decoder::new(4096)
+        .decode(&mut cursor, |header| {
+            let (name, value) = match header {
+                Header::Field { name, value } => (
+                    name.as_str().to_owned(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                ),
+                Header::Method(v) => (":method".into(), v.as_str().to_owned()),
+                Header::Scheme(v) => (":scheme".into(), v.to_string()),
+                Header::Path(v) => (":path".into(), v.to_string()),
+                Header::Authority(v) => (":authority".into(), v.to_string()),
+                other => (format!("{other:?}"), String::new()),
+            };
+            out.insert(name, value);
+        })
+        .expect("the block we just encoded decodes");
+    out
 }
