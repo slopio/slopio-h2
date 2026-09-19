@@ -16,14 +16,41 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use runtime::net::{BufRingSpec, connect_tcp};
+use runtime::runtime::time::timeout;
 
 use crate::shared::transport::PlainMessages;
 
 mod connection;
 
 pub use connection::Connection;
+
+/// How long [`connect`] has to produce a connection that can carry a request.
+///
+/// One bound over the whole establishment rather than one per stage, because
+/// what a caller wants to limit is how long until it has something usable, and
+/// two constants that sum to a third nobody wrote down is worse than one that
+/// says what it means.
+///
+/// Every stage under it is otherwise unbounded, and the middle one is the
+/// reason this exists. A TCP connect is at least bounded by the kernel — six
+/// SYN retries, about two minutes, which is far too long but is finite. The
+/// handshake is not bounded by anything: a peer that accepts the connection
+/// and then sends nothing holds us for ever. That is the shape `PARTIAL_TIMEOUT`
+/// stops on the server side, pointed the other way, and it is cheaper to cause
+/// here than to mount — one `accept` and silence.
+///
+/// It is also what happens by accident, which matters more than the attack.
+/// Point this at a port where something that is not HTTP/2 is listening — an
+/// HTTP/1.1 server, sshd, a TLS endpoint — and without a deadline it hangs
+/// instead of failing.
+///
+/// Ten seconds is generous for what it covers: a TCP handshake and one round
+/// trip of SETTINGS. A peer that cannot manage both in ten seconds is not one
+/// a request was going to go well over.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Connects to `addr` and completes the HTTP/2 handshake.
 ///
@@ -35,6 +62,24 @@ pub use connection::Connection;
 ///
 /// `U` is the buffer ring inbound reads land in, as on the server side.
 pub async fn connect<U: BufRingSpec + 'static>(
+    addr: SocketAddr,
+) -> io::Result<Connection<PlainMessages<U, false>>> {
+    match timeout(CONNECT_TIMEOUT, establish::<U>(addr)).await {
+        Ok(connection) => connection,
+        // Dropping the attempt is what cancels it, and both halves are built
+        // for that: `ConnectTcp::drop` cancels the op and parks the fd and the
+        // `sockaddr` the kernel may still be reading, and dropping the
+        // handshake drops the `MultiRecv`, which recycles its buffers and
+        // cancels in that order.
+        Err(()) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "no usable connection within CONNECT_TIMEOUT",
+        )),
+    }
+}
+
+/// The two stages the deadline covers.
+async fn establish<U: BufRingSpec + 'static>(
     addr: SocketAddr,
 ) -> io::Result<Connection<PlainMessages<U, false>>> {
     let socket = connect_tcp(addr).await?;

@@ -177,3 +177,45 @@ fn a_ping_during_the_handshake_is_answered() {
         .any(|w| w[3] == PING && w[4] == FLAG_ACK && &w[9..17] == b"probe!!!");
     assert!(answered, "the probe came back with ACK set");
 }
+
+/// A server that accepts and then says nothing must not hold us for ever.
+///
+/// The hazard the deadline exists for, and the one nothing else bounds: the
+/// TCP connect is at least limited by the kernel's SYN retries, but a peer
+/// that completes the connection and goes quiet is unbounded. It costs the
+/// peer one `accept`.
+///
+/// Scripted with a reply well past the deadline, so the deadline is what
+/// decides rather than the script running out. Virtual time, so ten seconds
+/// cost the test nothing.
+#[test]
+fn a_silent_server_does_not_hold_the_connection_for_ever() {
+    use crate::client::CONNECT_TIMEOUT;
+    use runtime::runtime::time::timeout;
+
+    let (fake, handle) = FakeRing::builder().virtual_time().build();
+    let socket = simulated_socket();
+    let fd = socket.fd();
+    handle.on_multishot_read(
+        fd,
+        vec![ReadEvent::Data(server_opening()).after(CONNECT_TIMEOUT * 10)],
+    );
+
+    let result = RuntimeInner::simulated(fake).block_on::<TestRing, _>(
+        async move {
+            runtime_core::runtime::spawn(async move {
+                timeout(
+                    CONNECT_TIMEOUT,
+                    Connection::handshake(PlainMessages::<TestRing, false>::new(socket)),
+                )
+                .await
+                .is_err()
+            })
+            .await
+        },
+        None,
+        |run| run(),
+    );
+
+    assert!(result, "the deadline fired rather than the handshake finishing");
+}
