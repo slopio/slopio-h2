@@ -35,11 +35,13 @@
 //!
 //! [`client`]: crate::shared::codec::frames::FrameDecoder::client
 
+use std::cell::RefCell;
 use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
+use runtime::Handle;
 use runtime::net::{BufRingSpec, connect_tcp};
 use runtime::runtime::time::timeout;
 
@@ -95,14 +97,31 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Dropping it does not close the connection while streams are still running
 /// — the loop stays up until the last of them is done with. What ends the
 /// connection is the last handle of any kind going away, and then the loop
-/// says goodbye with a GOAWAY (§6.8) rather than vanishing.
+/// says goodbye with a GOAWAY (§6.8) rather than vanishing. [`Client::close`]
+/// is the same ending asked for out loud, which is what a caller that means to
+/// wait for it wants.
 pub struct Client {
     shared: Rc<ClientShared>,
+    /// The task the loop runs in, owned rather than detached.
+    ///
+    /// Owning it is what makes the connection's end observable: a detached
+    /// task answers nobody, so a connection that failed with no stream open
+    /// failed in silence — `is_closed` turned true and the reason went
+    /// nowhere. Dropping this handle detaches the task rather than killing it,
+    /// which is what lets a client walk away from a connection its streams are
+    /// still using.
+    ///
+    /// `None` for a client on a connection somebody else drives, which only
+    /// the tests do.
+    task: RefCell<Option<Handle<io::Result<()>>>>,
 }
 
 impl Client {
-    pub(crate) fn new(shared: Rc<ClientShared>) -> Self {
-        Self { shared }
+    pub(crate) fn new(shared: Rc<ClientShared>, task: Option<Handle<io::Result<()>>>) -> Self {
+        Self {
+            shared,
+            task: RefCell::new(task),
+        }
     }
 
     /// What the peer said it will accept, as of its last SETTINGS frame.
@@ -130,9 +149,50 @@ impl Client {
     }
 
     /// Whether this connection can still take requests. `true` once a GOAWAY
-    /// has arrived, the loop has stopped, or §5.1.1's stream ids are spent.
+    /// has arrived, the loop has stopped, [`Client::close`] has been called,
+    /// or §5.1.1's stream ids are spent.
     pub fn is_closed(&self) -> bool {
         self.shared.is_closing()
+    }
+
+    /// Stops this connection taking new requests, and lets the streams already
+    /// on it finish.
+    ///
+    /// The graceful shutdown of §6.8, from this end: nothing in flight is
+    /// cancelled, and the loop sends its GOAWAY and stops once the last stream
+    /// is done. Returns at once — [`Client::closed`] is how to wait for it.
+    ///
+    /// Dropping every handle does the same thing. This is for the caller that
+    /// wants to keep the handle and still say when it is finished.
+    pub fn close(&self) {
+        self.shared.stop_opening();
+        // The loop is parked on the socket, and what just changed is not
+        // something the socket will tell it.
+        self.shared.core.wake_flusher();
+    }
+
+    /// Waits for the connection to end, and says why it did.
+    ///
+    /// `Ok` is a connection that was finished with — by this client, or by a
+    /// peer that closed or said goodbye. `Err` is one that stopped for a
+    /// reason, and it is the same reason the streams in flight were given.
+    ///
+    /// This waits; it does not close. A caller that holds this handle and
+    /// awaits here is waiting for the *peer* to go, which is a thing to want
+    /// on purpose and a hang to fall into by accident — [`Client::close`]
+    /// first is what makes it the end of one's own connection.
+    ///
+    /// The end is handed over once, as a response head is. A second call
+    /// answers the error that says so rather than waiting for something that
+    /// has already happened.
+    pub async fn closed(&self) -> io::Result<()> {
+        let task = self.task.borrow_mut().take();
+        match task {
+            Some(task) => task.await,
+            None => Err(io::Error::other(
+                "this client does not own the connection loop",
+            )),
+        }
     }
 
     /// How many streams are open on this connection, against the peer's
@@ -160,9 +220,10 @@ impl Drop for Client {
 /// has to cope with limits it has not been told yet. Waiting costs one round
 /// trip and makes `max_concurrent_streams` mean something before it is needed.
 ///
-/// The spawned loop is detached: it ends on its own when the last [`Client`]
-/// and [`Stream`] have been dropped, which is the only thing that can tell it
-/// no further request is coming.
+/// The loop runs in a task the returned [`Client`] owns: [`Client::closed`]
+/// is its end, and dropping every handle — or [`Client::close`] — is what
+/// brings that end about, since nothing else can tell it that no further
+/// request is coming.
 ///
 /// `U` is the buffer ring inbound reads land in, as on the server side.
 pub async fn connect<U: BufRingSpec + 'static>(addr: SocketAddr) -> io::Result<Client> {
@@ -181,9 +242,7 @@ pub async fn connect<U: BufRingSpec + 'static>(addr: SocketAddr) -> io::Result<C
         }
     };
 
-    let client = connection.client();
-    runtime::spawn(connection.run());
-    Ok(client)
+    Ok(connection.spawn())
 }
 
 /// The two stages the deadline covers.

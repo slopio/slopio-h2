@@ -143,9 +143,7 @@ where
                 let conn = Connection::handshake(PlainMessages::<TestRing, false>::new(socket))
                     .await
                     .expect("the handshake completed");
-                let client = conn.client();
-                runtime_core::runtime::spawn(conn.run());
-                app(client).await
+                app(conn.spawn()).await
             })
             .await
         },
@@ -757,6 +755,98 @@ fn a_closed_connection_fails_the_streams_it_was_carrying() {
     );
 }
 
+/// §6.8: a client that is finished with a connection says so, and can wait for
+/// the goodbye to have gone.
+///
+/// `close` is the ending asked for rather than fallen into — dropping every
+/// handle brings about the same one, but a caller that wants to *wait* for it
+/// cannot drop the handle it would wait on.
+#[test]
+fn closing_a_client_ends_the_connection_and_waits_for_the_goodbye() {
+    // No EOF in the script at all, deliberately: the peer never goes away, so
+    // the only thing that can end this connection is the client saying it is
+    // done with it. A test that left one in would pass on the peer's close
+    // and prove nothing.
+    let (outcome, written) = with_client(
+        vec![ReadEvent::Data(server_opening()).after(Duration::from_millis(1))],
+        |client| async move {
+            client.close();
+            let ended = client.closed().await;
+            (ended.is_ok(), client.is_closed())
+        },
+    );
+
+    assert_eq!(outcome, (true, true), "ended, and said it had");
+
+    let goodbye = frames(&written)
+        .into_iter()
+        .find(|f| f.kind == GOAWAY)
+        .expect("a GOAWAY went out");
+    assert_eq!(
+        u32::from_be_bytes(goodbye.payload[4..8].try_into().unwrap()),
+        crate::shared::codec::types::NO_ERROR,
+        "nothing went wrong; the connection was finished with"
+    );
+}
+
+/// A connection that fails with no stream open used to fail in silence: the
+/// reason went to the streams, and there were none. The task belongs to the
+/// `Client` now, so the reason has somewhere to go.
+#[test]
+fn a_connection_that_fails_with_no_stream_open_still_says_why() {
+    // §5.1: a HEADERS on a stream this client never opened. Nothing is in
+    // flight — no request has been made at all — so the only thing that can
+    // report this is the connection itself.
+    let unexpected = frame(HEADERS, FLAG_END_HEADERS, 3, STATUS_200);
+
+    let (message, written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(unexpected).after(Duration::from_millis(10)),
+            ReadEvent::Eof.after(Duration::from_secs(60)),
+        ],
+        |client| async move {
+            client
+                .closed()
+                .await
+                .expect_err("a protocol error is not a clean end")
+                .to_string()
+        },
+    );
+
+    assert!(
+        message.contains("never opened"),
+        "the reason reaches the caller: {message}"
+    );
+
+    let goaway = frames(&written)
+        .into_iter()
+        .find(|f| f.kind == GOAWAY)
+        .expect("a GOAWAY went out");
+    assert_eq!(
+        u32::from_be_bytes(goaway.payload[4..8].try_into().unwrap()),
+        crate::shared::codec::types::PROTOCOL_ERROR
+    );
+}
+
+/// The end is handed over once, like a response head: a second ask is a
+/// mistake, and a mistake reported is better than one that hangs.
+#[test]
+fn the_connections_end_is_answered_once() {
+    let (second, _) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Eof.after(Duration::from_millis(10)),
+        ],
+        |client| async move {
+            let _ = client.closed().await;
+            client.closed().await.expect_err("asked twice").to_string()
+        },
+    );
+
+    assert!(second.contains("does not own"), "said so: {second}");
+}
+
 #[derive(Clone, Debug)]
 struct Frame {
     kind: u8,
@@ -824,4 +914,53 @@ fn decode_block(payload: &[u8]) -> std::collections::HashMap<String, String> {
         })
         .expect("the block we just encoded decodes");
     out
+}
+
+/// The example's shape, end to end: a request answered in full, then the
+/// client says it is done and waits for the goodbye. No EOF here either — the
+/// peer stays, and the client leaves.
+#[test]
+fn a_finished_exchange_then_close_and_wait() {
+    let mut response = frame(HEADERS, FLAG_END_HEADERS, 1, STATUS_200);
+    response.extend_from_slice(&frame(DATA, FLAG_END_STREAM, 1, b"hello"));
+
+    let (ended, written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(response).after(Duration::from_millis(10)),
+        ],
+        |client| async move {
+            let request = http::Request::get("http://example.test/").body(()).unwrap();
+            let stream = client.send_request(&request, true).expect("a stream");
+            let _ = stream.response().await.expect("a response");
+            while stream.read().await.expect("a body").is_some() {}
+            drop(stream);
+            client.close();
+            client.closed().await.is_ok()
+        },
+    );
+
+    assert!(ended, "the connection ended cleanly, and said so");
+    assert!(
+        frames(&written).iter().any(|f| f.kind == GOAWAY),
+        "§6.8: and said goodbye on the way out"
+    );
+}
+
+#[test]
+fn the_end_can_be_asked_for_after_it_has_happened() {
+    let (ended, _) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Eof.after(Duration::from_millis(10)),
+        ],
+        |client| async move {
+            // The loop is over well before anyone asks.
+            settle().await;
+            settle().await;
+            client.closed().await.is_ok()
+        },
+    );
+
+    assert!(ended);
 }

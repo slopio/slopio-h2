@@ -96,5 +96,14 @@ fn main() {
             }
         }
         println!("  read {received} bytes of body");
+
+        // Done with the connection: no more requests, the loop finishes what
+        // is on it and says goodbye, and this is where that end is heard.
+        drop(stream);
+        client.close();
+        match client.closed().await {
+            Ok(()) => println!("  connection closed"),
+            Err(e) => eprintln!("  connection ended badly: {e}"),
+        }
     });
 }

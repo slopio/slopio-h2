@@ -34,8 +34,61 @@ enum Event<B> {
     Flush,
     /// The buffer ring was empty. Nothing to do but come back.
     Retry,
-    /// The peer is gone, cleanly or otherwise.
+    /// The peer closed its side.
     Closed,
+    /// The transport failed, which is a close with nobody to tell.
+    Failed,
+    /// Nothing will be asked of this connection again, and nothing is left on
+    /// it to finish.
+    Finished,
+}
+
+/// Why the loop stopped: what the streams in flight are told, and what the
+/// caller hears.
+///
+/// The two are the same sentence deliberately. A stream failing with "the
+/// peer closed the connection" and a `run` that answered something else about
+/// the same moment would be two accounts of one event.
+enum Ended {
+    /// The connection was finished with: by this client, or by a peer that
+    /// closed or said goodbye.
+    Done(&'static str),
+    /// It stopped for a reason — a transport failure, or a protocol error we
+    /// answered with a GOAWAY.
+    Failed(&'static str),
+}
+
+impl Ended {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Done(reason) | Self::Failed(reason) => reason,
+        }
+    }
+
+    fn into_result(self) -> io::Result<()> {
+        match self {
+            Self::Done(_) => Ok(()),
+            Self::Failed(reason) => Err(io::Error::other(reason)),
+        }
+    }
+}
+
+/// Whether the connection has nothing left to do, ever.
+///
+/// Two ways to get there, and they are the same answer. Nobody holds a handle
+/// — the loop's own `Rc` is the one always there, so being alone with it means
+/// no request can be made again — or no further request will be taken, because
+/// a GOAWAY arrived or [`Client::close`] was called, and what was in flight
+/// has finished.
+///
+/// A free function on the shared state rather than a method on the connection,
+/// because the one place it has to be asked is inside a poll that has the
+/// transport borrowed. That is not a detail: neither of these is an *event*.
+/// Nothing arrives to announce them, and the wake that follows a dropped
+/// handle or a `close` carries no frame — so a loop that only asked between
+/// events would sleep through both, which is precisely what it did.
+fn finished(shared: &Rc<ClientShared>) -> bool {
+    Rc::strong_count(shared) == 1 || (shared.is_closing() && shared.streams.len() == 0)
 }
 
 pub struct Connection<T: Transport> {
@@ -111,10 +164,28 @@ impl<T: Transport> Connection<T> {
         Ok(conn)
     }
 
-    /// A handle on this connection, for the task that will make requests on
-    /// it. Nothing happens on it until [`Connection::run`] is driving.
-    pub fn client(&self) -> Client {
-        Client::new(Rc::clone(&self.protocol.shared))
+    /// Puts the loop in a task of its own and answers the handle requests are
+    /// made on.
+    ///
+    /// The [`Client`] owns that task rather than the task being detached, and
+    /// that is the whole difference: a detached task cannot be waited on, cannot
+    /// be stopped, and reports nothing when it ends — so a connection that died
+    /// with no stream open died in silence. Owned, its end is
+    /// [`Client::closed`], and dropping the handle still detaches, which is
+    /// what keeps a client that simply walks away from having to say so.
+    pub fn spawn(self) -> Client
+    where
+        T: 'static,
+    {
+        let shared = Rc::clone(&self.protocol.shared);
+        Client::new(shared, Some(runtime::spawn(self.run())))
+    }
+
+    /// A handle on a connection somebody else is driving — the tests, which
+    /// run the loop themselves or not at all. A `Client` made this way has no
+    /// task to wait on, which is why it is not the way out of this module.
+    pub(crate) fn client(&self) -> Client {
+        Client::new(Rc::clone(&self.protocol.shared), None)
     }
 
     /// Drives the connection until there is nothing left to drive: the peer
@@ -134,16 +205,16 @@ impl<T: Transport> Connection<T> {
     /// application, and how long a request may take is that application's
     /// business, not this loop's. A request that must not hang forever wraps
     /// its own `timeout` around `response()` today.
-    pub async fn run(mut self) {
-        let reason = loop {
-            // Nobody holds a handle any more, so no request can ever be made
-            // on this connection again — and anything still in the map has no
-            // one left to read it. §6.8: say goodbye rather than vanishing.
-            if self.is_abandoned() {
-                self.protocol
-                    .fail(NO_ERROR, "the client is done with this connection");
-                let _ = self.flush().await;
-                break "the client closed the connection";
+    ///
+    /// `Ok` is a connection that ended because it was finished with — by this
+    /// client, or by a peer that closed or said goodbye. `Err` is one that
+    /// stopped for a reason: a transport failure, or a protocol error we
+    /// answered with a GOAWAY. Either way the streams still in flight are
+    /// told the same thing, which is what they report to whoever was waiting.
+    pub async fn run(mut self) -> io::Result<()> {
+        let ended = loop {
+            if finished(&self.protocol.shared) {
+                break self.farewell().await;
             }
 
             let event = self.next_event().await;
@@ -153,7 +224,7 @@ impl<T: Transport> Connection<T> {
                 }
                 Event::Flush => {
                     if self.flush().await.is_err() {
-                        break "the connection failed while sending";
+                        break Ended::Failed("the connection failed while sending");
                     }
                     continue;
                 }
@@ -165,36 +236,43 @@ impl<T: Transport> Connection<T> {
                     runtime::yield_now().await;
                     continue;
                 }
-                Event::Closed => break "the peer closed the connection",
+                Event::Closed => break Ended::Done("the peer closed the connection"),
+                Event::Failed => break Ended::Failed("the connection failed while reading"),
+                Event::Finished => break self.farewell().await,
             }
 
             // A connection error was answered with a GOAWAY, which still has
             // to leave before the socket does.
             if self.protocol.is_closing() {
                 let _ = self.flush().await;
-                break self.protocol.failure.unwrap_or("the connection failed");
-            }
-            // A GOAWAY from the peer with nothing left to finish: the streams
-            // it would not process are already failed, and no new one can be
-            // opened, so there is nothing to stay for.
-            if self.protocol.shared.is_closing() && self.protocol.shared.streams.len() == 0 {
-                let _ = self.flush().await;
-                break "the peer went away";
+                break Ended::Failed(self.protocol.failure.unwrap_or("the connection failed"));
             }
         };
 
         // Whatever was still in flight ends here, with a reason, rather than
         // waiting on frames that will never come.
-        self.protocol.shared.shut_down(reason);
+        self.protocol.shared.shut_down(ended.reason());
+        ended.into_result()
     }
 
-    /// Whether anything outside this loop still holds the connection. The
-    /// loop's own `Rc` is the one that is always there, so being alone with
-    /// it means every [`Client`] and [`Stream`] has been dropped.
+    /// §6.8: a connection that is done is said to be done. The GOAWAY is
+    /// written only if none has gone out — `fail` is idempotent — and then
+    /// what is queued leaves, since a goodbye nobody sends is a socket that
+    /// simply vanished.
     ///
-    /// [`Stream`]: crate::client::Stream
-    fn is_abandoned(&self) -> bool {
-        Rc::strong_count(&self.protocol.shared) == 1
+    /// The reason the peer already gave, where there is one, so a connection
+    /// that ends because the peer said goodbye does not report itself as
+    /// having ended because we did.
+    async fn farewell(&mut self) -> Ended {
+        let reason = self
+            .protocol
+            .failure
+            .unwrap_or("the client closed the connection");
+        self.protocol.fail(NO_ERROR, reason);
+        match self.flush().await {
+            Ok(()) => Ended::Done(reason),
+            Err(_) => Ended::Failed("the connection failed while sending"),
+        }
     }
 
     /// Waits for whichever comes first: a chunk from the peer, or a frame to
@@ -215,15 +293,24 @@ impl<T: Transport> Connection<T> {
         let shared = &protocol.shared;
 
         std::future::poll_fn(move |cx| {
+            // Asked on every poll, because this is the one thing that becomes
+            // true without an event: a handle dropped or a `close` wakes this
+            // task and brings no frame with it, so the answer has to be looked
+            // for rather than waited for.
+            if finished(shared) {
+                return Poll::Ready(Event::Finished);
+            }
             if !shared.core.output_is_empty() {
                 return Poll::Ready(Event::Flush);
             }
             match Pin::new(&mut *transport).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Event::Inbound(chunk)),
                 Poll::Ready(Some(Err(RecvError::Later))) => Poll::Ready(Event::Retry),
-                // A transport failure and a clean close are the same thing to
-                // a loop that has nowhere left to send a GOAWAY.
-                Poll::Ready(Some(Err(RecvError::Fatal(_))) | None) => Poll::Ready(Event::Closed),
+                Poll::Ready(None) => Poll::Ready(Event::Closed),
+                // Nowhere left to send a GOAWAY, so this ends the loop as a
+                // close does — but it is not one, and whoever waits on the
+                // connection is owed the difference.
+                Poll::Ready(Some(Err(RecvError::Fatal(_)))) => Poll::Ready(Event::Failed),
                 Poll::Pending => {
                     shared.core.park_flusher(cx.waker());
                     match shared.core.output_is_empty() {
