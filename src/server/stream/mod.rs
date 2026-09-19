@@ -509,6 +509,32 @@ impl Stream {
     }
 }
 
+/// What [`SharedConnection::write_data`] needs of a stream: the send window,
+/// and where to park a writer that has run out of it.
+///
+/// One waker slot serves both directions here, which is sound because a
+/// server stream has one task and that task waits on one thing at a time —
+/// either for body bytes to arrive or for credit to write with, never both.
+///
+/// [`SharedConnection::write_data`]: crate::shared::connection::SharedConnection::write_data
+impl crate::shared::connection::SendSide for Stream {
+    fn available_send(&self) -> u32 {
+        self.available_send()
+    }
+
+    fn debit_send(&self, len: u32) -> Result<(), ()> {
+        self.debit_send(len)
+    }
+
+    fn register_send_waker(&self, waker: &Waker) {
+        self.register_waker(waker);
+    }
+
+    fn note_sent(&self, n: usize) {
+        self.note_sent(n);
+    }
+}
+
 /// The declared body length, or `None` when the request declared none.
 ///
 /// RFC 9110 §8.6 gives `content-length` the grammar `1*DIGIT` with no upper

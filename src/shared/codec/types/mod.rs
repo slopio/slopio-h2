@@ -38,6 +38,9 @@ pub enum StreamViolation {
     MalformedMessage,
     /// §8.3.1: a request missing or misusing its pseudo-headers.
     MalformedRequest,
+    /// §8.3.2: a response missing `:status`, or carrying a pseudo-header that
+    /// belongs to a request.
+    MalformedResponse,
     /// §8.1: trailers without END_STREAM, or with pseudo-headers.
     MalformedTrailers,
     /// §8.1.1: DATA payloads not adding up to `content-length`.
@@ -65,6 +68,7 @@ impl StreamViolation {
             Self::PrioritySelfDependency | Self::HeadersSelfDependency => "stream depends on itself",
             Self::MalformedMessage => "malformed message",
             Self::MalformedRequest => "malformed request",
+            Self::MalformedResponse => "malformed response",
             Self::MalformedTrailers => "malformed trailers",
             Self::ContentLengthMismatch => "body does not match content-length",
             Self::DataAfterEndStream => "frame after END_STREAM",

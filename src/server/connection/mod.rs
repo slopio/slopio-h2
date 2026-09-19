@@ -16,7 +16,13 @@ mod tests;
 
 pub const MAX_CONCURRENT_STREAMS: u32 = 64;
 
-pub const CONNECTION_INITIAL_WINDOW_SIZE: u32 = 65_535;
+/// §6.9.2's starting point for both halves of the connection window, which a
+/// WINDOW_UPDATE on stream 0 is the only thing that moves. Shared with the
+/// client, which starts from the same place.
+pub use crate::shared::connection::CONNECTION_INITIAL_WINDOW_SIZE;
+
+/// The connection receive window this server announces, once the handshake is
+/// done. Ours to choose, where the send side is the peer's to credit.
 pub const CONNECTION_RECV_WINDOW: u32 = 1024 * 1024;
 
 /// How long one gather-write may stall before the connection is closed.

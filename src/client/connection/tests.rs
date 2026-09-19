@@ -1,13 +1,13 @@
-//! The handshake, against a scripted server.
+//! The client, against a scripted server.
 //!
 //! The same simulated ring the server's tests run on, pointed the other way:
 //! what the script declares is now what a *server* would send, and what comes
 //! back is what the client put on the wire.
 //!
-//! Verified by hand against three implementations — popple-h2, tokio's `h2`,
-//! and nghttpd — which agree on the handshake and disagree about everything
-//! else they advertise. That is worth having done once and is not worth doing
-//! in a test, which is what this is for.
+//! The handshake was verified by hand against three implementations —
+//! popple-h2, tokio's `h2`, and nghttpd — which agree on it and disagree about
+//! everything else they advertise. That is worth having done once and is not
+//! worth doing in a test, which is what this is for.
 
 use std::io;
 
@@ -15,19 +15,31 @@ use std::time::Duration;
 
 use runtime_core::deterministic_testing::{FakeRing, ReadEvent, Scripted, simulated_socket};
 use runtime_core::runtime::RuntimeInner;
+use runtime_core::runtime::time::timeout;
 
 use super::Connection;
+use crate::client::{Client, Unavailable};
 use crate::shared::codec::frames::CLIENT_PREFACE;
 use crate::shared::connection::settings::Settings;
 use crate::shared::transport::PlainMessages;
 
 runtime_core::define_buf_ring!(TestRing, bgid = 9, buffer_size = 16384, ring_size = 4);
 
+const DATA: u8 = 0x0;
 const HEADERS: u8 = 0x1;
+const RST_STREAM: u8 = 0x3;
 const SETTINGS: u8 = 0x4;
 const PING: u8 = 0x6;
 const GOAWAY: u8 = 0x7;
+const WINDOW_UPDATE: u8 = 0x8;
 const FLAG_ACK: u8 = 0x1;
+const FLAG_END_STREAM: u8 = 0x1;
+const FLAG_END_HEADERS: u8 = 0x4;
+
+/// `:status 200` is entry 8 of the static table, so a response head needs no
+/// literal encoding and no dynamic table entry — which keeps the scripts from
+/// having to model HPACK state the decoder is keeping.
+const STATUS_200: &[u8] = &[0x88];
 
 fn frame(kind: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(9 + payload.len());
@@ -45,6 +57,16 @@ fn server_opening() -> Vec<u8> {
     let mut bytes = frame(SETTINGS, 0, 0, &[0x00, 0x03, 0x00, 0x00, 0x00, 0x64]);
     bytes.extend_from_slice(&frame(SETTINGS, FLAG_ACK, 0, &[]));
     bytes
+}
+
+/// A literal header field, never indexed (§6.2.3), so a scripted trailer
+/// section leaves the decoder's dynamic table exactly as it found it.
+fn literal(name: &str, value: &str) -> Vec<u8> {
+    let mut out = vec![0x10, name.len() as u8];
+    out.extend_from_slice(name.as_bytes());
+    out.push(value.len() as u8);
+    out.extend_from_slice(value.as_bytes());
+    out
 }
 
 /// Runs a handshake against `inbound`, and hands back its result with the
@@ -86,7 +108,7 @@ fn handshake(mut inbound: Vec<ReadEvent>) -> (io::Result<Settings>, Vec<u8>) {
             runtime_core::runtime::spawn(async move {
                 Connection::handshake(PlainMessages::<TestRing, false>::new(socket))
                     .await
-                    .map(|conn| conn.peer_settings().clone())
+                    .map(|conn| conn.client().peer_settings())
             })
             .await
         },
@@ -97,11 +119,80 @@ fn handshake(mut inbound: Vec<ReadEvent>) -> (io::Result<Settings>, Vec<u8>) {
     (result, handle.writes(fd).concat())
 }
 
+/// Hands the connection over to `app` with the loop running behind it, which
+/// is how the API is meant to be used: the application holds a [`Client`] and
+/// the frames move in a task of their own.
+///
+/// `inbound` is scripted at the times given — a response cannot be declared
+/// "after the request" here, because the script is fixed before the runtime
+/// starts, so it is declared at a moment the request will comfortably precede.
+fn with_client<F, Fut, R>(inbound: Vec<Scripted>, app: F) -> (R, Vec<u8>)
+where
+    F: FnOnce(Client) -> Fut + 'static,
+    Fut: Future<Output = R>,
+    R: 'static,
+{
+    let (fake, handle) = FakeRing::builder().virtual_time().build();
+    let socket = simulated_socket();
+    let fd = socket.fd();
+    handle.on_multishot_read(fd, inbound);
+
+    let result = RuntimeInner::simulated(fake).block_on::<TestRing, _>(
+        async move {
+            runtime_core::runtime::spawn(async move {
+                let conn = Connection::handshake(PlainMessages::<TestRing, false>::new(socket))
+                    .await
+                    .expect("the handshake completed");
+                let client = conn.client();
+                runtime_core::runtime::spawn(conn.run());
+                app(client).await
+            })
+            .await
+        },
+        None,
+        |run| run(),
+    );
+
+    (result, handle.writes(fd).concat())
+}
+
+/// One scripted arrival per buffer the ring can hold.
+///
+/// A completion cannot exceed its buffer, so a response larger than one has
+/// to be declared as the several reads it would really be — which is closer
+/// to the wire anyway: chunk boundaries are the kernel's, and the decoder
+/// reassembles across them.
+fn split(bytes: Vec<u8>, first: Duration) -> Vec<Scripted> {
+    let mut due = first;
+    bytes
+        .chunks(16_000)
+        .map(|chunk| {
+            let at = due;
+            due += Duration::from_millis(1);
+            ReadEvent::Data(chunk.to_vec()).after(at)
+        })
+        .collect()
+}
+
+/// Lets the connection loop have the thread: the test's task waits on the
+/// clock, which is virtual, so ten milliseconds of it cost nothing.
+///
+/// Needed wherever a test asserts on bytes that a *drop* produced — a
+/// RST_STREAM, a GOAWAY — since writing a frame only wakes the loop, and the
+/// loop is what sends it.
+async fn settle() {
+    let _ = timeout(Duration::from_millis(10), std::future::pending::<()>()).await;
+}
+
 #[test]
 fn the_preface_goes_out_before_anything_is_read() {
     let (result, written) = handshake(vec![ReadEvent::Data(server_opening())]);
 
-    assert!(result.is_ok(), "the handshake completed: {:?}", result.as_ref().err());
+    assert!(
+        result.is_ok(),
+        "the handshake completed: {:?}",
+        result.as_ref().err()
+    );
 
     // §3.4: the magic string first, and immediately a SETTINGS frame — not
     // after a round trip, which is a server holding a connection open for
@@ -126,12 +217,34 @@ fn the_peers_settings_are_taken_and_acknowledged() {
     let peer = result.expect("the handshake completed");
     assert_eq!(peer.max_concurrent_streams, Some(100));
 
-    // §6.5.3: and acknowledged. Two SETTINGS frames go out — ours, then the
-    // ack — so the last one carries ACK and no payload.
-    let tail = &written[written.len() - 9..];
-    assert_eq!(tail[3], SETTINGS);
-    assert_eq!(tail[4], FLAG_ACK);
-    assert_eq!(&tail[..3], &[0, 0, 0], "an ack carries no payload");
+    // §6.5.3: and acknowledged.
+    let sent = frames(&written);
+    let ack = sent
+        .iter()
+        .rev()
+        .find(|f| f.kind == SETTINGS && f.flags & FLAG_ACK != 0)
+        .expect("a SETTINGS ACK went out");
+    assert!(ack.payload.is_empty(), "an ack carries no payload");
+}
+
+/// §6.9.2: the connection window starts at 65535 whatever the SETTINGS say,
+/// and a WINDOW_UPDATE on stream 0 is the only thing that moves it. A client
+/// that never sent one would stall every download at 64 KiB.
+#[test]
+fn the_connection_window_is_opened_during_the_handshake() {
+    let (_, written) = handshake(vec![ReadEvent::Data(server_opening())]);
+
+    let update = frames(&written)
+        .into_iter()
+        .find(|f| f.kind == WINDOW_UPDATE)
+        .expect("a WINDOW_UPDATE went out");
+    assert_eq!(update.stream_id, 0, "connection level");
+    assert_eq!(
+        u32::from_be_bytes(update.payload[..4].try_into().unwrap()),
+        crate::client::CONNECTION_RECV_WINDOW
+            - crate::shared::connection::CONNECTION_INITIAL_WINDOW_SIZE,
+        "the gap between the default and what we announce"
+    );
 }
 
 /// §6.5.3 makes the exchange two-way and the halves independent: a server may
@@ -171,7 +284,11 @@ fn a_ping_during_the_handshake_is_answered() {
     bytes.extend_from_slice(&server_opening());
 
     let (result, written) = handshake(vec![ReadEvent::Data(bytes)]);
-    assert!(result.is_ok(), "the handshake still completed: {:?}", result.as_ref().err());
+    assert!(
+        result.is_ok(),
+        "the handshake still completed: {:?}",
+        result.as_ref().err()
+    );
 
     let answered = written
         .windows(9 + 8)
@@ -192,7 +309,6 @@ fn a_ping_during_the_handshake_is_answered() {
 #[test]
 fn a_silent_server_does_not_hold_the_connection_for_ever() {
     use crate::client::CONNECT_TIMEOUT;
-    use runtime::runtime::time::timeout;
 
     let (fake, handle) = FakeRing::builder().virtual_time().build();
     let socket = simulated_socket();
@@ -218,52 +334,48 @@ fn a_silent_server_does_not_hold_the_connection_for_ever() {
         |run| run(),
     );
 
-    assert!(result, "the deadline fired rather than the handshake finishing");
+    assert!(
+        result,
+        "the deadline fired rather than the handshake finishing"
+    );
 }
 
-/// A request goes out as one HEADERS frame on stream 1, with the pseudo-headers
-/// §8.3 requires and in the order it requires them.
+/// A request goes out as one HEADERS frame on stream 1, with the
+/// pseudo-headers §8.3 requires and in the order it requires them.
 #[test]
 fn a_request_opens_stream_one_and_carries_its_pseudo_headers() {
-    let (fake, handle) = FakeRing::builder().virtual_time().build();
-    let socket = simulated_socket();
-    let fd = socket.fd();
-    handle.on_multishot_read(
-        fd,
+    let (id, written) = with_client(
         vec![
             ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
-            ReadEvent::Eof.after(Duration::from_millis(50)),
+            ReadEvent::Eof.after(Duration::from_millis(100)),
         ],
-    );
-
-    let sent = RuntimeInner::simulated(fake).block_on::<TestRing, _>(
-        async move {
-            runtime_core::runtime::spawn(async move {
-                let mut conn =
-                    Connection::handshake(PlainMessages::<TestRing, false>::new(socket))
-                        .await
-                        .expect("the handshake completed");
-                let request = http::Request::get("http://example.test/hello")
-                    .body(())
-                    .unwrap();
-                conn.send_request(&request, true).await.expect("written")
-            })
-            .await
+        |client| async move {
+            let request = http::Request::get("http://example.test/hello")
+                .body(())
+                .unwrap();
+            let stream = client.send_request(&request, true).expect("a stream");
+            let id = stream.id();
+            settle().await;
+            u32::from(id)
         },
-        None,
-        |run| run(),
     );
 
     // §5.1.1: a client's first stream is 1.
-    assert_eq!(sent.map(u32::from), Some(1));
+    assert_eq!(id, 1);
 
-    let written = handle.writes(fd).concat();
-    let head = find_frame(&written, HEADERS).expect("a HEADERS frame went out");
+    let head = frames(&written)
+        .into_iter()
+        .find(|f| f.kind == HEADERS)
+        .expect("a HEADERS frame went out");
     assert_eq!(head.stream_id, 1);
     // §8.1: no body was offered, so the head ends the stream, and §4.3 wants
     // the block whole — one frame, END_HEADERS set.
-    assert_eq!(head.flags & 0x1, 0x1, "END_STREAM");
-    assert_eq!(head.flags & 0x4, 0x4, "END_HEADERS");
+    assert_eq!(head.flags & FLAG_END_STREAM, FLAG_END_STREAM, "END_STREAM");
+    assert_eq!(
+        head.flags & FLAG_END_HEADERS,
+        FLAG_END_HEADERS,
+        "END_HEADERS"
+    );
 
     let decoded = decode_block(&head.payload);
     assert_eq!(decoded.get(":method").map(String::as_str), Some("GET"));
@@ -281,80 +393,410 @@ fn a_request_opens_stream_one_and_carries_its_pseudo_headers() {
 /// worse than a wait.
 #[test]
 fn no_stream_is_opened_past_the_peers_concurrency_limit() {
-    let (fake, handle) = FakeRing::builder().virtual_time().build();
-    let socket = simulated_socket();
-    let fd = socket.fd();
     // The server allows exactly one.
     let mut opening = frame(SETTINGS, 0, 0, &[0x00, 0x03, 0x00, 0x00, 0x00, 0x01]);
     opening.extend_from_slice(&frame(SETTINGS, FLAG_ACK, 0, &[]));
-    handle.on_multishot_read(
-        fd,
+
+    let (outcome, _) = with_client(
         vec![
             ReadEvent::Data(opening).after(Duration::from_millis(1)),
-            ReadEvent::Eof.after(Duration::from_millis(50)),
+            ReadEvent::Eof.after(Duration::from_millis(100)),
         ],
-    );
-
-    let ids = RuntimeInner::simulated(fake).block_on::<TestRing, _>(
-        async move {
-            runtime_core::runtime::spawn(async move {
-                let mut conn =
-                    Connection::handshake(PlainMessages::<TestRing, false>::new(socket))
-                        .await
-                        .expect("the handshake completed");
-                let request = http::Request::get("http://example.test/").body(()).unwrap();
-                let first = conn.send_request(&request, true).await.expect("written");
-                let second = conn.send_request(&request, true).await.expect("written");
-                (first, second)
-            })
-            .await
+        |client| async move {
+            let request = http::Request::get("http://example.test/").body(()).unwrap();
+            // The first handle is held, deliberately: the limit is a count of
+            // live streams, and dropping it would retire the stream and free
+            // the slot the second ask is meant to find taken.
+            let first = client.send_request(&request, true).expect("a stream");
+            let second = client.send_request(&request, true).err();
+            (u32::from(first.id()), second)
         },
-        None,
-        |run| run(),
     );
 
-    assert_eq!(ids.0.map(u32::from), Some(1), "the one it allowed");
-    assert_eq!(ids.1, None, "and no more, without asking");
+    assert_eq!(outcome.0, 1, "the one it allowed");
+    assert_eq!(
+        outcome.1,
+        Some(Unavailable::AtLimit),
+        "and no more, without asking"
+    );
 }
 
-/// The frames the client wrote, parsed back.
+/// The response head and its body reach the handle, in that order, and the
+/// body ends where END_STREAM said it did.
+#[test]
+fn a_response_and_its_body_reach_the_stream() {
+    let mut response = frame(HEADERS, FLAG_END_HEADERS, 1, STATUS_200);
+    response.extend_from_slice(&frame(DATA, 0, 1, b"hello "));
+    response.extend_from_slice(&frame(DATA, FLAG_END_STREAM, 1, b"world"));
+
+    let (seen, _) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(response).after(Duration::from_millis(10)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let request = http::Request::get("http://example.test/").body(()).unwrap();
+            let stream = client.send_request(&request, true).expect("a stream");
+
+            let head = stream.response().await.expect("a response");
+            let mut body = Vec::new();
+            while let Some(chunk) = stream.read().await.expect("a body") {
+                body.extend_from_slice(&chunk);
+            }
+            (head.status().as_u16(), body)
+        },
+    );
+
+    assert_eq!(seen.0, 200);
+    assert_eq!(seen.1, b"hello world");
+}
+
+/// §8.1: a body is written as DATA frames on the stream its head opened, and
+/// the last of them carries END_STREAM.
+#[test]
+fn a_request_body_goes_out_as_data_frames() {
+    let response = frame(HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, STATUS_200);
+
+    let (status, written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(response).after(Duration::from_millis(50)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let request = http::Request::post("http://example.test/upload")
+                .body(())
+                .unwrap();
+            let stream = client.send_request(&request, false).expect("a stream");
+            stream.write(b"one", false).await.expect("written");
+            stream.write(b"two", true).await.expect("written");
+            let head = stream.response().await.expect("a response");
+            head.status().as_u16()
+        },
+    );
+
+    assert_eq!(status, 200);
+
+    let sent = frames(&written);
+    let head = sent.iter().find(|f| f.kind == HEADERS).expect("a head");
+    assert_eq!(
+        head.flags & FLAG_END_STREAM,
+        0,
+        "a request with a body does not end at its head"
+    );
+
+    let body: Vec<&Frame> = sent.iter().filter(|f| f.kind == DATA).collect();
+    assert_eq!(body.len(), 2, "one frame per write");
+    assert_eq!(body[0].payload, b"one");
+    assert_eq!(body[0].flags & FLAG_END_STREAM, 0);
+    assert_eq!(body[1].payload, b"two");
+    assert_eq!(
+        body[1].flags & FLAG_END_STREAM,
+        FLAG_END_STREAM,
+        "the last write ends the request"
+    );
+}
+
+/// §6.9.1: reading the body is what hands the peer its credit back. Until the
+/// application takes a chunk, the bytes are still spending the window they
+/// arrived on — which is what bounds the buffer.
+///
+/// A body still arriving, deliberately: a stream that has *ended* is retired
+/// the moment its END_STREAM lands, and its credit goes back to the
+/// connection whole rather than to a window nobody will spend again. What is
+/// checked here is the download that is still going, which is the case where
+/// the credit has to flow or the peer stops at 64 KiB.
+#[test]
+fn reading_the_body_credits_the_peer() {
+    // Four frames that pass the stream's release threshold (half of 65535)
+    // only together, so the WINDOW_UPDATE is the last read's: one frame for
+    // the lot, which is the accumulation working. Each is within the 16384
+    // this client allows a frame to be, since a peer that sent more would be
+    // answered with a connection error instead.
+    let chunk = vec![b'x'; 10_000];
+    let mut response = frame(HEADERS, FLAG_END_HEADERS, 1, STATUS_200);
+    for _ in 0..4 {
+        response.extend_from_slice(&frame(DATA, 0, 1, &chunk));
+    }
+
+    let mut inbound = vec![ReadEvent::Data(server_opening()).after(Duration::from_millis(1))];
+    inbound.extend(split(response, Duration::from_millis(10)));
+    inbound.push(ReadEvent::Eof.after(Duration::from_millis(200)));
+
+    let (read, written) = with_client(inbound, |client| async move {
+        let request = http::Request::get("http://example.test/big")
+            .body(())
+            .unwrap();
+        let stream = client.send_request(&request, true).expect("a stream");
+        let _ = stream.response().await.expect("a response");
+
+        let mut total = 0;
+        for _ in 0..4 {
+            total += stream
+                .read()
+                .await
+                .expect("a body")
+                .expect("more body")
+                .len();
+        }
+        settle().await;
+        total
+    });
+
+    assert_eq!(read, 40_000);
+
+    let updates: Vec<Frame> = frames(&written)
+        .into_iter()
+        .filter(|f| f.kind == WINDOW_UPDATE && f.stream_id == 1)
+        .collect();
+    assert_eq!(updates.len(), 1, "one frame for four chunks, not one each");
+    assert_eq!(
+        u32::from_be_bytes(updates[0].payload[..4].try_into().unwrap()),
+        40_000,
+        "everything read so far"
+    );
+}
+
+/// §8.1: a trailer section after the body, and the body ends with it.
+///
+/// The head arrives on its own, and the application takes it, before the rest
+/// of the message does — which is the case that tells a trailer section from a
+/// second response head. A stream that answered "have I a response?" by
+/// looking at the slot the application took the head *from* would deliver
+/// these trailers as a response instead.
+#[test]
+fn trailers_end_the_response() {
+    let head = frame(HEADERS, FLAG_END_HEADERS, 1, STATUS_200);
+    let mut rest = frame(DATA, 0, 1, b"body");
+    rest.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &literal("x-checksum", "42"),
+    ));
+
+    let (seen, _) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(head).after(Duration::from_millis(10)),
+            ReadEvent::Data(rest).after(Duration::from_millis(30)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let request = http::Request::get("http://example.test/").body(()).unwrap();
+            let stream = client.send_request(&request, true).expect("a stream");
+            let _ = stream.response().await.expect("a response");
+
+            let mut body = Vec::new();
+            while let Some(chunk) = stream.read().await.expect("a body") {
+                body.extend_from_slice(&chunk);
+            }
+            let trailers = stream.trailers().and_then(|fields| {
+                fields
+                    .get("x-checksum")
+                    .map(|v| v.to_str().unwrap().to_owned())
+            });
+            (body, trailers)
+        },
+    );
+
+    assert_eq!(seen.0, b"body");
+    assert_eq!(seen.1.as_deref(), Some("42"), "§8.1: the trailer section");
+}
+
+/// §6.4: the peer gives up on the stream, and whoever was waiting on it is
+/// told rather than left waiting for a response that is not coming.
+#[test]
+fn a_reset_stream_fails_what_was_waiting_on_it() {
+    let reset = frame(RST_STREAM, 0, 1, &0x8u32.to_be_bytes());
+
+    let (message, _) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(reset).after(Duration::from_millis(10)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let request = http::Request::get("http://example.test/").body(()).unwrap();
+            let stream = client.send_request(&request, true).expect("a stream");
+            stream.response().await.expect_err("reset").to_string()
+        },
+    );
+
+    assert!(
+        message.contains("reset by peer"),
+        "the reason reaches the caller: {message}"
+    );
+}
+
+/// Dropping a handle for a stream the peer has not finished is a cancel
+/// (§8.1): the peer is told to stop, which it cannot infer from a client that
+/// simply stops reading.
+#[test]
+fn dropping_an_unfinished_stream_resets_it() {
+    let response = frame(HEADERS, FLAG_END_HEADERS, 1, STATUS_200);
+
+    let (_, written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(response).after(Duration::from_millis(10)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let request = http::Request::get("http://example.test/").body(()).unwrap();
+            let stream = client.send_request(&request, true).expect("a stream");
+            // The head arrived but the body never ends: the stream is still
+            // open when the handle goes.
+            let _ = stream.response().await.expect("a response");
+            drop(stream);
+            settle().await;
+        },
+    );
+
+    let reset = frames(&written)
+        .into_iter()
+        .find(|f| f.kind == RST_STREAM)
+        .expect("a RST_STREAM went out");
+    assert_eq!(reset.stream_id, 1);
+    assert_eq!(
+        u32::from_be_bytes(reset.payload[..4].try_into().unwrap()),
+        crate::shared::codec::types::CANCEL
+    );
+}
+
+/// A stream that finished both halves is not reset when its handle goes:
+/// there is nothing left to cancel, and a RST_STREAM on a closed stream is
+/// noise the peer has to account for.
+#[test]
+fn a_finished_stream_is_not_reset() {
+    let response = frame(HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, STATUS_200);
+
+    let (_, written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(response).after(Duration::from_millis(10)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let request = http::Request::get("http://example.test/").body(()).unwrap();
+            let stream = client.send_request(&request, true).expect("a stream");
+            let _ = stream.response().await.expect("a response");
+            assert_eq!(stream.read().await.expect("the end"), None);
+            drop(stream);
+            settle().await;
+        },
+    );
+
+    assert!(
+        !frames(&written).iter().any(|f| f.kind == RST_STREAM),
+        "nothing to reset"
+    );
+}
+
+/// §6.8: a GOAWAY says what the peer never processed, and those requests are
+/// safe to retry elsewhere — which is worth saying at once rather than when
+/// the socket eventually closes.
+#[test]
+fn a_goaway_fails_the_streams_it_says_were_not_processed() {
+    // Streams 1 and 3 go out; the peer says it processed up to 1.
+    let mut goaway_payload = 1u32.to_be_bytes().to_vec();
+    goaway_payload.extend_from_slice(&0u32.to_be_bytes());
+    let goaway = frame(GOAWAY, 0, 0, &goaway_payload);
+
+    let (outcome, _) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(goaway).after(Duration::from_millis(10)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let request = http::Request::get("http://example.test/").body(()).unwrap();
+            let first = client.send_request(&request, true).expect("a stream");
+            let second = client.send_request(&request, true).expect("a stream");
+
+            let abandoned = second.response().await.expect_err("never processed");
+            // And nothing new may be opened on a connection that is leaving.
+            let refused = client.send_request(&request, true).err();
+            (first.id(), abandoned.to_string(), refused)
+        },
+    );
+
+    assert_eq!(u32::from(outcome.0), 1);
+    assert!(
+        outcome.1.contains("without processing"),
+        "the reason reaches the caller: {}",
+        outcome.1
+    );
+    assert_eq!(outcome.2, Some(Unavailable::Closed));
+}
+
+/// The connection going is not silence: a stream still waiting is failed with
+/// a reason, rather than parked on frames that will never arrive.
+#[test]
+fn a_closed_connection_fails_the_streams_it_was_carrying() {
+    let (message, _) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Eof.after(Duration::from_millis(10)),
+        ],
+        |client| async move {
+            let request = http::Request::get("http://example.test/").body(()).unwrap();
+            let stream = client.send_request(&request, true).expect("a stream");
+            stream
+                .response()
+                .await
+                .expect_err("the peer went")
+                .to_string()
+        },
+    );
+
+    assert!(
+        message.contains("closed"),
+        "the reason reaches the caller: {message}"
+    );
+}
+
+#[derive(Clone, Debug)]
+struct Frame {
+    kind: u8,
+    flags: u8,
+    stream_id: u32,
+    payload: Vec<u8>,
+}
+
+/// Every frame the peer would have received, in order.
 ///
 /// The preface is skipped first: it is 24 bytes of magic string and not a
 /// frame, so a walker that starts at zero reads its bytes as a frame header
 /// and every offset after it is wrong.
-fn find_frame(bytes: &[u8], kind: u8) -> Option<Frame> {
+fn frames(bytes: &[u8]) -> Vec<Frame> {
     let mut at = if bytes.starts_with(CLIENT_PREFACE) {
         CLIENT_PREFACE.len()
     } else {
         0
     };
+    let mut out = Vec::new();
     while at + 9 <= bytes.len() {
         let len = u32::from_be_bytes([0, bytes[at], bytes[at + 1], bytes[at + 2]]) as usize;
         let end = at + 9 + len;
         if end > bytes.len() {
-            return None;
+            break;
         }
-        if bytes[at + 3] == kind {
-            return Some(Frame {
-                flags: bytes[at + 4],
-                stream_id: u32::from_be_bytes([
-                    bytes[at + 5] & 0x7f,
-                    bytes[at + 6],
-                    bytes[at + 7],
-                    bytes[at + 8],
-                ]),
-                payload: bytes[at + 9..end].to_vec(),
-            });
-        }
+        out.push(Frame {
+            kind: bytes[at + 3],
+            flags: bytes[at + 4],
+            stream_id: u32::from_be_bytes([
+                bytes[at + 5] & 0x7f,
+                bytes[at + 6],
+                bytes[at + 7],
+                bytes[at + 8],
+            ]),
+            payload: bytes[at + 9..end].to_vec(),
+        });
         at = end;
     }
-    None
-}
-
-struct Frame {
-    flags: u8,
-    stream_id: u32,
-    payload: Vec<u8>,
+    out
 }
 
 /// The fields of an encoded block, by name.

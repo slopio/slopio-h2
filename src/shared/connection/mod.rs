@@ -11,8 +11,11 @@
 
 pub mod output;
 pub mod settings;
+mod shared_connection;
 pub mod stream_map;
 pub mod stream_window;
+
+pub use shared_connection::{CONNECTION_INITIAL_WINDOW_SIZE, SendSide, SharedConnection};
 
 /// A stream identifier with its reserved bit already masked off.
 ///

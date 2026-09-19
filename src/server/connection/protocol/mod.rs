@@ -4,10 +4,9 @@ use http::{HeaderMap, StatusCode};
 
 use crate::server::connection::{
     CONNECTION_INITIAL_WINDOW_SIZE, CONNECTION_RECV_WINDOW, MAX_CONCURRENT_STREAMS,
-    shared_with_streams::{LiveStreams, SharedConnection, StreamToken, retire_if_closed},
+    shared_with_streams::{LiveStreams, StreamToken, retire_if_closed},
 };
 use crate::server::stream::Stream;
-use crate::shared::connection::{STREAM_ID, settings::Settings};
 use crate::shared::codec::{
     frames::{
         DECODE_MAX_HEADER_LIST_SIZE, FrameHandler, FrameKind, SettingsIter,
@@ -23,6 +22,7 @@ use crate::shared::codec::{
         STREAM_CLOSED, Setting, StreamViolation,
     },
 };
+use crate::shared::connection::{STREAM_ID, SharedConnection, settings::Settings};
 
 /// Stream errors — ours to report or the peer's to send — a connection may
 /// accumulate before it is closed as abusive. One counter for both: a
@@ -279,7 +279,7 @@ impl Streams {
         let (stream, handle) = self.streams.remove(id)?;
         handle.kill();
         // Body bytes the task never consumed still hold connection credit.
-        release_connection_credit(shared, stream.take_unreleased());
+        shared.release_stream_credit(stream.take_unreleased());
         Some(stream)
     }
 
@@ -340,6 +340,7 @@ impl Protocol {
         let shared = SharedConnection::new(
             peer_settings.header_table_size,
             peer_settings.max_frame_size,
+            CONNECTION_RECV_WINDOW,
         );
         Self {
             peer_settings,
@@ -515,16 +516,6 @@ impl Protocol {
     }
 }
 
-/// Hands the peer back connection-level credit for bytes that reached no
-/// handler — padding, and whatever a departing stream still held — writing
-/// the WINDOW_UPDATE on stream 0 when enough has piled up. The frame goes
-/// out beside the ledger entry, never after it.
-fn release_connection_credit(shared: &SharedConnection, len: u32) {
-    if let Some(increment) = shared.window.release(len) {
-        shared.write_frame(|out| encode_window_update(out, StreamId::ZERO, increment));
-    }
-}
-
 /// §8.1.2.1/.3/.6: `:method` and `:scheme` are required, `:path` non-empty,
 /// and no `:status` (a response pseudo-header).
 fn is_malformed_request(headers: &Headers) -> bool {
@@ -563,7 +554,9 @@ fn requested_size(path: Option<&str>) -> Option<usize> {
 
 /// The placeholder handler: `200` and a fixed body, whatever the request.
 async fn handle_stream(token: StreamToken) {
-    let (shared, stream, id) = (token.shared(), token.stream(), token.id());
+    // The stream by reference, not by `Rc`: the writers below are generic
+    // over what they send from, and a smart pointer is not that thing.
+    let (shared, stream, id) = (token.shared(), &**token.stream(), token.id());
 
     // The two body contracts, picked by the request's `content-length`.
     let received = match stream.body_is_oneshot() {
@@ -584,7 +577,7 @@ async fn handle_stream(token: StreamToken) {
         }
     };
 
-    shared.write_headers(id, StatusCode::OK, &HeaderMap::new(), false);
+    shared.write_response(id, StatusCode::OK, &HeaderMap::new(), false);
     match requested_size(stream.path()) {
         Some(n) => shared.write_data(id, stream, &FILLER[..n], true).await,
         None => {
@@ -625,13 +618,10 @@ impl FrameHandler for Protocol {
         // all of it is. Either way it goes back now — release only what a
         // handler consumes and the window shrinks by the padding for good,
         // until the connection stalls with nothing to show for it.
-        release_connection_credit(
-            &self.shared,
-            match received {
-                Ok(()) => padded_len - payload.len() as u32,
-                Err(_) => padded_len,
-            },
-        );
+        self.shared.release_stream_credit(match received {
+            Ok(()) => padded_len - payload.len() as u32,
+            Err(_) => padded_len,
+        });
 
         // The peer's half closing is the other half of what retires a
         // stream; the task's token is the first, and either may be last.
