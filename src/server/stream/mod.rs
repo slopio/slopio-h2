@@ -5,15 +5,14 @@ use std::time::{Duration, SystemTime};
 use http::header;
 
 use crate::{
-    server::{
-        connection::settings::Settings,
-        stream::{input_data::InputData, stream_window::StreamWindow},
+    server::stream::input_data::InputData,
+    shared::{
+        codec::{frames::headers::Headers, types::StreamViolation},
+        connection::{settings::Settings, stream_window::StreamWindow},
     },
-    shared::codec::{frames::headers::Headers, types::StreamViolation},
 };
 
 mod input_data;
-mod stream_window;
 
 /// How long a body is given before its rate is judged at all.
 ///

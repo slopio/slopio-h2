@@ -1,6 +1,6 @@
 use std::cell::Cell;
 
-use crate::server::connection::settings::Settings;
+use crate::shared::connection::settings::Settings;
 
 pub const LOCAL_INITIAL_WINDOW_SIZE: u32 = 65_535;
 

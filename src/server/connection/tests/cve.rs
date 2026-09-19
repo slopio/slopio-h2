@@ -775,7 +775,7 @@ fn a_request_body_that_never_arrives_is_reclaimed() {
 /// §4.2 says an encoder may use less than it is offered, so this one does.
 #[test]
 fn a_peer_cannot_name_an_unbounded_hpack_table() {
-    use crate::server::connection::settings::{MAX_ENCODER_TABLE_SIZE, Settings};
+    use crate::shared::connection::settings::{MAX_ENCODER_TABLE_SIZE, Settings};
     use crate::shared::codec::types::Setting;
 
     let mut settings = Settings::default();

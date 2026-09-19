@@ -9,11 +9,8 @@ use crate::shared::{
 use runtime::runtime::time::timeout;
 use runtime_streams::StreamExt;
 
-mod output;
 mod protocol;
-pub(crate) mod settings;
 mod shared_with_streams;
-mod stream_map;
 #[cfg(test)]
 mod tests;
 

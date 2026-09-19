@@ -34,7 +34,7 @@ use std::rc::Rc;
 
 use rustc_hash::FxHashMap;
 
-use crate::server::STREAM_ID;
+use crate::shared::connection::STREAM_ID;
 
 /// Generic over what it stores so its safety contract can be tested against
 /// a value whose destructor re-enters, which is the case that matters and

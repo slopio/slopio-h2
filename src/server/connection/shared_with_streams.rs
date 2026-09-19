@@ -4,9 +4,9 @@ use std::task::{Poll, Waker};
 
 use http::{HeaderMap, StatusCode};
 
-use crate::server::STREAM_ID;
-use crate::server::connection::output::Output;
-use crate::server::connection::stream_map::StreamMap;
+use crate::shared::connection::STREAM_ID;
+use crate::shared::connection::output::Output;
+use crate::shared::connection::stream_map::StreamMap;
 use crate::server::connection::{CONNECTION_INITIAL_WINDOW_SIZE, CONNECTION_RECV_WINDOW};
 use crate::server::stream::Stream;
 use crate::shared::{

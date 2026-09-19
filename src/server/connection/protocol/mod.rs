@@ -4,10 +4,10 @@ use http::{HeaderMap, StatusCode};
 
 use crate::server::connection::{
     CONNECTION_INITIAL_WINDOW_SIZE, CONNECTION_RECV_WINDOW, MAX_CONCURRENT_STREAMS,
-    settings::Settings,
     shared_with_streams::{LiveStreams, SharedConnection, StreamToken, retire_if_closed},
 };
-use crate::server::{STREAM_ID, stream::Stream};
+use crate::server::stream::Stream;
+use crate::shared::connection::{STREAM_ID, settings::Settings};
 use crate::shared::codec::{
     frames::{
         DECODE_MAX_HEADER_LIST_SIZE, FrameHandler, FrameKind, SettingsIter,
