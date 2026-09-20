@@ -8,6 +8,44 @@ use crate::shared::transport::{PlainMessages, Transport};
 mod connection;
 mod stream;
 
+pub use stream::Stream;
+
+/// What answers a request.
+///
+/// One handler serves the whole server, cloned per connection and again per
+/// stream, which is why `Clone` is in the bound: a handler is a *factory* for
+/// the work of one exchange, not the work itself. For most of them the clone
+/// is a no-op — a function pointer, or a closure over an `Rc`.
+///
+/// Taken by value rather than by reference because the future it returns is
+/// spawned, and a future borrowing the handler could not outlive the call that
+/// made it. The blanket impl below means a closure is a handler, so this trait
+/// is rarely named:
+///
+/// ```ignore
+/// Server::new(settings).run::<Ring, _>(|stream: Stream| async move {
+///     stream.respond(StatusCode::OK, &HeaderMap::new(), false);
+///     stream.write(b"hello\n", true).await;
+/// }).await
+/// ```
+///
+/// Returning without answering is not a protocol error the peer can see
+/// coming, so the stream writes a `500` on the way out rather than leaving it
+/// waiting.
+pub trait Handler: Clone + 'static {
+    fn handle(self, stream: Stream) -> impl Future<Output = ()> + 'static;
+}
+
+impl<F, Fut> Handler for F
+where
+    F: FnOnce(Stream) -> Fut + Clone + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    fn handle(self, stream: Stream) -> impl Future<Output = ()> + 'static {
+        self(stream)
+    }
+}
+
 pub struct Header {}
 
 pub struct Server {
@@ -42,11 +80,16 @@ impl Server {
 
     /// `U` is the buffer ring accepted sockets receive into: one per worker
     /// thread, shared by every connection on it.
-    pub async fn run<U: BufRingSpec + 'static>(self) -> std::io::Result<()> {
+    pub async fn run<U: BufRingSpec + 'static, H: Handler>(
+        self,
+        handler: H,
+    ) -> std::io::Result<()> {
         let mut acceptor = MultiAccept::new(self.settings.bind_port)?;
         match self.settings.transport {
-            ServerTransport::Plain => serve_plain::<U, false>(&mut acceptor).await,
-            ServerTransport::PlainZeroCopy => serve_plain::<U, true>(&mut acceptor).await,
+            ServerTransport::Plain => serve_plain::<U, false, H>(&mut acceptor, handler).await,
+            ServerTransport::PlainZeroCopy => {
+                serve_plain::<U, true, H>(&mut acceptor, handler).await
+            }
         }
         Ok(())
     }
@@ -55,11 +98,16 @@ impl Server {
 /// Accept loop. `ZC` picks the send op and is baked into the spawned
 /// connection's type, so the two variants share this source and nothing
 /// else.
-async fn serve_plain<U: BufRingSpec + 'static, const ZC: bool>(acceptor: &mut MultiAccept)
-where
+async fn serve_plain<U: BufRingSpec + 'static, const ZC: bool, H: Handler>(
+    acceptor: &mut MultiAccept,
+    handler: H,
+) where
     PlainMessages<U, ZC>: Transport,
 {
     while let Some(socket) = acceptor.next().await {
-        spawn(Connection::new(PlainMessages::<U, ZC>::new(socket)).run());
+        // One clone per connection, and the connection clones again per
+        // stream: the handler is shared by every exchange the server ever
+        // serves.
+        spawn(Connection::new(PlainMessages::<U, ZC>::new(socket), handler.clone()).run());
     }
 }

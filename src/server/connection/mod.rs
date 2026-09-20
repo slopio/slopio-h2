@@ -1,6 +1,7 @@
 use std::io;
 use std::time::Duration;
 
+use crate::server::Handler;
 use crate::server::connection::protocol::Protocol;
 use crate::shared::{
     codec::frames::FrameDecoder,
@@ -10,7 +11,7 @@ use runtime::runtime::time::timeout;
 use runtime_streams::StreamExt;
 
 mod protocol;
-mod shared_with_streams;
+pub(crate) mod shared_with_streams;
 #[cfg(test)]
 mod tests;
 
@@ -176,10 +177,10 @@ pub const MAX_DRY_READS: u32 = 16;
 /// here, because the decoder borrows it as its `FrameHandler` while being
 /// borrowed itself — two `&mut` at once, which is only sound across disjoint
 /// fields.
-pub struct Connection<T: Transport> {
+pub struct Connection<T: Transport, H: Handler> {
     transport: T,
     decoder: FrameDecoder,
-    protocol: Protocol,
+    protocol: Protocol<H>,
     /// When the peer last entered a half-sent state, cleared when it leaves
     /// one. `None` is a connection that owes us nothing in particular.
     ///
@@ -193,12 +194,12 @@ pub struct Connection<T: Transport> {
     last_swept: std::time::SystemTime,
 }
 
-impl<T: Transport> Connection<T> {
-    pub fn new(transport: T) -> Self {
+impl<T: Transport, H: Handler> Connection<T, H> {
+    pub fn new(transport: T, handler: H) -> Self {
         Self {
             transport,
             decoder: FrameDecoder::new(),
-            protocol: Protocol::new(),
+            protocol: Protocol::new(handler),
             partial_since: None,
             last_swept: runtime::runtime::now(),
         }

@@ -14,7 +14,8 @@
 //!
 //! `PORT` defaults to 8080, `RING` to the `64x512` the plain example ships.
 
-use popple_h2::server::{Server, ServerSettings, ServerTransport};
+use http::{HeaderMap, StatusCode};
+use popple_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 use runtime::net::BufRingSpec;
 use runtime::{main_thread_with, thread_per_core_with};
 
@@ -24,7 +25,12 @@ use runtime::{main_thread_with, thread_per_core_with};
 runtime::define_buf_ring!(Ring64x512, bgid = 1, buffer_size = 65536, ring_size = 512);
 runtime::define_buf_ring!(Ring64x4096, bgid = 1, buffer_size = 65536, ring_size = 4096);
 runtime::define_buf_ring!(Ring16x4096, bgid = 1, buffer_size = 16384, ring_size = 4096);
-runtime::define_buf_ring!(Ring16x16384, bgid = 1, buffer_size = 16384, ring_size = 16384);
+runtime::define_buf_ring!(
+    Ring16x16384,
+    bgid = 1,
+    buffer_size = 16384,
+    ring_size = 16384
+);
 
 fn main() {
     let port = env_u16("PORT", 8080);
@@ -55,7 +61,7 @@ async fn serve<U: BufRingSpec + 'static>(port: u16) {
         bind_port: port,
         transport: ServerTransport::Plain,
     };
-    if let Err(e) = Server::new(settings).run::<U>().await {
+    if let Err(e) = Server::new(settings).run::<U, _>(bench_route).await {
         eprintln!("server error: {e}");
     }
 }
@@ -65,4 +71,59 @@ fn env_u16(name: &str, default: u16) -> u16 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Bytes a sized request is answered from.
+///
+/// Sliced, never allocated: a benchmark that asks for a 10 KiB body and gets a
+/// `vec![]` per request is measuring the allocator. 64 KiB because that is the
+/// default stream window — past it a response needs a WINDOW_UPDATE to finish,
+/// which is a different thing to measure and wants asking for on purpose.
+static FILLER: [u8; 64 * 1024] = [b'x'; 64 * 1024];
+
+/// How many bytes `/<n>` asks for, if it asks for a number.
+///
+/// The size comes from the request rather than from the process, so one server
+/// serves every payload a benchmark wants without being restarted, and the two
+/// sides of a comparison are told what to send by the same URL. Anything else —
+/// `/`, a real path — gets the echo below.
+fn requested_size(path: Option<&str>) -> Option<usize> {
+    let n: usize = path?.strip_prefix('/')?.parse().ok()?;
+    (n > 0).then(|| n.min(FILLER.len()))
+}
+
+/// `200` and a body whose size the URL chose, after reading whatever the
+/// request sent.
+///
+/// This lived in the library until the server took a handler, which is where
+/// it belonged all along: the routes exist for `bench/run.sh` and for nothing
+/// else. Note what the echo costs — a `format!` per request — and that the
+/// sized route deliberately does not.
+async fn bench_route(stream: Stream) {
+    // The two body contracts, picked by the request's `content-length`.
+    let received = if stream.body_is_oneshot() {
+        // Small enough to hold: wait for all of it, take it in one piece. No
+        // credit goes back while it fills — that is what this form buys.
+        stream.body().await.map_or(0, |body| body.len())
+    } else {
+        // Too large, or of unknown length: drained as it arrives. Taking
+        // bytes is what hands the peer its credit back, so a handler that
+        // stops taking is a handler that stops the upload.
+        let mut total = 0;
+        while stream.readable().await {
+            let taken = stream.peek(|bytes| bytes.len());
+            stream.consume(taken);
+            total += taken;
+        }
+        total
+    };
+
+    stream.respond(StatusCode::OK, &HeaderMap::new(), false);
+    match requested_size(stream.path()) {
+        Some(n) => stream.write(&FILLER[..n], true).await,
+        None => {
+            let body = format!("read {received} bytes\n");
+            stream.write(body.as_bytes(), true).await;
+        }
+    }
 }

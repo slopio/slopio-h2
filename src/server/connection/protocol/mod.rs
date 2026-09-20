@@ -1,12 +1,11 @@
 use std::rc::Rc;
 
-use http::{HeaderMap, StatusCode};
-
 use crate::server::connection::{
     CONNECTION_INITIAL_WINDOW_SIZE, CONNECTION_RECV_WINDOW, MAX_CONCURRENT_STREAMS,
     shared_with_streams::{LiveStreams, StreamToken, retire_if_closed},
 };
-use crate::server::stream::Stream;
+use crate::server::stream::StreamState;
+use crate::server::{Handler, Stream};
 use crate::shared::codec::{
     frames::{
         DECODE_MAX_HEADER_LIST_SIZE, FrameHandler, FrameKind, SettingsIter,
@@ -18,8 +17,8 @@ use crate::shared::codec::{
         stream_id::StreamId,
     },
     types::{
-        DecodeError, ENHANCE_YOUR_CALM, FLOW_CONTROL_ERROR, NO_ERROR, PROTOCOL_ERROR, REFUSED_STREAM,
-        STREAM_CLOSED, Setting, StreamViolation,
+        DecodeError, ENHANCE_YOUR_CALM, FLOW_CONTROL_ERROR, NO_ERROR, PROTOCOL_ERROR,
+        REFUSED_STREAM, STREAM_CLOSED, Setting, StreamViolation,
     },
 };
 use crate::shared::connection::{STREAM_ID, SharedConnection, settings::Settings};
@@ -113,10 +112,10 @@ impl FrameWorth {
 use runtime::spawn;
 
 /// The connection's side of the protocol: what every frame does to it.
-pub struct Protocol {
+pub struct Protocol<H: Handler> {
     peer_settings: Settings,
     shared: Rc<SharedConnection>,
-    streams: Streams,
+    streams: Streams<H>,
     /// Armed by `on_preface`, consumed by the next `on_frame`: §3.4 makes
     /// the client's SETTINGS the first frame after its preface.
     expect_settings: bool,
@@ -138,7 +137,9 @@ pub struct Protocol {
     odd_frames: u32,
 }
 
-struct Streams {
+struct Streams<H: Handler> {
+    /// Cloned once per stream, at the spawn below.
+    handler: H,
     last_client_stream_id: STREAM_ID,
     goaway_stream_id: Option<STREAM_ID>,
     /// Shared with every stream task, so one can take itself out when it
@@ -155,7 +156,7 @@ enum Rejected {
     Fatal(u32, &'static str),
 }
 
-impl Streams {
+impl<H: Handler> Streams<H> {
     fn create(
         &mut self,
         settings: &Settings,
@@ -190,14 +191,21 @@ impl Streams {
             return Err(Rejected::Refused(REFUSED_STREAM));
         }
 
-        let stream = Rc::new(Stream::create(settings, headers).map_err(Rejected::Violation)?);
+        let stream = Rc::new(StreamState::create(settings, headers).map_err(Rejected::Violation)?);
         let token = StreamToken::new(
             id,
             Rc::clone(&stream),
             Rc::clone(shared),
             Rc::downgrade(&self.streams),
         );
-        let handle = spawn(handle_stream(token));
+        // The handler is invoked by the task's first poll, not here. Called
+        // on this line instead, it would run — and could drop its stream —
+        // before the `insert` below, so a stream could end while the map had
+        // never heard of it. Deferring makes "in the map before the handler
+        // can touch it" an ordering the code enforces rather than one the
+        // handler has to respect.
+        let handler = self.handler.clone();
+        let handle = spawn(async move { handler.handle(Stream::new(token)).await });
         self.streams.insert(raw, stream, handle);
         Ok(())
     }
@@ -275,7 +283,7 @@ impl Streams {
     ///
     /// `None` when the id was never opened, which `reset_stream` still has
     /// to answer: REFUSED_STREAM is sent for streams that never existed.
-    fn remove(&mut self, id: STREAM_ID, shared: &SharedConnection) -> Option<Rc<Stream>> {
+    fn remove(&mut self, id: STREAM_ID, shared: &SharedConnection) -> Option<Rc<StreamState>> {
         let (stream, handle) = self.streams.remove(id)?;
         handle.kill();
         // Body bytes the task never consumed still hold connection credit.
@@ -311,7 +319,7 @@ impl Streams {
     }
 }
 
-impl Drop for Streams {
+impl<H: Handler> Drop for Streams<H> {
     /// A handle merely *dropped* is a task detached, not stopped: it keeps
     /// its `Rc<SharedConnection>` alive, writes into an output no one will
     /// ever flush again, parks on the high-water mark, and is never woken —
@@ -332,8 +340,8 @@ impl Drop for Streams {
     }
 }
 
-impl Protocol {
-    pub(super) fn new() -> Self {
+impl<H: Handler> Protocol<H> {
+    pub(super) fn new(handler: H) -> Self {
         // §6.5.2 defaults, until the peer's SETTINGS says otherwise — and
         // the encoder and frame size we start from are those same defaults.
         let peer_settings = Settings::default();
@@ -346,6 +354,7 @@ impl Protocol {
             peer_settings,
             shared: Rc::new(shared),
             streams: Streams {
+                handler,
                 last_client_stream_id: 0,
                 goaway_stream_id: None,
                 streams: Rc::new(LiveStreams::new()),
@@ -495,7 +504,7 @@ impl Protocol {
 
     /// HEADERS on a live stream: its trailers (§8.1). The stream checks them
     /// and closes its input; a bad set is a stream error, like a bad DATA.
-    fn on_trailers(&mut self, stream: Rc<Stream>, headers: Box<Headers>) {
+    fn on_trailers(&mut self, stream: Rc<StreamState>, headers: Box<Headers>) {
         let id = headers.stream_id();
         match stream.recv_trailers(headers) {
             // §8.1: trailers carry END_STREAM, so this closes the peer's
@@ -526,70 +535,7 @@ fn is_malformed_request(headers: &Headers) -> bool {
         || !p.path.as_deref().is_some_and(|path| !path.is_empty())
 }
 
-/// Basic behaviour for now: a 200 with no body, whatever the request, and
-/// without waiting for its body. The HEADERS carries END_STREAM, which
-/// closes our half only — the peer may still be sending, and the stream
-/// stays in the map until it is done too.
-///
-/// A panic here would take the whole process down — the runtime does not
-/// catch task panics.
-/// Bytes a sized request is answered from.
-///
-/// Sliced, never allocated: a benchmark that asks for a 10 KiB body and gets a
-/// `vec![]` per request is measuring the allocator. 64 KiB because that is the
-/// default stream window — past it a response needs a WINDOW_UPDATE to finish,
-/// which is a different thing to measure and wants asking for on purpose.
-static FILLER: [u8; 64 * 1024] = [b'x'; 64 * 1024];
-
-/// How many bytes `/<n>` asks for, if it asks for a number.
-///
-/// The size comes from the request rather than from the process, so one server
-/// serves every payload a benchmark wants without being restarted, and the two
-/// sides of a comparison are told what to send by the same URL. Anything else —
-/// `/`, a real path — gets the echo below.
-fn requested_size(path: Option<&str>) -> Option<usize> {
-    let n: usize = path?.strip_prefix('/')?.parse().ok()?;
-    (n > 0).then(|| n.min(FILLER.len()))
-}
-
-/// The placeholder handler: `200` and a fixed body, whatever the request.
-async fn handle_stream(token: StreamToken) {
-    // The stream by reference, not by `Rc`: the writers below are generic
-    // over what they send from, and a smart pointer is not that thing.
-    let (shared, stream, id) = (token.shared(), &**token.stream(), token.id());
-
-    // The two body contracts, picked by the request's `content-length`.
-    let received = match stream.body_is_oneshot() {
-        // Small enough to hold: wait for all of it, take it in one piece.
-        // No credit goes back while it fills — that is what this form buys.
-        true => stream.body().await.map_or(0, |body| body.len()),
-        // Too large, or of unknown length: drained as it arrives. Taking
-        // bytes is what hands the peer its credit back, so a handler that
-        // stops taking is a handler that stops the upload.
-        false => {
-            let mut total = 0;
-            while stream.readable().await {
-                let taken = stream.peek(|bytes| bytes.len());
-                shared.consume(id, stream, taken);
-                total += taken;
-            }
-            total
-        }
-    };
-
-    shared.write_response(id, StatusCode::OK, &HeaderMap::new(), false);
-    match requested_size(stream.path()) {
-        Some(n) => shared.write_data(id, stream, &FILLER[..n], true).await,
-        None => {
-            let body = format!("read {received} bytes\n");
-            shared.write_data(id, stream, body.as_bytes(), true).await
-        }
-    }
-    // No `end_output` here: dropping the token is what ends our half, and
-    // it happens however the task ends, not only when it ends well.
-}
-
-impl FrameHandler for Protocol {
+impl<H: Handler> FrameHandler for Protocol<H> {
     /// `payload` borrows the decoder's buffer: valid only for the duration of
     /// the call. §6.9.1: `padded_len` is what flow control accounts for,
     /// pad-length byte and padding included.

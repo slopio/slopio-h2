@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use http::{HeaderMap, StatusCode};
 
-use crate::server::stream::Stream;
+use crate::server::stream::StreamState;
 use crate::shared::connection::STREAM_ID;
 use crate::shared::connection::SharedConnection;
 use crate::shared::connection::stream_map::StreamMap;
@@ -23,7 +23,7 @@ use std::rc::Weak;
 
 /// The connection's live streams. Each entry owns its stream and the handle
 /// of the task running it.
-pub type LiveStreams = StreamMap<Stream, Handle<()>>;
+pub type LiveStreams = StreamMap<StreamState, Handle<()>>;
 
 /// Takes a stream out once both its halves are done (§5.1), handing back
 /// whatever connection credit it still held.
@@ -54,7 +54,7 @@ pub fn retire_if_closed(map: &LiveStreams, shared: &SharedConnection, id: STREAM
 /// and nothing else does, so it is the task that says so.
 pub struct StreamToken {
     id: StreamId,
-    stream: Rc<Stream>,
+    stream: Rc<StreamState>,
     shared: Rc<SharedConnection>,
     /// `Weak` because the map owns this token, by way of the handle of the
     /// task that holds it: an `Rc` back would be a cycle neither ever leaves.
@@ -64,7 +64,7 @@ pub struct StreamToken {
 impl StreamToken {
     pub fn new(
         id: StreamId,
-        stream: Rc<Stream>,
+        stream: Rc<StreamState>,
         shared: Rc<SharedConnection>,
         map: Weak<LiveStreams>,
     ) -> Self {
@@ -80,7 +80,7 @@ impl StreamToken {
         self.id
     }
 
-    pub fn stream(&self) -> &Rc<Stream> {
+    pub fn stream(&self) -> &Rc<StreamState> {
         &self.stream
     }
 
@@ -101,6 +101,26 @@ impl Drop for StreamToken {
     /// while the connection is suspended at an `await`, holding no reference
     /// into the map; `StreamMap` is where that argument lives in full.
     fn drop(&mut self) {
+        // A handler that returned without answering leaves the peer waiting
+        // for a response that cannot come: nothing else on this connection
+        // will ever speak for that stream. So it gets a `500` on the way out.
+        //
+        // Only for a stream still in the map. One the peer reset, or one the
+        // connection killed, is already gone from it — and a HEADERS frame on
+        // a stream that no longer exists is noise the peer has to account for.
+        let live = self
+            .map
+            .upgrade()
+            .is_some_and(|map| map.get(self.id.into()).is_some());
+        if live && !self.stream.has_responded() {
+            self.shared.write_response(
+                self.id,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &HeaderMap::new(),
+                true,
+            );
+        }
+
         self.stream.end_output();
         if let Some(map) = self.map.upgrade() {
             retire_if_closed(&map, &self.shared, self.id.into());
@@ -151,7 +171,7 @@ impl SharedConnection {
     /// stream half cannot. Nothing goes out until a worthwhile amount has
     /// piled up at either level, so a handler taking a few bytes at a time
     /// does not answer every DATA frame with a WINDOW_UPDATE of its own.
-    pub fn consume(&self, stream_id: StreamId, stream: &Stream, n: usize) {
+    pub fn consume(&self, stream_id: StreamId, stream: &StreamState, n: usize) {
         let taken = stream.consume(n);
         if taken == 0 {
             return;

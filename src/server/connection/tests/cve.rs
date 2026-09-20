@@ -28,9 +28,7 @@ use super::{
     PREFACE, PRIORITY, RST_STREAM, SETTINGS, WINDOW_UPDATE, deliveries, frame, pings,
     run_connection, run_connection_timed,
 };
-use crate::shared::codec::types::{
-    COMPRESSION_ERROR, ENHANCE_YOUR_CALM, NO_ERROR, REFUSED_STREAM,
-};
+use crate::shared::codec::types::{COMPRESSION_ERROR, ENHANCE_YOUR_CALM, NO_ERROR, REFUSED_STREAM};
 
 /// The GOAWAY a connection was closed with, if it was.
 fn goaway(written: &[Frame]) -> Option<(u32, String)> {
@@ -775,8 +773,8 @@ fn a_request_body_that_never_arrives_is_reclaimed() {
 /// §4.2 says an encoder may use less than it is offered, so this one does.
 #[test]
 fn a_peer_cannot_name_an_unbounded_hpack_table() {
-    use crate::shared::connection::settings::{MAX_ENCODER_TABLE_SIZE, Settings};
     use crate::shared::codec::types::Setting;
+    use crate::shared::connection::settings::{MAX_ENCODER_TABLE_SIZE, Settings};
 
     let mut settings = Settings::default();
     // §6.5.2: any u32 is legal to ask for, so this must not be an error.

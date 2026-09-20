@@ -7,13 +7,14 @@
 //!     cargo run --example server
 //!     curl --http2-prior-knowledge http://localhost:8080/ -v
 //!
-//! No handler yet: a connection is accepted, its transport and protocol
+//! The handler is a plain `async fn`: a connection is accepted, its transport and protocol
 //! state are built, and `Connection::run` — the loop — is what remains.
 //!
 //! `PER_CORE=1` runs one worker per core of the affinity mask, worker `n`
 //! pinned to core `n` — so under `taskset -c 0,1`, cores 0 and 1.
 
-use popple_h2::server::{Server, ServerSettings, ServerTransport};
+use http::{HeaderMap, StatusCode};
+use popple_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 use runtime::main_thread_with;
 
 // 64 KiB buffers × 512 slots — the ring every inbound read lands in.
@@ -51,7 +52,14 @@ async fn serve() {
         bind_port: 8080,
         transport: ServerTransport::Plain,
     };
-    if let Err(e) = Server::new(settings).run::<MyBufRing>().await {
+    if let Err(e) = Server::new(settings).run::<MyBufRing, _>(hello).await {
         eprintln!("server error: {e}");
     }
+}
+
+/// One exchange. The handler owns its stream for as long as it runs, and
+/// dropping it is what ends the server's half (§5.1).
+async fn hello(stream: Stream) {
+    stream.respond(StatusCode::OK, &HeaderMap::new(), false);
+    stream.write(b"hello\n", true).await;
 }

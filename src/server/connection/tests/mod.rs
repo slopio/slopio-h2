@@ -48,6 +48,30 @@ runtime_core::define_buf_ring!(TestRing, bgid = 7, buffer_size = 16384, ring_siz
 
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+/// The handler every test in this suite runs against: read the request body,
+/// answer `200` and say how many bytes it was.
+///
+/// It lived in the library until the server took a handler. Keeping it here,
+/// spelled out, is what lets a test assert on the bytes a response carries
+/// without reaching into the connection to find out what it decided to send.
+async fn echo(stream: crate::server::Stream) {
+    let received = if stream.body_is_oneshot() {
+        stream.body().await.map_or(0, |body| body.len())
+    } else {
+        let mut total = 0;
+        while stream.readable().await {
+            let taken = stream.peek(|bytes| bytes.len());
+            stream.consume(taken);
+            total += taken;
+        }
+        total
+    };
+
+    stream.respond(http::StatusCode::OK, &http::HeaderMap::new(), false);
+    let body = format!("read {received} bytes\n");
+    stream.write(body.as_bytes(), true).await;
+}
+
 const DATA: u8 = 0x0;
 const HEADERS: u8 = 0x1;
 const SETTINGS: u8 = 0x4;
@@ -155,6 +179,17 @@ pub(super) fn run_connection_timed(
     inbound: Vec<Scripted>,
     script: impl FnOnce(&FakeRingHandle, i32),
 ) -> Vec<Frame> {
+    run_connection_with(inbound, script, echo)
+}
+
+/// As [`run_connection_timed`], against a handler of the test's choosing —
+/// for the tests that are about what the connection does *around* a handler
+/// rather than about the bytes one produces.
+pub(super) fn run_connection_with<H: crate::server::Handler>(
+    inbound: Vec<Scripted>,
+    script: impl FnOnce(&FakeRingHandle, i32),
+    handler: H,
+) -> Vec<Frame> {
     let (fake, handle) = FakeRing::builder().virtual_time().build();
     let socket = simulated_socket();
     let fd = socket.fd();
@@ -169,7 +204,7 @@ pub(super) fn run_connection_timed(
             // future that yields with an empty task list puts the runtime to
             // sleep with nothing armed to wake it.
             runtime_core::runtime::spawn(
-                Connection::new(PlainMessages::<TestRing, false>::new(socket)).run(),
+                Connection::new(PlainMessages::<TestRing, false>::new(socket), handler).run(),
             )
             .await;
         },
@@ -178,6 +213,36 @@ pub(super) fn run_connection_timed(
     );
 
     frames(&handle.writes(fd).concat())
+}
+
+/// §5.1: a handler that returns without answering would leave the peer waiting
+/// for a response nothing on this connection will ever send. The stream writes
+/// a `500` on its way out rather than hanging it.
+///
+/// A handler that does nothing at all is the extreme case; the one that
+/// matters in practice is the one that returns early on an error path and
+/// forgets to say so.
+#[test]
+fn a_handler_that_answers_nothing_still_ends_the_stream() {
+    let written = run_connection_with(
+        deliveries(&a_get()).into_iter().map(Into::into).collect(),
+        |_, _| {},
+        |_stream: crate::server::Stream| async {},
+    );
+
+    let head = written
+        .iter()
+        .find(|f| f.kind == HEADERS)
+        .expect("a response head went out");
+    assert_eq!(head.stream_id, 1);
+    assert_eq!(
+        decode_block(&head.payload)
+            .get(":status")
+            .map(String::as_str),
+        Some("500")
+    );
+    // §8.1: and it ends the message, so the peer stops waiting.
+    assert_eq!(head.flags & FLAG_END_STREAM, FLAG_END_STREAM);
 }
 
 /// Cuts a byte stream into deliveries the ring's buffers can hold.

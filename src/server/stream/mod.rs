@@ -4,6 +4,10 @@ use std::time::{Duration, SystemTime};
 
 use http::header;
 
+use http::StatusCode;
+
+use crate::server::connection::shared_with_streams::StreamToken;
+use crate::shared::codec::frames::stream_id::StreamId;
 use crate::{
     server::stream::input_data::InputData,
     shared::{
@@ -65,7 +69,7 @@ const MIN_SEND_RATE: u64 = 256;
 /// response. `no_more_input` and `no_more_output` track them one each; both
 /// set is the closed state that lets the connection take the stream out of
 /// its map.
-pub struct Stream {
+pub struct StreamState {
     /// When the peer's HEADERS opened this stream.
     ///
     /// The runtime's clock, not the OS's: the event loop samples
@@ -109,11 +113,16 @@ pub struct Stream {
     /// the task — still holding credit. Whatever is left when the stream
     /// goes must be given back, or the connection window shrinks for good.
     unreleased: Cell<u32>,
+    /// A response head has been written. Not the same as `no_more_output`,
+    /// which the token sets on the way out whether or not anything was said:
+    /// this is what tells a handler that returned in silence from one that
+    /// answered.
+    responded: Cell<bool>,
     window: StreamWindow,
     waker: RefCell<Option<Waker>>,
 }
 
-impl Stream {
+impl StreamState {
     /// `settings` are the peer's: they credit the send window.
     pub fn create(settings: &Settings, header: Box<Headers>) -> Result<Self, StreamViolation> {
         let content_length =
@@ -149,6 +158,7 @@ impl Stream {
             sent: Cell::new(0),
             sending_since: Cell::new(None),
             unreleased: Cell::new(0),
+            responded: Cell::new(false),
             waker: RefCell::new(None),
         })
     }
@@ -213,6 +223,26 @@ impl Stream {
     /// The request's `:path`.
     pub fn path(&self) -> Option<&str> {
         self.header.pseudo().path.as_deref()
+    }
+
+    /// The request's `:method`.
+    pub fn method(&self) -> Option<&http::Method> {
+        self.header.pseudo().method.as_ref()
+    }
+
+    /// Its ordinary fields, pseudo-headers excluded — those are `method`,
+    /// `path` and their neighbours (§8.3).
+    pub fn fields(&self) -> &http::HeaderMap {
+        self.header.fields()
+    }
+
+    /// Whether a response head has gone out for this stream.
+    pub fn has_responded(&self) -> bool {
+        self.responded.get()
+    }
+
+    pub fn note_responded(&self) {
+        self.responded.set(true);
     }
 
     /// Records `n` response body bytes as having gone to the peer, starting
@@ -509,6 +539,123 @@ impl Stream {
     }
 }
 
+/// One request, and the response owed for it: what a handler is handed.
+///
+/// The mirror of the client's [`Stream`](crate::client::Stream), and owned the
+/// same way — it is the handler's for as long as the handler runs, and
+/// dropping it is what ends the server's half of the exchange (§5.1). A
+/// handler that returns without answering gets a `500` written for it, because
+/// the alternative is a peer waiting for a response that will never come.
+///
+/// Not `Clone` and not `Send`: one stream, one task, one thread.
+pub struct Stream {
+    token: StreamToken,
+}
+
+impl Stream {
+    pub(crate) fn new(token: StreamToken) -> Self {
+        Self { token }
+    }
+
+    fn state(&self) -> &StreamState {
+        self.token.stream()
+    }
+
+    /// §5.1.1: the id the peer opened this stream with. Odd, since a client
+    /// opens it.
+    pub fn id(&self) -> StreamId {
+        self.token.id()
+    }
+
+    /// The request's `:method`.
+    pub fn method(&self) -> Option<&http::Method> {
+        self.state().method()
+    }
+
+    /// The request's `:path`.
+    pub fn path(&self) -> Option<&str> {
+        self.state().path()
+    }
+
+    /// The request's ordinary fields.
+    pub fn fields(&self) -> &http::HeaderMap {
+        self.state().fields()
+    }
+
+    /// Which body contract this request falls under, decided by its
+    /// `content-length` when the stream was created: `true` for one delivered
+    /// whole by [`Stream::body`], `false` for one drained through
+    /// [`Stream::readable`], [`Stream::peek`] and [`Stream::consume`].
+    pub fn body_is_oneshot(&self) -> bool {
+        self.state().body_is_oneshot()
+    }
+
+    /// The whole body, once it is whole. `None` when the request carried none,
+    /// or when it is large enough that it has to be drained instead.
+    pub fn body(&self) -> impl Future<Output = Option<Box<[u8]>>> {
+        self.state().body()
+    }
+
+    /// Waits until the body has bytes to take, or has ended. `false` is the
+    /// end.
+    pub fn readable(&self) -> impl Future<Output = bool> {
+        self.state().readable()
+    }
+
+    /// Shows what is buffered without consuming it. The slice borrows the
+    /// stream's buffer, hence the closure: nothing may hold it across the
+    /// `await` that would let the connection push more in.
+    pub fn peek<R>(&self, with: impl FnOnce(&[u8]) -> R) -> R {
+        self.state().peek(with)
+    }
+
+    /// Takes the `n` leading bytes the handler is done with, and hands the
+    /// peer back the credit they were holding (§6.9.1). A handler that stops
+    /// consuming is a handler that stops the upload, which is the point.
+    pub fn consume(&self, n: usize) {
+        self.token.shared().consume(self.id(), self.state(), n);
+    }
+
+    /// §8.1: the trailers, if the request carried any. `None` until the body
+    /// has ended, since that is what a trailer section follows.
+    pub fn trailers(&self) -> Option<http::HeaderMap> {
+        self.state()
+            .take_trailers()
+            .map(|headers| (*headers).into_fields())
+    }
+
+    /// Writes the response head. §8.3 puts `:status` before every ordinary
+    /// field, which is done here rather than asked of the caller.
+    ///
+    /// `end_stream` answers without a body. Otherwise the body follows through
+    /// [`Stream::write`], and calling that first would put DATA on a stream
+    /// the peer has had no head for.
+    pub fn respond(&self, status: StatusCode, fields: &http::HeaderMap, end_stream: bool) {
+        self.token
+            .shared()
+            .write_response(self.id(), status, fields, end_stream);
+        self.state().note_responded();
+        if end_stream {
+            self.state().end_output();
+        }
+    }
+
+    /// Writes the next of the response body, `end_stream` marking it as the
+    /// last.
+    ///
+    /// §6.9.1: cut into DATA frames by what the stream's send window, the
+    /// connection's and the peer's `max_frame_size` allow, and by the room
+    /// left in the output. With none of it this waits, so a body larger than
+    /// the peer will take does not have to be held anywhere but where the
+    /// caller already has it.
+    pub async fn write(&self, data: &[u8], end_stream: bool) {
+        self.token
+            .shared()
+            .write_data(self.id(), self.state(), data, end_stream)
+            .await;
+    }
+}
+
 /// What [`SharedConnection::write_data`] needs of a stream: the send window,
 /// and where to park a writer that has run out of it.
 ///
@@ -517,7 +664,7 @@ impl Stream {
 /// either for body bytes to arrive or for credit to write with, never both.
 ///
 /// [`SharedConnection::write_data`]: crate::shared::connection::SharedConnection::write_data
-impl crate::shared::connection::SendSide for Stream {
+impl crate::shared::connection::SendSide for StreamState {
     fn available_send(&self) -> u32 {
         self.available_send()
     }
