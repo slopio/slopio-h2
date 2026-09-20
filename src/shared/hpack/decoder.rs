@@ -7,6 +7,7 @@ use http::header;
 use http::method::{self, Method};
 use http::status::{self, StatusCode};
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::Cursor;
 use std::str::Utf8Error;
@@ -17,16 +18,87 @@ pub struct Decoder {
     /// Largest dynamic-table size the peer may set (what we advertise as
     /// SETTINGS_HEADER_TABLE_SIZE; fixed at the default).
     last_max_update: usize,
+    /// §2.3.2: the dynamic table, which is connection state and stays here —
+    /// what the peer indexes against depends on every block it has sent.
     table: Table,
+}
+
+/// The two arenas a decode carves from: one set per worker, not one per
+/// connection.
+///
+/// Both are the same trick. An HPACK block arrives in a ring buffer that is
+/// owed straight back, while the values decoded out of it must outlive the
+/// request, so the block is copied once into memory we own and every field is
+/// then a refcounted slice of that copy — one copy per block instead of one
+/// allocation per field. [`Scratch::buffer`] does the same for huffman-coded
+/// strings, which cannot be slices of the input at all because they have to be
+/// decompressed somewhere.
+///
+/// Neither holds anything *between* calls: a decode appends and hands out
+/// slices, and it is the slices that keep the memory alive. So there is nothing
+/// per-connection about them — on a thread per core, no two connections decode
+/// at once — and owning them per connection cost 8 KiB apiece, pinned for the
+/// life of every connection whether or not it ever sent a header again. Shared,
+/// that measured 20.9 KiB down to 12.9 KiB per connection at 20 000 of them:
+/// 408 MB to 251 MB, for no throughput difference this machine could resolve.
+///
+/// What the worst case becomes is worth stating, because it is the obvious
+/// objection. A live header set pins the whole chunk it was carved from, and
+/// chunks are now shared, so one long-lived stream can pin bytes that other
+/// connections carved beside it. The amount is bounded by the chunk, and if
+/// every live header set pinned a chunk of its own, the cost would be one per
+/// header set — which is exactly what is paid *today, always, per connection*.
+/// The trade improves the common case and cannot lose the pathological one.
+///
+/// Slices from different connections therefore live in one allocation. Each
+/// holds only its own range and `Bytes` hands out no way to reach a neighbour,
+/// so this is a matter of when memory is released rather than of who can read
+/// what.
+#[derive(Debug)]
+struct Scratch {
+    /// Huffman output, decompressed here and split out as it is produced.
     buffer: BytesMut,
     /// Staging for the compressed header blocks, see [`Decoder::stage`].
     input: BytesMut,
 }
 
-/// Chunk size the header blocks are staged in. Header values are zero-copy
-/// slices of a chunk, so one stays alive while any stream still holds a header
-/// it carried — the same trade-off `buffer` already makes for huffman output,
-/// at the same size.
+thread_local! {
+    static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch {
+        buffer: BytesMut::new(),
+        input: BytesMut::new(),
+    });
+}
+
+/// The huffman arena, borrowed for the length of one decode.
+///
+/// Taken out of the thread-local rather than borrowed from it, so that no
+/// `RefCell` guard is alive while the caller's callback runs — a callback that
+/// decoded something itself would otherwise panic, and the callback is the
+/// caller's code, not ours. It goes back however the decode ends, which is what
+/// the `Drop` is for: a block that fails halfway out is the common case, not an
+/// exotic one.
+struct Lent(BytesMut);
+
+impl Lent {
+    fn take() -> Self {
+        Self(SCRATCH.with(|scratch| std::mem::take(&mut scratch.borrow_mut().buffer)))
+    }
+}
+
+impl Drop for Lent {
+    fn drop(&mut self) {
+        SCRATCH.with(|scratch| scratch.borrow_mut().buffer = std::mem::take(&mut self.0));
+    }
+}
+
+/// Chunk size the header blocks are staged in.
+///
+/// A refill unit, not a limit: a block that does not fit in what is left of the
+/// current chunk gets a fresh one, and the old chunk lives on as long as any
+/// slice carved from it. Nothing is grown and nothing is compacted — compacting
+/// would mean moving bytes that live `Bytes` point at. A block larger than this
+/// takes a chunk of its own size; the frame decoder caps that at
+/// `MAX_HEADER_BLOCK_SIZE`.
 const STAGE_CAPACITY: usize = 4096;
 
 /// Represents all errors that can be encountered while performing the decoding
@@ -164,8 +236,6 @@ impl Decoder {
         Decoder {
             last_max_update: size,
             table: Table::new(size),
-            buffer: BytesMut::with_capacity(4096),
-            input: BytesMut::new(),
         }
     }
 
@@ -176,11 +246,18 @@ impl Decoder {
     /// promotion to a shared one that the first `split_to` of the decode forces.
     /// Refilling by the chunk amortizes both over every block a chunk holds.
     pub fn stage(&mut self, payload: &[u8]) -> BytesMut {
-        if self.input.capacity() < payload.len() {
-            self.input = BytesMut::with_capacity(payload.len().max(STAGE_CAPACITY));
-        }
-        self.input.extend_from_slice(payload);
-        self.input.split()
+        SCRATCH.with(|scratch| {
+            // After a `split`, `capacity` is what is left of the chunk. Too
+            // little for this block and the chunk is let go rather than grown:
+            // whatever was carved from it holds it alive, and the copy below
+            // has somewhere contiguous to land.
+            let input = &mut scratch.borrow_mut().input;
+            if input.capacity() < payload.len() {
+                *input = BytesMut::with_capacity(payload.len().max(STAGE_CAPACITY));
+            }
+            input.extend_from_slice(payload);
+            input.split()
+        })
     }
 
     /// Decodes the headers found in the given buffer.
@@ -194,6 +271,9 @@ impl Decoder {
     {
         use self::Representation::*;
 
+        // Once per block rather than once per string: the arena comes out of
+        // the thread-local here and goes back when `huff` drops.
+        let mut huff = Lent::take();
         let mut can_resize = true;
 
         while let Some(ty) = peek_u8(src) {
@@ -209,7 +289,7 @@ impl Decoder {
                 }
                 LiteralWithIndexing => {
                     can_resize = false;
-                    let entry = self.decode_literal(src, true)?;
+                    let entry = self.decode_literal(src, true, &mut huff.0)?;
 
                     // Insert the header into the table
                     self.table.insert(entry.clone());
@@ -219,13 +299,13 @@ impl Decoder {
                 }
                 LiteralWithoutIndexing => {
                     can_resize = false;
-                    let entry = self.decode_literal(src, false)?;
+                    let entry = self.decode_literal(src, false, &mut huff.0)?;
                     consume(src);
                     f(entry);
                 }
                 LiteralNeverIndexed => {
                     can_resize = false;
-                    let entry = self.decode_literal(src, false)?;
+                    let entry = self.decode_literal(src, false, &mut huff.0)?;
                     consume(src);
 
                     // TODO: Track that this should never be indexed
@@ -268,6 +348,7 @@ impl Decoder {
         &mut self,
         buf: &mut Cursor<&mut BytesMut>,
         index: bool,
+        huff: &mut BytesMut,
     ) -> Result<Header, DecoderError> {
         let prefix = if index { 6 } else { 4 };
 
@@ -277,8 +358,8 @@ impl Decoder {
         // First, read the header name
         if table_idx == 0 {
             let old_pos = buf.position();
-            let name_marker = self.try_decode_string(buf)?;
-            let value_marker = self.try_decode_string(buf)?;
+            let name_marker = self.try_decode_string(buf, huff)?;
+            let value_marker = self.try_decode_string(buf, huff)?;
             buf.set_position(old_pos);
             // Read the name as a literal
             let name = name_marker.consume(buf);
@@ -286,7 +367,7 @@ impl Decoder {
             Header::new(name, value)
         } else {
             let e = self.table.get(table_idx)?;
-            let value = self.decode_string(buf)?;
+            let value = self.decode_string(buf, huff)?;
 
             e.name().into_entry(value)
         }
@@ -295,6 +376,7 @@ impl Decoder {
     fn try_decode_string(
         &mut self,
         buf: &mut Cursor<&mut BytesMut>,
+        arena: &mut BytesMut,
     ) -> Result<StringMarker, DecoderError> {
         let old_pos = buf.position();
         const HUFF_FLAG: u8 = 0b1000_0000;
@@ -316,7 +398,7 @@ impl Decoder {
         if huff {
             let ret = {
                 let raw = &buf.chunk()[..len];
-                huffman::decode(raw, &mut self.buffer).map(|buf| StringMarker {
+                huffman::decode(raw, arena).map(|buf| StringMarker {
                     offset,
                     len,
                     string: Some(BytesMut::freeze(buf)),
@@ -335,9 +417,13 @@ impl Decoder {
         }
     }
 
-    fn decode_string(&mut self, buf: &mut Cursor<&mut BytesMut>) -> Result<Bytes, DecoderError> {
+    fn decode_string(
+        &mut self,
+        buf: &mut Cursor<&mut BytesMut>,
+        huff: &mut BytesMut,
+    ) -> Result<Bytes, DecoderError> {
         let old_pos = buf.position();
-        let marker = self.try_decode_string(buf)?;
+        let marker = self.try_decode_string(buf, huff)?;
         buf.set_position(old_pos);
         Ok(marker.consume(buf))
     }
@@ -818,6 +904,76 @@ pub fn get_static(idx: usize) -> Header {
 }
 
 #[cfg(test)]
+mod arena {
+    use super::*;
+
+    /// One chunk for every connection on the worker, which is the whole point:
+    /// two decoders that know nothing of each other carve from the same
+    /// allocation, one after the other.
+    #[test]
+    fn two_decoders_carve_from_the_same_chunk() {
+        let mut one = Decoder::new(4096);
+        let mut two = Decoder::new(4096);
+
+        let first = one.stage(&[1, 2, 3, 4]);
+        let second = two.stage(&[5, 6, 7, 8]);
+
+        // Addresses rather than pointers: what is being asserted is adjacency
+        // in one allocation, and comparing them as integers says exactly that
+        // without reaching past either slice.
+        assert_eq!(
+            first.as_ptr() as usize + first.len(),
+            second.as_ptr() as usize,
+            "the second block begins where the first ended"
+        );
+    }
+
+    /// What "the arena is full" does: nothing announces it, nothing fails, and
+    /// what was lent before the rollover stays readable — those slices hold the
+    /// old chunk alive themselves. Nothing is grown and nothing is compacted,
+    /// because compacting would move bytes that live `Bytes` point at.
+    #[test]
+    fn a_full_chunk_is_replaced_and_what_it_lent_survives() {
+        let mut de = Decoder::new(4096);
+
+        let block = vec![b'a'; 1000];
+        let mut kept: Vec<BytesMut> = Vec::new();
+        for _ in 0..4 {
+            kept.push(de.stage(&block));
+        }
+
+        // The fifth no longer fits in what is left of a 4096-byte chunk.
+        let after = de.stage(&vec![b'b'; 1000]);
+        assert_ne!(
+            kept[0].as_ptr() as usize + 4000,
+            after.as_ptr() as usize,
+            "a fresh chunk, not the tail of the old one"
+        );
+
+        for slice in &kept {
+            assert!(slice.iter().all(|&b| b == b'a'), "the old chunk is intact");
+        }
+        assert!(after.iter().all(|&b| b == b'b'));
+
+        // And the old chunk dies with its last slice, not with the rollover.
+        drop(kept);
+        assert!(after.iter().all(|&b| b == b'b'));
+    }
+
+    /// §6.10 lets a block outgrow the refill size; it takes a chunk of its own
+    /// rather than being refused or split.
+    #[test]
+    fn a_block_larger_than_the_refill_size_gets_its_own_chunk() {
+        let mut de = Decoder::new(4096);
+        let big = vec![b'z'; STAGE_CAPACITY * 3];
+
+        let staged = de.stage(&big);
+        assert_eq!(staged.len(), STAGE_CAPACITY * 3);
+        assert!(staged.iter().all(|&b| b == b'z'));
+    }
+}
+
+#[cfg(test)]
 mod test {
     use super::*;
 
@@ -834,7 +990,10 @@ mod test {
     fn test_decode_string_empty() {
         let mut de = Decoder::new(0);
         let mut buf = BytesMut::new();
-        let err = de.decode_string(&mut Cursor::new(&mut buf)).unwrap_err();
+        let mut huff = BytesMut::new();
+        let err = de
+            .decode_string(&mut Cursor::new(&mut buf), &mut huff)
+            .unwrap_err();
         assert_eq!(err, DecoderError::NeedMore(NeedMore::UnexpectedEndOfStream));
     }
 
