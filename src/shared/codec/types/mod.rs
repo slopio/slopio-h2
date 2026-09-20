@@ -15,6 +15,10 @@ pub enum DecodeError {
     /// next frame; the in-progress frame is discarded.
     Stream {
         stream_id: StreamId,
+        /// Which rule was broken, for a handler whose answer depends on it:
+        /// a malformed HEADERS opened — and so spent — its stream id, where
+        /// a bad PRIORITY did nothing of the kind.
+        violation: StreamViolation,
         code: u32,
         message: &'static str,
     },

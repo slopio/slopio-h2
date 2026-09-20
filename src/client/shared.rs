@@ -109,6 +109,7 @@ impl ClientShared {
     /// writer is bounded by.
     pub(crate) fn set_peer_settings(&self, settings: Settings) {
         self.core.set_max_frame_size(settings.max_frame_size);
+        self.core.set_header_table_size(settings.header_table_size);
         *self.peer_settings.borrow_mut() = settings;
     }
 

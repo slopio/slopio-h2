@@ -573,6 +573,19 @@ impl<H: Handler> FrameHandler for Protocol<H> {
             Err(_) => padded_len,
         });
 
+        // The same padding was debited from the stream's window, and the
+        // handler's `consume` only ever returns payload. Not worth a frame on
+        // a stream the peer has just finished with.
+        let padding = padded_len - payload.len() as u32;
+        if received.is_ok() && !end_stream && padding > 0 {
+            if let Some(stream) = self.streams.streams.get(raw)
+                && let Some(increment) = stream.release_recv(padding)
+            {
+                self.shared
+                    .write_frame(|out| encode_window_update(out, stream_id, increment));
+            }
+        }
+
         // The peer's half closing is the other half of what retires a
         // stream; the task's token is the first, and either may be last.
         if received.is_ok() && end_stream {
@@ -611,9 +624,14 @@ impl<H: Handler> FrameHandler for Protocol<H> {
         // List truncated during decoding: HPACK state stays in sync, but the
         // content is incomplete and must not reach the handler — neither as a
         // request nor as trailers, hence before the lookup below.
+        //
+        // Counted, because it is the dearest refusal there is: the whole
+        // block was decoded to learn it was too long, and `FrameWorth` saw a
+        // full header block and cleared both burst budgets for it.
         if headers.is_over_size() {
             self.streams.spend(raw);
-            return self.reset_stream(id, REFUSED_STREAM);
+            self.reset_stream(id, REFUSED_STREAM);
+            return self.count_fault("too many over-sized header lists");
         }
 
         // §8.1: an id already live takes these HEADERS as its trailers.
@@ -662,6 +680,13 @@ impl<H: Handler> FrameHandler for Protocol<H> {
                 return self.fail_connection(invalid.code, invalid.message);
             }
         }
+
+        // What bounds our writers takes effect with the frame: the encoder's
+        // table (RFC 7541 §4.2) and the largest payload we may emit.
+        self.shared
+            .set_header_table_size(self.peer_settings.header_table_size);
+        self.shared
+            .set_max_frame_size(self.peer_settings.max_frame_size);
 
         // §6.9.2: a new initial window moves every live stream's send window
         // by the difference — one walk, from the value before the frame to
@@ -740,8 +765,28 @@ impl<H: Handler> FrameHandler for Protocol<H> {
             DecodeError::Connection { code, message } => self.fail_connection(code, message),
             // The frame is already discarded; the stream is told why.
             DecodeError::Stream {
-                stream_id, code, ..
-            } => self.reset_stream(stream_id, code),
+                stream_id,
+                violation,
+                code,
+                ..
+            } => {
+                // §5.1: a HEADERS frame opens its stream whatever we make of
+                // the block, so the reset closes a stream rather than leaving
+                // an idle one — and the body the peer had already sent behind
+                // it is a frame on a closed stream, not on an idle one. The
+                // other decoder violations are PRIORITY and WINDOW_UPDATE,
+                // which open nothing.
+                //
+                // Counted like the malformed request `create` finds itself:
+                // `FrameWorth` called this block progress.
+                if violation == StreamViolation::MalformedMessage {
+                    if stream_id.is_client_initiated() {
+                        self.streams.spend(stream_id.into());
+                    }
+                    return self.fail_stream(stream_id, violation);
+                }
+                self.reset_stream(stream_id, code)
+            }
         }
     }
 

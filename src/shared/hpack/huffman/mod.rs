@@ -18,6 +18,20 @@ const DECODED: u8 = 2;
 const ERROR: u8 = 4;
 
 pub fn decode(src: &[u8], buf: &mut BytesMut) -> Result<BytesMut, DecoderError> {
+    // `buf` outlives this call — it is the thread's shared arena — so what a
+    // failed decode wrote before failing must not stay in it: `split` hands
+    // out everything in the buffer, and the next string decoded on this
+    // thread, from whatever connection, would come back with these bytes in
+    // front of its own.
+    let start = buf.len();
+    let decoded = decode_into(src, buf);
+    if decoded.is_err() {
+        buf.truncate(start);
+    }
+    decoded.map(|()| buf.split())
+}
+
+fn decode_into(src: &[u8], buf: &mut BytesMut) -> Result<(), DecoderError> {
     let mut decoder = Decoder::new();
 
     // Max compression ratio is >= 0.5
@@ -37,7 +51,7 @@ pub fn decode(src: &[u8], buf: &mut BytesMut) -> Result<BytesMut, DecoderError> 
         return Err(DecoderError::InvalidHuffmanCode);
     }
 
-    Ok(buf.split())
+    Ok(())
 }
 
 pub fn encode(src: &[u8], dst: &mut impl BufMut) {

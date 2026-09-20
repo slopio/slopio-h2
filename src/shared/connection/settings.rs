@@ -13,15 +13,17 @@
 //!   negative that way; overflowing 2^31-1 is a connection
 //!   `FLOW_CONTROL_ERROR`.
 //!
+//! - **`HEADER_TABLE_SIZE` (0x01)** — clamped here, then handed to the HPACK
+//!   encoder by `on_settings`, which shrinks its table and emits the dynamic
+//!   table size update at the head of the next block (RFC 7541 §4.2).
+//! - **`MAX_FRAME_SIZE` (0x05)** — handed to `SharedConnection`, where it
+//!   bounds the DATA and HEADERS frames we emit.
+//!
 //! ## Stored but not honoured
 //!
 //! Applying a value to this struct is not the same as obeying it. None of
 //! these currently reach the code they are supposed to constrain:
 //!
-//! - `HEADER_TABLE_SIZE` — should cap our HPACK *encoder*'s dynamic table,
-//!   and any change must emit a dynamic table size update at the head of the
-//!   next header block, or the peer's decoder desyncs.
-//! - `MAX_FRAME_SIZE` — should bound the DATA and HEADERS frames we emit.
 //! - `MAX_CONCURRENT_STREAMS` — bounds streams *we* initiate, so inert
 //!   without push; must never be confused with our own limit in `admits`.
 //! - `ENABLE_PUSH`, `ENABLE_CONNECT_PROTOCOL`, `MAX_HEADER_LIST_SIZE`,

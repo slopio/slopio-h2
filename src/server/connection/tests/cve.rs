@@ -397,6 +397,34 @@ fn a_header_list_of_tiny_fields_is_refused_by_the_size_cap() {
     assert_eq!(goaway(&written), None, "the connection survives it");
 }
 
+/// The same block, over and over. Each one is refused, and each one made us
+/// decode 600 fields to find that out — while `FrameWorth` reads a full
+/// header block and calls it progress, so neither burst budget ever sees it.
+/// `FAULT_LIMIT` has to, or refusing is all we ever do about it.
+#[test]
+fn a_flood_of_over_sized_header_lists_ends_the_connection() {
+    let mut block = GET_BLOCK.to_vec();
+    for _ in 0..600 {
+        block.extend_from_slice(&[0x00, 0x01, b'a', 0x00]);
+    }
+
+    let mut bytes = preface();
+    for i in 0..=super::super::protocol::FAULT_LIMIT {
+        bytes.extend_from_slice(&frame(
+            HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            1 + 2 * i,
+            &block,
+        ));
+    }
+
+    let written = run_connection(deliveries(&bytes), |_, _| {});
+
+    let (code, reason) = goaway(&written).expect("refusing for ever is not a defence");
+    assert_eq!(code, ENHANCE_YOUR_CALM);
+    assert_eq!(reason, "too many over-sized header lists");
+}
+
 /// An HPACK bomb: one large value entered into the dynamic table, then named
 /// again by one-byte references.
 ///

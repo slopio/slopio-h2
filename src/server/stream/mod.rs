@@ -38,15 +38,16 @@ const BODY_GRACE: Duration = Duration::from_secs(5);
 /// is first judged: 1280 bytes at five seconds.
 const MIN_BODY_RATE: u64 = 256;
 
-/// How long a response is given, from its first byte, before its rate is
-/// judged.
+/// How long a response may have waited on the peer's credit, in total, before
+/// its rate is judged.
 ///
-/// Measured from the first byte and not from the stream opening, which is the
-/// difference between judging the peer and judging ourselves: everything
-/// before that first byte is the handler thinking — a query, a file, an
-/// upstream — and a stream whose clock started at the request would fail its
-/// own check whenever the backend was slow. There is no equivalent dead time
-/// inbound, which is why [`BODY_GRACE`] can start where it does.
+/// Time spent waiting for credit and not time since the first byte, which is
+/// the difference between judging the peer and judging ourselves: a handler
+/// thinks before its first byte and may think between any two after it — an
+/// event stream is mostly that — and a clock that ran through those pauses
+/// would fail the stream whenever the *handler* was slow. There is no
+/// equivalent dead time inbound, which is why [`BODY_GRACE`] can start where
+/// it does.
 const SEND_GRACE: Duration = Duration::from_secs(5);
 
 /// Bytes per second below which a peer is not receiving a response, it is
@@ -103,12 +104,15 @@ pub struct StreamState {
     /// controls: that loop only advances by what the stream and connection
     /// windows have credited, so this measures the peer's pace and not ours.
     sent: Cell<u64>,
-    /// When the first response byte went out, or `None` before that.
+    /// Since when the writer has been parked with no credit from the peer, or
+    /// `None` while it is not.
+    send_blocked_since: Cell<Option<SystemTime>>,
+    /// Every such wait already over, added up.
     ///
-    /// The clock [`Stream::output_is_starving`] runs on. `None` also *is* the
-    /// "not started" state, so a handler that has produced nothing yet is
-    /// never judged.
-    sending_since: Cell<Option<SystemTime>>,
+    /// With the one above, the clock [`Stream::output_is_starving`] runs on:
+    /// only time the peer made us wait. A handler that has produced nothing,
+    /// or is between two writes, accrues none and is never judged.
+    send_blocked: Cell<Duration>,
     /// Body bytes taken from the connection window and not yet consumed by
     /// the task — still holding credit. Whatever is left when the stream
     /// goes must be given back, or the connection window shrinks for good.
@@ -166,7 +170,8 @@ impl StreamState {
             input: RefCell::new(input),
             received: Cell::new(0),
             sent: Cell::new(0),
-            sending_since: Cell::new(None),
+            send_blocked_since: Cell::new(None),
+            send_blocked: Cell::new(Duration::ZERO),
             unreleased: Cell::new(0),
             responded: Cell::new(false),
             retired: Cell::new(false),
@@ -215,6 +220,12 @@ impl StreamState {
     /// zero, so the comparison reads as infinitely fast rather than as a
     /// stalled peer.
     pub fn body_is_starving(&self) -> bool {
+        // END_STREAM came: the peer owes nothing more, so whatever time
+        // passes from here is the handler's. The sweep asks every live
+        // stream, and a GET is one whose body ended with its HEADERS.
+        if self.no_more_input.get() {
+            return false;
+        }
         let age = self.age();
         if age < BODY_GRACE {
             return false;
@@ -267,13 +278,22 @@ impl StreamState {
         self.retired.set(true);
     }
 
-    /// Records `n` response body bytes as having gone to the peer, starting
-    /// the send clock on the first of them.
+    /// Records `n` response body bytes as having gone to the peer, which
+    /// ends whatever wait for credit came before them.
     pub fn note_sent(&self, n: usize) {
-        if self.sending_since.get().is_none() {
-            self.sending_since.set(Some(runtime::runtime::now()));
+        if let Some(since) = self.send_blocked_since.take() {
+            self.send_blocked
+                .set(self.send_blocked.get() + elapsed_since(since));
         }
         self.sent.set(self.sent.get() + n as u64);
+    }
+
+    /// The writer found no credit and is about to park on it.
+    fn note_send_blocked(&self) {
+        if self.send_blocked_since.get().is_none() {
+            self.send_blocked_since
+                .set(Some(runtime::runtime::now()));
+        }
     }
 
     /// Whether the peer is taking its response too slowly to be receiving it.
@@ -283,19 +303,21 @@ impl StreamState {
     /// counts what arrives, and a peer that metes out a response with
     /// one-byte WINDOW_UPDATEs sends us nothing to count.
     ///
-    /// Answers `false` until the first byte is written — see [`SEND_GRACE`].
+    /// The rate is bytes over the time spent *waiting for the peer's credit*,
+    /// not over the life of the response — see [`SEND_GRACE`]. A peer that
+    /// credits a byte at a time keeps the writer parked between every two
+    /// bytes, so nearly all of its elapsed time counts; a handler pacing its
+    /// own output to a peer with credit to spare counts none.
     pub fn output_is_starving(&self) -> bool {
-        let Some(since) = self.sending_since.get() else {
-            return false;
-        };
-        // Floors at zero on a clock that stepped backwards, as `age` does.
-        let elapsed = runtime::runtime::now()
-            .duration_since(since)
-            .unwrap_or_default();
-        if elapsed < SEND_GRACE {
+        let waiting = self
+            .send_blocked_since
+            .get()
+            .map_or(Duration::ZERO, elapsed_since);
+        let blocked = self.send_blocked.get() + waiting;
+        if blocked < SEND_GRACE {
             return false;
         }
-        self.sent.get() < MIN_SEND_RATE.saturating_mul(elapsed.as_secs())
+        self.sent.get() < MIN_SEND_RATE.saturating_mul(blocked.as_secs())
     }
 
     /// A WINDOW_UPDATE on this stream. The task may be waiting on exactly
@@ -695,13 +717,24 @@ impl crate::shared::connection::SendSide for StreamState {
         self.debit_send(len)
     }
 
+    /// Only ever called for want of credit — a full output parks elsewhere —
+    /// so this is also where the wait on the peer starts being timed.
     fn register_send_waker(&self, waker: &Waker) {
+        self.note_send_blocked();
         self.register_waker(waker);
     }
 
     fn note_sent(&self, n: usize) {
         self.note_sent(n);
     }
+}
+
+/// Floors at zero on a clock that stepped backwards, as [`StreamState::age`]
+/// does.
+fn elapsed_since(since: SystemTime) -> Duration {
+    runtime::runtime::now()
+        .duration_since(since)
+        .unwrap_or_default()
 }
 
 /// The declared body length, or `None` when the request declared none.

@@ -462,6 +462,16 @@ impl SharedConnection {
         }
     }
 
+    /// Takes the peer's new `SETTINGS_HEADER_TABLE_SIZE`, already clamped to
+    /// what we are willing to keep. RFC 7541 §4.2: the encoder shrinks its
+    /// table and says so at the head of the next block, which `encode` does
+    /// on its own once told — a value that changes nothing queues nothing.
+    pub fn set_header_table_size(&self, header_table_size: u32) {
+        // SAFETY: the reference dies with the expression, and queuing a size
+        // update cannot re-enter.
+        unsafe { (*self.encoder.get()).update_max_size(header_table_size as usize) };
+    }
+
     /// Takes the peer's new `SETTINGS_MAX_FRAME_SIZE`.
     pub fn set_max_frame_size(&self, max_frame_size: u32) {
         self.max_frame_size.set(max_frame_size);

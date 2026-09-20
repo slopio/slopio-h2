@@ -907,6 +907,47 @@ pub fn get_static(idx: usize) -> Header {
 mod arena {
     use super::*;
 
+    /// The huffman arena is the worker's, not the connection's, so a string
+    /// that fails to decode on one connection must leave nothing in it: what
+    /// it left would come out in front of the next string decoded on this
+    /// thread, which belongs to somebody else.
+    #[test]
+    fn a_failed_huffman_string_leaves_nothing_for_the_next_decoder() {
+        fn block(huffman: &[u8]) -> BytesMut {
+            // `:method GET`, `:scheme https`, then `:path` as a literal
+            // without indexing (name index 4), huffman-coded.
+            let mut block = BytesMut::from(&[0x82, 0x87, 0x04, 0x80 | huffman.len() as u8][..]);
+            block.extend_from_slice(huffman);
+            block
+        }
+
+        // Valid codes for "/admin?x=", then EOS: decodes nine bytes and fails.
+        let mut poisoned = Vec::new();
+        huffman::encode(b"/admin?x=", &mut poisoned);
+        poisoned.extend_from_slice(&[0xff; 5]);
+        let mut attacker = Decoder::new(4096);
+        let mut buf = block(&poisoned);
+        assert!(
+            attacker
+                .decode(&mut Cursor::new(&mut buf), |_| {})
+                .is_err()
+        );
+
+        let mut honest = Vec::new();
+        huffman::encode(b"/ok", &mut honest);
+        let mut victim = Decoder::new(4096);
+        let mut buf = block(&honest);
+        let mut path = None;
+        victim
+            .decode(&mut Cursor::new(&mut buf), |header| {
+                if let Header::Path(value) = header {
+                    path = Some(value.as_str().to_owned());
+                }
+            })
+            .expect("a valid block decodes");
+        assert_eq!(path.as_deref(), Some("/ok"));
+    }
+
     /// One chunk for every connection on the worker, which is the whole point:
     /// two decoders that know nothing of each other carve from the same
     /// allocation, one after the other.

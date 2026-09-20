@@ -353,7 +353,7 @@ fn report_violation<H: FrameHandler>(
 ) -> Decode {
     match handler.stream_error_scope(violation) {
         ErrorScope::Connection => report_connection(handler, violation.code(), violation.message()),
-        ErrorScope::Stream => report_stream(handler, stream_id, violation.code(), violation.message()),
+        ErrorScope::Stream => report_stream(handler, stream_id, violation),
     }
 }
 
@@ -361,13 +361,13 @@ fn report_violation<H: FrameHandler>(
 fn report_stream<H: FrameHandler>(
     handler: &mut H,
     stream_id: StreamId,
-    code: u32,
-    message: &'static str,
+    violation: StreamViolation,
 ) -> Decode {
     handler.on_error(DecodeError::Stream {
         stream_id,
-        code,
-        message,
+        violation,
+        code: violation.code(),
+        message: violation.message(),
     });
     Ok(())
 }
