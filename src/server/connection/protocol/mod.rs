@@ -285,6 +285,9 @@ impl<H: Handler> Streams<H> {
     /// to answer: REFUSED_STREAM is sent for streams that never existed.
     fn remove(&mut self, id: STREAM_ID, shared: &SharedConnection) -> Option<Rc<StreamState>> {
         let (stream, handle) = self.streams.remove(id)?;
+        // Out of the table and its task about to be killed: what it would
+        // have written reaches nobody, and it must not try.
+        stream.note_retired();
         handle.kill();
         // Body bytes the task never consumed still hold connection credit.
         shared.release_stream_credit(stream.take_unreleased());
@@ -334,7 +337,8 @@ impl<H: Handler> Drop for Streams<H> {
     /// is the connection's, so no stream task holds a borrow or a
     /// half-written frame.
     fn drop(&mut self) {
-        for (_stream, handle) in self.streams.take_all() {
+        for (stream, handle) in self.streams.take_all() {
+            stream.note_retired();
             handle.kill();
         }
     }

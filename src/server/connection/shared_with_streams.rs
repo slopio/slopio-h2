@@ -38,6 +38,7 @@ pub fn retire_if_closed(map: &LiveStreams, shared: &SharedConnection, id: STREAM
     let Some((stream, _handle)) = map.remove(id) else {
         return;
     };
+    stream.note_retired();
     // Body bytes no handler consumed still hold credit. `_handle` drops
     // here, outside the map, which for a task retiring itself is that task
     // detaching its own handle — sound because the scheduler holds a
@@ -105,14 +106,16 @@ impl Drop for StreamToken {
         // for a response that cannot come: nothing else on this connection
         // will ever speak for that stream. So it gets a `500` on the way out.
         //
-        // Only for a stream still in the map. One the peer reset, or one the
-        // connection killed, is already gone from it — and a HEADERS frame on
-        // a stream that no longer exists is noise the peer has to account for.
-        let live = self
-            .map
-            .upgrade()
-            .is_some_and(|map| map.get(self.id.into()).is_some());
-        if live && !self.stream.has_responded() {
+        // Only for a stream still in the connection's table. One the peer
+        // reset, or one the connection killed, is already out of it — and a
+        // HEADERS frame on a stream that no longer exists is noise the peer
+        // has to account for.
+        //
+        // Both facts are `Cell` reads on the stream itself. The second used
+        // to be read from the table's membership instead, which cost a
+        // `Weak::upgrade`, a hash lookup and an `Rc` round trip on every
+        // request — 3% — to answer a question only a cancelled stream asks.
+        if !self.stream.has_responded() && !self.stream.is_retired() {
             self.shared.write_response(
                 self.id,
                 StatusCode::INTERNAL_SERVER_ERROR,

@@ -118,6 +118,16 @@ pub struct StreamState {
     /// this is what tells a handler that returned in silence from one that
     /// answered.
     responded: Cell<bool>,
+    /// This stream is out of the connection's live table: it finished and was
+    /// retired, or the peer reset it, or the connection is going down. Either
+    /// way nothing its task writes from here reaches anyone.
+    ///
+    /// The fact belongs here rather than in the table's membership, which is
+    /// where it used to be read from. Whether it is still in that table is the
+    /// one thing a stream's own task cannot otherwise know — and asking cost a
+    /// `Weak::upgrade`, a hash lookup and an `Rc` round trip on every request,
+    /// to answer a question only a cancelled stream ever asks. It measured 3%.
+    retired: Cell<bool>,
     window: StreamWindow,
     waker: RefCell<Option<Waker>>,
 }
@@ -159,6 +169,7 @@ impl StreamState {
             sending_since: Cell::new(None),
             unreleased: Cell::new(0),
             responded: Cell::new(false),
+            retired: Cell::new(false),
             waker: RefCell::new(None),
         })
     }
@@ -243,6 +254,17 @@ impl StreamState {
 
     pub fn note_responded(&self) {
         self.responded.set(true);
+    }
+
+    /// Whether this stream is out of the connection's live table.
+    pub fn is_retired(&self) -> bool {
+        self.retired.get()
+    }
+
+    /// Called by whoever takes it out, which is the connection and never the
+    /// stream's own task.
+    pub fn note_retired(&self) {
+        self.retired.set(true);
     }
 
     /// Records `n` response body bytes as having gone to the peer, starting
