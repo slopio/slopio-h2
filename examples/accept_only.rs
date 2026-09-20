@@ -12,9 +12,13 @@
 //! This is what found the HPACK encoder sizing bug: a connection that had
 //! sent a preface and nothing else cost 211 KiB, where `hold` measured 0.16
 //! KiB and `recv` 3.11 KiB. That gap said the runtime was not the problem and
-//! sent the search into `SharedConnection::new`. Idle connections are ~11 KiB
-//! now; a number far above that here again means a new per-connection
-//! allocation, and the two modes say whether it is ours or the runtime's.
+//! sent the search into `SharedConnection::new`.
+//!
+//! An idle HTTP/2 connection costs **8.78 KiB** today, and cost 12.73 before
+//! the HPACK arenas moved to one set per worker — both measured with
+//! `examples/idle_clients`, which is the driver this file's method asks for. A
+//! number far above that again means a new per-connection allocation, and the
+//! two modes here say whether it is ours or the runtime's.
 
 use runtime::net::{BufRingSpec, MultiAccept, MultiRecv};
 use runtime::{spawn, thread_per_core_with};

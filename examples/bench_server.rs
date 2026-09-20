@@ -13,6 +13,10 @@
 //! outgrows the server.
 //!
 //! `PORT` defaults to 8080, `RING` to the `64x512` the plain example ships.
+//!
+//! The routes are at the bottom of this file rather than in the library: they
+//! exist for `bench/run.sh` and for nothing else, and one of them allocates per
+//! request, which is a thing a benchmark's reader should be able to see.
 
 use http::{HeaderMap, StatusCode};
 use popple_h2::server::{Server, ServerSettings, ServerTransport, Stream};

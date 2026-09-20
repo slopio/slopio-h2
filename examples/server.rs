@@ -7,8 +7,10 @@
 //!     cargo run --example server
 //!     curl --http2-prior-knowledge http://localhost:8080/ -v
 //!
-//! The handler is a plain `async fn`: a connection is accepted, its transport and protocol
-//! state are built, and `Connection::run` — the loop — is what remains.
+//! The handler is an `async fn` taking a [`Stream`]: one call per request, and
+//! it owns that stream until it returns. Everything under it — accepting the
+//! socket, the preface, the frame loop, flow control, retiring the stream — is
+//! the library's, and none of it appears here.
 //!
 //! `PER_CORE=1` runs one worker per core of the affinity mask, worker `n`
 //! pinned to core `n` — so under `taskset -c 0,1`, cores 0 and 1.
@@ -57,9 +59,42 @@ async fn serve() {
     }
 }
 
-/// One exchange. The handler owns its stream for as long as it runs, and
-/// dropping it is what ends the server's half (§5.1).
+/// One exchange, and the whole shape of a handler.
+///
+/// The head first, then the body: DATA on a stream whose peer has had no
+/// HEADERS is a stream the peer cannot make sense of. `end_stream` goes on the
+/// last thing written, which is what §8.1 means by the message ending — here
+/// the body, but it would be the head for a response that has none.
+///
+/// Returning is what ends the server's half (§5.1): the stream is dropped, and
+/// its token retires it. A handler that returns without answering gets a `500`
+/// written for it rather than leaving the peer waiting.
 async fn hello(stream: Stream) {
+    // A request body, if there is one. `body_is_oneshot` is the request's
+    // `content-length` deciding which contract applies: small enough to hand
+    // over whole, or large enough that it has to be drained as it arrives.
+    let body = match stream.body_is_oneshot() {
+        true => stream.body().await.map_or(0, |bytes| bytes.len()),
+        false => {
+            let mut total = 0;
+            while stream.readable().await {
+                let taken = stream.peek(|bytes| bytes.len());
+                // Taking the bytes is what credits the peer for them, so a
+                // handler that stops consuming is a handler that stops the
+                // upload (§6.9.1).
+                stream.consume(taken);
+                total += taken;
+            }
+            total
+        }
+    };
+
+    let greeting = format!(
+        "{} {} — {body} bytes of body\n",
+        stream.method().map_or("?", |m| m.as_str()),
+        stream.path().unwrap_or("?"),
+    );
+
     stream.respond(StatusCode::OK, &HeaderMap::new(), false);
-    stream.write(b"hello\n", true).await;
+    stream.write(greeting.as_bytes(), true).await;
 }
