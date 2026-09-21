@@ -24,7 +24,21 @@ pub use crate::shared::connection::CONNECTION_INITIAL_WINDOW_SIZE;
 
 /// The connection receive window this server announces, once the handshake is
 /// done. Ours to choose, where the send side is the peer's to credit.
-pub const CONNECTION_RECV_WINDOW: u32 = 1024 * 1024;
+///
+/// Large on purpose, as servers usually have it: backpressure is the stream
+/// windows' job, and what they allow at once — every stream with a full
+/// window held unread — is a quarter of this. A connection window smaller
+/// than that sum is how streams accumulating together starve one another,
+/// each short of the bytes that would wake its handler. With this much room
+/// it never binds, and nothing has to manage it beyond the usual refill.
+pub const CONNECTION_RECV_WINDOW: u32 = 15 * 1024 * 1024;
+
+const _: () = assert!(
+    MAX_CONCURRENT_STREAMS as u64
+        * crate::shared::connection::stream_window::LOCAL_INITIAL_WINDOW_SIZE as u64
+        <= CONNECTION_RECV_WINDOW as u64,
+    "every stream holding a full window at once must fit in the connection window"
+);
 
 /// How long one gather-write may stall before the connection is closed.
 ///

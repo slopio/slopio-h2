@@ -24,8 +24,8 @@ pub use stream::Stream;
 ///
 /// ```ignore
 /// Server::new(settings).run::<Ring, _>(|stream: Stream| async move {
-///     stream.respond(StatusCode::OK, &HeaderMap::new(), false);
-///     stream.write(b"hello\n", true).await;
+///     stream.write_headers(StatusCode::OK, &HeaderMap::new());
+///     stream.write_data_final(b"hello\n").await;
 /// }).await
 /// ```
 ///

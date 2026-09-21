@@ -23,7 +23,7 @@ use crate::shared::codec::frames::CLIENT_PREFACE;
 use crate::shared::connection::settings::Settings;
 use crate::shared::transport::PlainMessages;
 
-runtime_core::define_buf_ring!(TestRing, bgid = 9, buffer_size = 16384, ring_size = 4);
+runtime_core::define_buf_ring!(TestRing, bgid = 3, buffer_size = 16384, ring_size = 4);
 
 const DATA: u8 = 0x0;
 const HEADERS: u8 = 0x1;
@@ -529,8 +529,10 @@ fn reading_the_body_credits_the_peer() {
         let stream = client.send_request(&request, true).expect("a stream");
         let _ = stream.response().await.expect("a response");
 
+        // By size and not by count: a read hands over what arrived, and a
+        // frame cut by the end of a segment arrives in pieces.
         let mut total = 0;
-        for _ in 0..4 {
+        while total < 40_000 {
             total += stream
                 .read()
                 .await

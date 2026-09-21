@@ -19,7 +19,8 @@ use http::{HeaderMap, StatusCode};
 use popple_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 use runtime::main_thread_with;
 
-// 64 KiB buffers × 512 slots — the ring every inbound read lands in.
+// 64 KiB buffers × 512, 128 of them in the ring at once — where every inbound
+// read lands.
 //
 // The buffer size is what a request body pays: a chunk is one dispatch
 // through the decoder and one wake of the stream task, so four times the
@@ -36,7 +37,25 @@ use runtime::main_thread_with;
 // and each pins its buffer until the loop comes back. 512 slots served 512
 // connections here with no ENOBUFS, because the loop recycles each chunk as
 // soon as it is decoded.
-runtime::define_buf_ring!(MyBufRing, bgid = 1, buffer_size = 65536, ring_size = 512);
+//
+// Those 512 are the pool, not the ring. The kernel takes ring entries in
+// order, so a ring of 512 walks all 32 MiB before it reuses a byte of it. With
+// `ring_size = 128` it sees 128 buffers, the rest wait in a reserve that hands
+// back the one released last, and the headroom above is still there for
+// whoever holds a buffer. Against a plain ring of 512 this measured the same
+// request rate and 7 MB of peak RSS for 10 on small requests.
+//
+// Not smaller than that: `ring_size` is how many sockets the kernel can serve
+// between two submits, reserve or no reserve. At 20 000 connections a ring of
+// 64 started closing them and a ring of 16 kept 150 (`bench_server` has the
+// table). `bgid` must be below 4.
+runtime::define_buf_ring!(
+    MyBufRing,
+    bgid = 1,
+    buffer_size = 65536,
+    ring_size = 128,
+    pool_size = 512
+);
 
 fn main() {
     println!("listening on http://localhost:8080 (HTTP/2 cleartext, prior knowledge)");
@@ -95,6 +114,6 @@ async fn hello(stream: Stream) {
         stream.path().unwrap_or("?"),
     );
 
-    stream.respond(StatusCode::OK, &HeaderMap::new(), false);
-    stream.write(greeting.as_bytes(), true).await;
+    stream.write_headers(StatusCode::OK, &HeaderMap::new());
+    stream.write_data_final(greeting.as_bytes()).await;
 }

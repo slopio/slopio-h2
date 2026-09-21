@@ -20,11 +20,18 @@
 //! number far above that again means a new per-connection allocation, and the
 //! two modes here say whether it is ours or the runtime's.
 
-use runtime::net::{BufRingSpec, MultiAccept, MultiRecv};
+use runtime::net::{MultiAccept, MultiRecv};
 use runtime::{spawn, thread_per_core_with};
 use runtime_streams::StreamExt;
 
-runtime::define_buf_ring!(Ring, bgid = 1, buffer_size = 65536, ring_size = 512);
+// The geometry `examples/server.rs` ships, so the floor is measured on it.
+runtime::define_buf_ring!(
+    Ring,
+    bgid = 1,
+    buffer_size = 65536,
+    ring_size = 128,
+    pool_size = 512
+);
 
 fn main() {
     let mode = std::env::var("MODE").unwrap_or_else(|_| "recv".into());

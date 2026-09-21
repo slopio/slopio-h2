@@ -80,6 +80,21 @@ impl StreamWindow {
         Some(pending)
     }
 
+    /// As [`release_recv`](Self::release_recv), with nothing held back: `len`
+    /// and whatever was pending, however little. For a receiver that holds
+    /// whole messages and cannot take the next until its sender has the
+    /// credit to finish sending it.
+    #[cfg(feature = "grpc")]
+    #[must_use]
+    pub fn release_recv_now(&self, len: u32) -> Option<u32> {
+        let pending = self.pending_release.replace(0) + len;
+        if pending == 0 {
+            return None;
+        }
+        self.to_recv.set(self.to_recv.get() + pending as i32);
+        Some(pending)
+    }
+
     /// §6.9.1: a DATA frame debits the receive window by its *padded* length,
     /// pad-length byte and padding included. Dropping below zero means the
     /// peer sent past the credit we gave it.

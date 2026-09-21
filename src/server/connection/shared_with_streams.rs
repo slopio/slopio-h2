@@ -15,7 +15,11 @@ use crate::shared::connection::STREAM_ID;
 use crate::shared::connection::SharedConnection;
 use crate::shared::connection::stream_map::StreamMap;
 use crate::shared::{
-    codec::frames::{encode::encode_window_update, stream_id::StreamId},
+    codec::frames::{
+        encode::{encode_rst_stream, encode_window_update},
+        stream_id::StreamId,
+    },
+    codec::types::{INTERNAL_ERROR, NO_ERROR},
     hpack::Header,
 };
 use runtime::Handle;
@@ -122,6 +126,33 @@ impl Drop for StreamToken {
                 &HeaderMap::new(),
                 true,
             );
+        } else if !self.stream.output_ended() && !self.stream.is_retired() {
+            // The other way to leave the peer waiting: a head, perhaps some
+            // body, and no END_STREAM — a handler that returned between its
+            // last `write_data` and its `write_trailers`, or on an error half way
+            // through a body. There is no honest way to finish that response
+            // for it: an empty DATA with END_STREAM would pass a truncated
+            // body off as a whole one. RST_STREAM says what happened, and it
+            // closes both halves, so nothing more is expected of the peer.
+            self.shared
+                .write_frame(|out| encode_rst_stream(out, self.id, INTERNAL_ERROR));
+            if !self.stream.input_ended() {
+                self.shared.note_reset(self.id.into());
+            }
+            self.stream.abandon_input();
+        }
+
+        // A complete response to a request that is still arriving: answered
+        // early, as a refusal is. §8.1 has us say so with RST_STREAM(NO_ERROR)
+        // rather than take a body nobody will read — and rather than keep the
+        // stream's place in the table until the peer finishes, or until the
+        // sweep takes an honest client's unhurried upload for a starved one
+        // and counts it as a fault.
+        if !self.stream.input_ended() && !self.stream.is_retired() {
+            self.shared
+                .write_frame(|out| encode_rst_stream(out, self.id, NO_ERROR));
+            self.shared.note_reset(self.id.into());
+            self.stream.abandon_input();
         }
 
         self.stream.end_output();
@@ -164,6 +195,29 @@ impl SharedConnection {
                 }
             }));
         self.write_headers(stream_id, headers, end_stream);
+    }
+
+    /// Gives the peer back the credit a taken gRPC message was holding, on
+    /// the stream and on the connection both — [`consume`](Self::consume) for
+    /// a whole message, with the stream's half announced at once: see
+    /// [`StreamState::release_message`].
+    #[cfg(feature = "grpc")]
+    pub fn release_message(&self, stream_id: StreamId, stream: &StreamState, credit: u32) {
+        if let Some(increment) = stream.release_message(credit) {
+            self.write_frame(|out| encode_window_update(out, stream_id, increment));
+        }
+        self.release_stream_credit(credit);
+    }
+
+    /// Writes a trailer section: the fields and END_STREAM, no pseudo-header
+    /// (§8.1). Whether the stream is in a state to take one is the caller's
+    /// to have checked.
+    pub fn write_trailers(&self, stream_id: StreamId, fields: &HeaderMap) {
+        let headers = fields.iter().map(|(name, value)| Header::Field {
+            name: Some(name.clone()),
+            value: value.clone(),
+        });
+        self.write_headers(stream_id, headers, true);
     }
 
     /// Takes `n` body bytes off the stream on the handler's behalf and gives

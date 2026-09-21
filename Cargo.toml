@@ -3,6 +3,13 @@ name = "popple-h2"
 version = "0.1.0"
 edition = "2024"
 
+# `grpc` is everything under `src/grpc` and the few places a stream hands a
+# body to it: requests with `content-type: application/grpc` are read as
+# messages. Without it they are HTTP bodies like any other.
+[features]
+default = ["grpc"]
+grpc = []
+
 [dependencies]
 bytes = "1"
 fnv = "1"

@@ -8,6 +8,8 @@ use http::StatusCode;
 
 use crate::server::connection::shared_with_streams::StreamToken;
 use crate::shared::codec::frames::stream_id::StreamId;
+#[cfg(feature = "grpc")]
+use crate::grpc::{GrpcError, GrpcFormat, GrpcFrame, GrpcInput};
 use crate::{
     server::stream::input_data::InputData,
     shared::{
@@ -17,6 +19,36 @@ use crate::{
 };
 
 mod input_data;
+
+/// Where a request's body lands, chosen once, at HEADERS.
+///
+/// Two types and not one with more variants: an HTTP body and a gRPC one have
+/// different contracts with the stream task — what is delivered, when the task
+/// is woken, when credit goes back — and nothing of [`InputData`] had to
+/// change for the other to exist.
+enum Input {
+    /// END_STREAM on the HEADERS, or a declared length of zero.
+    None,
+    Http(InputData),
+    #[cfg(feature = "grpc")]
+    Grpc(GrpcInput),
+}
+
+impl Input {
+    fn http(&self) -> Option<&InputData> {
+        match self {
+            Self::Http(input) => Some(input),
+            _ => None,
+        }
+    }
+
+    fn http_mut(&mut self) -> Option<&mut InputData> {
+        match self {
+            Self::Http(input) => Some(input),
+            _ => None,
+        }
+    }
+}
 
 /// How long a body is given before its rate is judged at all.
 ///
@@ -94,7 +126,11 @@ pub struct StreamState {
     /// nothing about the peer's half — the stream is half-closed(local), and
     /// §5.1 still lets the peer send its body.
     no_more_output: Cell<bool>,
-    input: RefCell<Option<InputData>>,
+    input: RefCell<Input>,
+    /// What the request's `content-type` made of it, body or no body: a gRPC
+    /// call that sends no message is still one, and is answered as one.
+    #[cfg(feature = "grpc")]
+    grpc: Option<GrpcFormat>,
     /// Body bytes taken so far, padding excluded. Doubles as the write cursor
     /// of a pre-allocated buffer.
     received: Cell<u64>,
@@ -152,17 +188,34 @@ impl StreamState {
             return Err(StreamViolation::ContentLengthMismatch);
         }
 
+        // Read whether or not a body follows: a gRPC call that sends no
+        // message is still one, and is answered as one.
+        #[cfg(feature = "grpc")]
+        let grpc = GrpcFormat::of(&header);
+
         // Nothing is allocated for a request that cannot carry a body, nor
-        // for one that declares an empty one.
+        // for one that declares an empty one. For the others, all there is to
+        // go on is the HEADERS.
         let input = match content_length {
-            _ if end_stream => None,
-            Some(0) => None,
-            declared => Some(InputData::new(declared)),
+            _ if end_stream => Input::None,
+            Some(0) => Input::None,
+            declared => {
+                #[cfg(feature = "grpc")]
+                let input = match grpc {
+                    Some(format) => Input::Grpc(GrpcInput::new(format, header.fields(), declared)),
+                    None => Input::Http(InputData::new(declared)),
+                };
+                #[cfg(not(feature = "grpc"))]
+                let input = Input::Http(InputData::new(declared));
+                input
+            }
         };
 
         Ok(Self {
             created_at: runtime::runtime::now(),
             window: StreamWindow::from(settings),
+            #[cfg(feature = "grpc")]
+            grpc,
             header,
             trailers: Cell::new(None),
             no_more_input: Cell::new(end_stream),
@@ -379,6 +432,25 @@ impl StreamState {
         self.no_more_output.set(true);
     }
 
+    /// Whether the peer's half is done: its END_STREAM came, or we stopped
+    /// expecting one.
+    pub fn input_ended(&self) -> bool {
+        self.no_more_input.get()
+    }
+
+    /// Whether our END_STREAM has gone out: on the head of a response with no
+    /// body, on the last of its DATA, or on its trailers.
+    pub fn output_ended(&self) -> bool {
+        self.no_more_output.get()
+    }
+
+    /// Stops expecting anything more from the peer, for a stream we have just
+    /// reset: a RST_STREAM closes both halves at once (§5.1), and whatever of
+    /// the body is still in flight lands on a stream that is gone.
+    pub fn abandon_input(&self) {
+        self.no_more_input.set(true);
+    }
+
     /// Both halves done, which is what lets the connection remove the
     /// stream. A task that answered before the peer finished sending keeps
     /// the stream in the map until its END_STREAM, or a reset, arrives;
@@ -402,9 +474,22 @@ impl StreamState {
         }
 
         // §8.1.1: the body must add up to exactly what was declared.
-        let declared = self.input.borrow().as_ref().and_then(InputData::expected);
+        let declared = match &*self.input.borrow() {
+            Input::None => None,
+            Input::Http(input) => input.expected(),
+            #[cfg(feature = "grpc")]
+            Input::Grpc(input) => input.declared(),
+        };
         if declared.is_some_and(|declared| self.received.get() != declared) {
             return Err(StreamViolation::ContentLengthMismatch);
+        }
+        // A gRPC client sends no trailers, but one that did has ended its
+        // body all the same, and between two messages or not.
+        #[cfg(feature = "grpc")]
+        {
+            if let Input::Grpc(input) = &mut *self.input.borrow_mut() {
+                input.end();
+            }
         }
 
         self.trailers.set(Some(headers));
@@ -427,8 +512,22 @@ impl StreamState {
     pub fn body_is_oneshot(&self) -> bool {
         self.input
             .borrow()
-            .as_ref()
+            .http()
             .is_none_or(|input| !input.wakes_per_frame())
+    }
+
+    /// Whether this request is gRPC, and its body therefore a sequence of
+    /// messages taken through [`Stream::message`] rather than a body.
+    #[cfg(feature = "grpc")]
+    pub fn is_grpc(&self) -> bool {
+        self.grpc.is_some()
+    }
+
+    /// What a gRPC request's messages are serialised as, `None` when the
+    /// request is not gRPC.
+    #[cfg(feature = "grpc")]
+    pub fn grpc_format(&self) -> Option<GrpcFormat> {
+        self.grpc
     }
 
     /// The whole body, once it is whole.
@@ -436,7 +535,7 @@ impl StreamState {
     /// Resolves at END_STREAM and not before — nothing is handed over in
     /// pieces, so no credit is handed back in pieces either, and the peer
     /// gets no WINDOW_UPDATE until the stream retires. That is what bounds
-    /// this form: `BUFFER_ONESHOT_LIMIT` is small enough that every stream
+    /// this form: `InputData::ONESHOT_LIMIT` is small enough that every stream
     /// accumulating at once still fits in the connection window, which is
     /// the static assertion in `input_data`.
     ///
@@ -450,12 +549,14 @@ impl StreamState {
                 self.register_waker(cx.waker());
                 return Poll::Pending;
             }
-            Poll::Ready(
-                self.input
-                    .borrow_mut()
-                    .take()
-                    .and_then(InputData::into_oneshot),
-            )
+            let mut input = self.input.borrow_mut();
+            if input.http().is_none() {
+                return Poll::Ready(None);
+            }
+            Poll::Ready(match std::mem::replace(&mut *input, Input::None) {
+                Input::Http(input) => input.into_oneshot(),
+                _ => None,
+            })
         })
     }
 
@@ -483,7 +584,7 @@ impl StreamState {
     /// `await` that would let the connection push more in.
     pub fn peek<R>(&self, with: impl FnOnce(&[u8]) -> R) -> R {
         let input = self.input.borrow();
-        with(input.as_ref().map_or(&[][..], InputData::available))
+        with(input.http().map_or(&[][..], InputData::available))
     }
 
     /// Takes the `n` leading bytes the handler is done with, and says how
@@ -494,7 +595,7 @@ impl StreamState {
     /// into WINDOW_UPDATE frames, being the half that can write.
     pub fn consume(&self, n: usize) -> u32 {
         let mut input = self.input.borrow_mut();
-        let Some(input) = input.as_mut() else {
+        let Some(input) = input.http_mut() else {
             return 0;
         };
         let n = n.min(input.available().len());
@@ -516,7 +617,7 @@ impl StreamState {
     fn available_len(&self) -> usize {
         self.input
             .borrow()
-            .as_ref()
+            .http()
             .map_or(0, |input| input.available().len())
     }
 
@@ -530,50 +631,104 @@ impl StreamState {
         }
 
         let mut input = self.input.borrow_mut();
-        let Some(input) = input.as_mut() else {
-            // No buffer at all means a declared length of zero, so any byte
-            // is already one too many (§8.1.1).
-            if !payload.is_empty() {
-                return Err(StreamViolation::ContentLengthMismatch);
-            }
-            if end_stream {
-                self.no_more_input.set(true);
-                self.wake();
-            }
-            return Ok(());
+        let declared = match &*input {
+            Input::None => Some(0),
+            Input::Http(input) => input.expected(),
+            #[cfg(feature = "grpc")]
+            Input::Grpc(input) => input.declared(),
         };
 
-        // §8.1.1: exceeding the declared length is an error as soon as it
-        // happens — no reason to take the rest of the body first.
+        // §8.1.1: the body must add up to exactly what was declared.
         let at = self.received.get();
         let received = at + payload.len() as u64;
-        if input.expected().is_some_and(|declared| received > declared) {
+        if end_stream && declared.is_some_and(|declared| received != declared) {
             return Err(StreamViolation::ContentLengthMismatch);
         }
 
-        input.push(at, payload);
-        self.received.set(received);
-        // Bounded by the receive window, so it cannot outgrow a u32.
-        self.unreleased
-            .set(self.unreleased.get() + payload.len() as u32);
-
-        if end_stream {
-            // §8.1.1: and the body must add up to exactly what was declared.
-            if input
-                .expected()
-                .is_some_and(|declared| received != declared)
-            {
+        // §8.1.1 again: exceeding the declared length is an error as soon as
+        // it happens — no reason to take the rest of the body first. Whether a
+        // payload fits is for what holds the body to say, and `push` is where
+        // an HTTP body says it.
+        let wake = match &mut *input {
+            // No buffer at all is a declared length of zero, so any byte is
+            // one too many.
+            Input::None if !payload.is_empty() => {
                 return Err(StreamViolation::ContentLengthMismatch);
             }
+            Input::None => end_stream,
+            Input::Http(input) => {
+                input
+                    .push(at, payload)
+                    .map_err(|_| StreamViolation::ContentLengthMismatch)?;
+                // A body held whole is worth waking for only once; a drained
+                // one has something to take on every frame.
+                end_stream || input.wakes_per_frame()
+            }
+            #[cfg(feature = "grpc")]
+            Input::Grpc(input) => {
+                if declared.is_some_and(|declared| received > declared) {
+                    return Err(StreamViolation::ContentLengthMismatch);
+                }
+                let wake = input.push(payload);
+                if end_stream {
+                    input.end();
+                }
+                wake || end_stream
+            }
+        };
+
+        // Only now: a payload that was refused never landed. Whatever holds
+        // it, it holds connection credit until a handler takes it — bounded
+        // by the receive window, so it cannot outgrow a u32.
+        self.received.set(received);
+        self.unreleased
+            .set(self.unreleased.get() + payload.len() as u32);
+        if end_stream {
             self.no_more_input.set(true);
         }
-
-        // A body held whole is worth waking for only once; a drained one has
-        // something to take on every frame.
-        if end_stream || input.wakes_per_frame() {
+        if wake {
             self.wake();
         }
         Ok(())
+    }
+
+    /// The next gRPC message, once it is whole.
+    ///
+    /// `None` is the end: the peer's END_STREAM came and every message has
+    /// been taken — or the request is not gRPC. `Some(Err(_))` is a body that
+    /// stopped being gRPC, told once, after whatever was whole before it.
+    #[cfg(feature = "grpc")]
+    pub fn message(&self) -> impl Future<Output = Option<Result<GrpcFrame, GrpcError>>> {
+        std::future::poll_fn(move |cx| {
+            let taken = match &mut *self.input.borrow_mut() {
+                Input::Grpc(input) => input.take(),
+                _ => return Poll::Ready(None),
+            };
+            match taken {
+                Some(taken) => Poll::Ready(Some(taken)),
+                None if self.no_more_input.get() => Poll::Ready(None),
+                None => {
+                    self.register_waker(cx.waker());
+                    Poll::Pending
+                }
+            }
+        })
+    }
+
+    /// Lets go of the credit a taken gRPC message was holding, `len` being
+    /// what it took on the wire. The connection's is the caller's to hand
+    /// back; `Some` is the stream's, to announce.
+    ///
+    /// At once rather than accumulated, unlike [`release_recv`]: the next
+    /// message may need the whole window to fit, and credit held back below a
+    /// threshold is credit its sender waits for while we wait for the message.
+    ///
+    /// [`release_recv`]: Self::release_recv
+    #[cfg(feature = "grpc")]
+    #[must_use]
+    pub fn release_message(&self, len: u32) -> Option<u32> {
+        self.unreleased.set(self.unreleased.get() - len);
+        self.window.release_recv_now(len)
     }
 
     fn wake(&self) {
@@ -660,6 +815,46 @@ impl Stream {
         self.token.shared().consume(self.id(), self.state(), n);
     }
 
+    /// Whether the request is gRPC: a POST with `content-type:
+    /// application/grpc`, whether or not it carries a body — one that ends on
+    /// its HEADERS is a call with no message, and still a call. Its body is a
+    /// sequence of messages, taken through [`message`](Self::message); the
+    /// body accessors answer as they do for a request that has none.
+    #[cfg(feature = "grpc")]
+    pub fn is_grpc(&self) -> bool {
+        self.state().is_grpc()
+    }
+
+    /// What the request's messages are serialised as — `+proto`, `+json` —
+    /// known from its HEADERS, before any message. `None` when the request is
+    /// not gRPC.
+    #[cfg(feature = "grpc")]
+    pub fn grpc_format(&self) -> Option<GrpcFormat> {
+        self.state().grpc_format()
+    }
+
+    /// The next gRPC message, whole: a [`GrpcFrame`], whose two variants are
+    /// what the prefix's Compressed-Flag said. Only the uncompressed one hands
+    /// out its bytes; the compressed one knows its encoding and converts.
+    ///
+    /// `None` is the peer's half-close with nothing left to take. A unary
+    /// handler calls this once and expects `None` from a second call; a
+    /// client-streaming one loops. `Some(Err(_))` is a body that stopped
+    /// being gRPC — a message over the limit, a bad flag, an END_STREAM in the
+    /// middle of one — for the handler to answer with a `grpc-status`.
+    ///
+    /// Taking a message is what gives the peer the credit to send the next.
+    #[cfg(feature = "grpc")]
+    pub async fn message(&self) -> Option<Result<GrpcFrame, GrpcError>> {
+        let taken = self.state().message().await;
+        if let Some(Ok(frame)) = &taken {
+            self.token
+                .shared()
+                .release_message(self.id(), self.state(), frame.wire_len() as u32);
+        }
+        taken
+    }
+
     /// §8.1: the trailers, if the request carried any. `None` until the body
     /// has ended, since that is what a trailer section follows.
     pub fn trailers(&self) -> Option<http::HeaderMap> {
@@ -668,35 +863,88 @@ impl Stream {
             .map(|headers| (*headers).into_fields())
     }
 
-    /// Writes the response head. §8.3 puts `:status` before every ordinary
-    /// field, which is done here rather than asked of the caller.
+    /// Writes the response head, with more of the response to follow. §8.3
+    /// puts `:status` before every ordinary field, which is done here rather
+    /// than asked of the caller.
     ///
-    /// `end_stream` answers without a body. Otherwise the body follows through
-    /// [`Stream::write`], and calling that first would put DATA on a stream
-    /// the peer has had no head for.
-    pub fn respond(&self, status: StatusCode, fields: &http::HeaderMap, end_stream: bool) {
+    /// The body follows through [`write_data`](Self::write_data), and calling
+    /// that first would put DATA on a stream the peer has had no head for. A
+    /// response that is its head and nothing else is
+    /// [`write_headers_final`](Self::write_headers_final).
+    ///
+    /// None of the writers takes an `end_stream` flag. What ends a response is
+    /// a method that takes the stream with it — `write_headers_final`,
+    /// [`write_data_final`](Self::write_data_final),
+    /// [`write_trailers`](Self::write_trailers) — so that writing after the
+    /// end is a compile error rather than a frame on a closed stream, and so
+    /// that the end is something a handler has to say. One that returns
+    /// without saying it has its stream reset, since the peer would otherwise
+    /// wait for the rest of a response that is not coming.
+    pub fn write_headers(&self, status: StatusCode, fields: &http::HeaderMap) {
         self.token
             .shared()
-            .write_response(self.id(), status, fields, end_stream);
+            .write_response(self.id(), status, fields, false);
         self.state().note_responded();
-        if end_stream {
-            self.state().end_output();
-        }
     }
 
-    /// Writes the next of the response body, `end_stream` marking it as the
-    /// last.
+    /// The whole response in its head: `status`, `fields`, END_STREAM.
+    ///
+    /// What a gRPC server calls Trailers-Only, with `grpc-status` among the
+    /// fields.
+    pub fn write_headers_final(self, status: StatusCode, fields: &http::HeaderMap) {
+        self.token
+            .shared()
+            .write_response(self.id(), status, fields, true);
+        self.state().note_responded();
+        self.state().end_output();
+    }
+
+    /// Writes the next of the response body, with more to follow — or
+    /// trailers.
     ///
     /// §6.9.1: cut into DATA frames by what the stream's send window, the
     /// connection's and the peer's `max_frame_size` allow, and by the room
     /// left in the output. With none of it this waits, so a body larger than
     /// the peer will take does not have to be held anywhere but where the
     /// caller already has it.
-    pub async fn write(&self, data: &[u8], end_stream: bool) {
+    pub async fn write_data(&self, data: &[u8]) {
         self.token
             .shared()
-            .write_data(self.id(), self.state(), data, end_stream)
+            .write_data(self.id(), self.state(), data, false)
             .await;
+    }
+
+    /// Writes the last of the response body, END_STREAM on its last frame.
+    pub async fn write_data_final(self, data: &[u8]) {
+        self.token
+            .shared()
+            .write_data(self.id(), self.state(), data, true)
+            .await;
+        // After the await and not before: a write that is dropped half way
+        // never wrote the frame that carries the flag.
+        self.state().end_output();
+    }
+
+    /// Ends the response with a trailer section (§8.1): a last HEADERS frame,
+    /// after the body, carrying END_STREAM.
+    ///
+    /// For what is only known once the body has been produced — gRPC puts the
+    /// outcome of the whole call there, as `grpc-status`.
+    ///
+    /// `fields` are ordinary fields only, which the type already guarantees —
+    /// a `HeaderName` cannot start with `:`, and §8.1 allows no pseudo-header
+    /// here.
+    ///
+    /// Does nothing on a stream with no response head yet: trailers the peer
+    /// has had no head for are a malformed response. That leaves the handler
+    /// having answered nothing, and it gets the `500` that is owed for that.
+    pub fn write_trailers(self, fields: &http::HeaderMap) {
+        let state = self.state();
+        if !state.has_responded() || state.is_retired() {
+            return;
+        }
+        self.token.shared().write_trailers(self.id(), fields);
+        state.end_output();
     }
 }
 

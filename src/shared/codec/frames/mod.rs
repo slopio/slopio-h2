@@ -142,6 +142,11 @@ pub trait FrameHandler {
     /// `padded_len` is the original DATA frame payload length (pad-length
     /// byte + body + padding) — what flow control accounts against per
     /// §6.9.1.
+    ///
+    /// Not once per frame: an unpadded DATA frame cut by the end of a read is
+    /// delivered as it arrives, one call per piece, each accounting for its own
+    /// bytes. The pieces add up to the frame, and only the last carries
+    /// `end_stream`. [`on_frame`](Self::on_frame) is still once per frame.
     fn on_data(
         &mut self,
         stream_id: StreamId,
@@ -194,6 +199,25 @@ pub trait FrameHandler {
     fn on_error(&mut self, err: DecodeError);
 }
 
+/// An unpadded DATA frame whose header has been read and whose payload is
+/// still arriving.
+///
+/// Every other frame has to be whole before it means anything, so it is
+/// gathered in `remaining`. A DATA payload is just bytes for a stream, and the
+/// nine bytes in front of it say which stream and how many: gathering it first
+/// copies it once into `remaining` and again into the stream, for up to a frame
+/// of every read that ends inside one. This is what is kept instead.
+///
+/// Padded frames do not come through here — the padding is at the far end, so
+/// telling body from padding wants the whole frame, and they are rare enough to
+/// stay on the path that has it.
+struct PartialData {
+    stream_id: StreamId,
+    /// Payload bytes still to come. Never zero while this is stored.
+    left: u32,
+    end_stream: bool,
+}
+
 /// State accumulated across HEADERS + CONTINUATION frames before HPACK decoding.
 struct HeaderBlockState {
     headers: Headers,
@@ -205,6 +229,7 @@ pub struct FrameDecoder {
     max_frame_size: u32,
     max_header_list_size: usize,
     remaining: Vec<u8>,
+    partial_data: Option<PartialData>,
     header_block: Option<HeaderBlockState>,
     preface_seen: bool,
     /// Set once a connection-level error has been reported. Further input is
@@ -247,6 +272,7 @@ impl FrameDecoder {
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             max_header_list_size: DECODE_MAX_HEADER_LIST_SIZE,
             remaining: Vec::new(),
+            partial_data: None,
             header_block: None,
             preface_seen: false,
             poisoned: false,
@@ -284,6 +310,7 @@ impl FrameDecoder {
             self.max_frame_size,
             self.max_header_list_size,
             &mut self.remaining,
+            &mut self.partial_data,
             &mut self.header_block,
             data,
             handler,
@@ -372,31 +399,42 @@ fn report_stream<H: FrameHandler>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_inner<H: FrameHandler>(
     hpack: &mut hpack::Decoder,
     max_frame_size: u32,
     max_header_list_size: usize,
     remaining: &mut Vec<u8>,
+    partial_data: &mut Option<PartialData>,
     header_block: &mut Option<HeaderBlockState>,
     data: &[u8],
     handler: &mut H,
 ) -> Decode {
     let mut pos = 0;
-    if !remaining.is_empty() {
+    if partial_data.is_some() {
+        pos = continue_data(partial_data, data, handler);
+    } else if !remaining.is_empty() {
         pos = handle_reassembly(
             hpack,
             max_frame_size,
             max_header_list_size,
             remaining,
+            partial_data,
             header_block,
             data,
             handler,
         )?;
     }
+    // Either of those may have used `data` up without finishing its frame.
+    if partial_data.is_some() || !remaining.is_empty() {
+        debug_assert_eq!(pos, data.len());
+        return Ok(());
+    }
     let consumed = decode_buf(
         hpack,
         max_frame_size,
         max_header_list_size,
+        partial_data,
         header_block,
         &data[pos..],
         handler,
@@ -408,13 +446,97 @@ fn decode_inner<H: FrameHandler>(
     Ok(())
 }
 
+/// Whether a DATA frame's payload can go to its stream as it arrives.
+#[inline]
+fn streams_payload(kind: FrameKind, flags: u8) -> bool {
+    // §6.1: PADDED is 0x8.
+    kind == FrameKind::Data && flags & 0x8 == 0
+}
+
+/// Deliver what `data` holds of the DATA payload in progress. Returns the
+/// number of bytes consumed from `data`.
+fn continue_data<H: FrameHandler>(
+    partial_data: &mut Option<PartialData>,
+    data: &[u8],
+    handler: &mut H,
+) -> usize {
+    let Some(partial) = partial_data.as_mut() else {
+        return 0;
+    };
+    let take = (partial.left as usize).min(data.len());
+    partial.left -= take as u32;
+    let (stream_id, done, end_stream) = (partial.stream_id, partial.left == 0, partial.end_stream);
+    if done {
+        *partial_data = None;
+    }
+    // An empty read is not an empty DATA frame, and must not look like one.
+    if take > 0 {
+        handler.on_data(stream_id, &data[..take], take, done && end_stream);
+    }
+    take
+}
+
+/// Start on an unpadded DATA frame whose header has just been read, with
+/// `available` being everything that follows it. Returns the number of payload
+/// bytes consumed — all of them, or all of `available`.
+#[allow(clippy::too_many_arguments)]
+fn begin_data<H: FrameHandler>(
+    hpack: &mut hpack::Decoder,
+    max_header_list_size: usize,
+    partial_data: &mut Option<PartialData>,
+    header_block: &mut Option<HeaderBlockState>,
+    flags: u8,
+    stream_id: StreamId,
+    length: u32,
+    available: &[u8],
+    handler: &mut H,
+) -> Decode<usize> {
+    if available.len() >= length as usize {
+        dispatch_frame(
+            hpack,
+            max_header_list_size,
+            header_block,
+            FrameKind::Data,
+            flags,
+            stream_id,
+            length,
+            &available[..length as usize],
+            handler,
+        )?;
+        return Ok(length as usize);
+    }
+
+    // What `dispatch_frame` checks of a DATA frame, none of which needs the
+    // payload — so a frame it would refuse is refused before any of it lands.
+    handler.on_frame(FrameKind::Data, stream_id, length, flags);
+    if header_block.is_some() {
+        return report_connection(
+            handler,
+            PROTOCOL_ERROR,
+            "expected CONTINUATION frame while header block is incomplete",
+        );
+    }
+    if stream_id.is_zero() {
+        return report_connection(handler, PROTOCOL_ERROR, "DATA frame with stream ID 0");
+    }
+
+    *partial_data = Some(PartialData {
+        stream_id,
+        left: length,
+        end_stream: flags & 0x1 != 0,
+    });
+    Ok(continue_data(partial_data, available, handler))
+}
+
 /// Complete a partial frame using bytes from `data`.
 /// Returns the number of bytes consumed from `data`.
+#[allow(clippy::too_many_arguments)]
 fn handle_reassembly<H: FrameHandler>(
     hpack: &mut hpack::Decoder,
     max_frame_size: u32,
     max_header_list_size: usize,
     remaining: &mut Vec<u8>,
+    partial_data: &mut Option<PartialData>,
     header_block: &mut Option<HeaderBlockState>,
     data: &[u8],
     handler: &mut H,
@@ -448,6 +570,25 @@ fn handle_reassembly<H: FrameHandler>(
     }
     let total = FRAME_HEADER_SIZE + length as usize;
 
+    // Only ever a header here: `decode_buf` starts on such a frame rather than
+    // leave its payload behind, so nothing of it was gathered.
+    if streams_payload(kind, flags) {
+        debug_assert_eq!(remaining.len(), FRAME_HEADER_SIZE);
+        remaining.clear();
+        let consumed = begin_data(
+            hpack,
+            max_header_list_size,
+            partial_data,
+            header_block,
+            flags,
+            stream_id,
+            length,
+            &data[pos..],
+            handler,
+        )?;
+        return Ok(pos + consumed);
+    }
+
     // Step 3: gather the rest of the frame into `remaining`.
     let payload_in_remaining = remaining.len() - FRAME_HEADER_SIZE;
     let need_from_data = (length as usize).saturating_sub(payload_in_remaining);
@@ -480,6 +621,7 @@ fn decode_buf<H: FrameHandler>(
     hpack: &mut hpack::Decoder,
     max_frame_size: u32,
     max_header_list_size: usize,
+    partial_data: &mut Option<PartialData>,
     header_block: &mut Option<HeaderBlockState>,
     buf: &[u8],
     handler: &mut H,
@@ -501,6 +643,22 @@ fn decode_buf<H: FrameHandler>(
         }
         let total = FRAME_HEADER_SIZE + length as usize;
         if remaining.len() < total {
+            // The read ends inside this frame. A DATA payload goes to its
+            // stream now rather than wait in `remaining` to be copied twice.
+            if streams_payload(kind, flags) {
+                offset += FRAME_HEADER_SIZE
+                    + begin_data(
+                        hpack,
+                        max_header_list_size,
+                        partial_data,
+                        header_block,
+                        flags,
+                        stream_id,
+                        length,
+                        &remaining[FRAME_HEADER_SIZE..],
+                        handler,
+                    )?;
+            }
             break;
         }
 
@@ -917,5 +1075,161 @@ mod tests {
 
         assert!(rec.errors.is_empty(), "valid small block must not error: {:?}", rec.errors);
         assert_eq!(rec.headers, 1, "the reassembled block must be dispatched once");
+    }
+    /// What the decoder says about DATA, call by call.
+    #[derive(Default)]
+    struct DataRecorder {
+        /// `(stream, payload, padded_len, end_stream)` per `on_data`.
+        calls: Vec<(u32, Vec<u8>, usize, bool)>,
+        data_frames: usize,
+        pings: usize,
+        errors: Vec<(u32, &'static str)>,
+    }
+
+    impl DataRecorder {
+        fn body(&self) -> Vec<u8> {
+            self.calls.iter().flat_map(|call| call.1.clone()).collect()
+        }
+    }
+
+    impl FrameHandler for DataRecorder {
+        fn on_data(&mut self, id: StreamId, payload: &[u8], padded_len: usize, end: bool) {
+            self.calls
+                .push((id.into(), payload.to_vec(), padded_len, end));
+        }
+        fn on_frame(&mut self, kind: FrameKind, _: StreamId, _: u32, _: u8) {
+            if kind == FrameKind::Data {
+                self.data_frames += 1;
+            }
+        }
+        fn on_headers(&mut self, _: Box<Headers>) {}
+        fn on_settings(&mut self, _: bool, _: SettingsIter<'_>) {}
+        fn on_window_update(&mut self, _: StreamId, _: u32) {}
+        fn on_rst_stream(&mut self, _: StreamId, _: u32) {}
+        fn on_ping(&mut self, _: bool, _: [u8; 8]) {
+            self.pings += 1;
+        }
+        fn on_goaway(&mut self, _: StreamId, _: u32, _: &[u8]) {}
+        fn on_error(&mut self, err: DecodeError) {
+            match err {
+                DecodeError::Connection { code, message } => self.errors.push((code, message)),
+                DecodeError::Stream { code, message, .. } => self.errors.push((code, message)),
+            }
+        }
+    }
+
+    const DATA: u8 = 0x0;
+    const PING: u8 = 0x6;
+    const END_STREAM: u8 = 0x1;
+    const PADDED: u8 = 0x8;
+
+    fn body(len: usize) -> Vec<u8> {
+        (0..len).map(|i| i as u8).collect()
+    }
+
+    /// A DATA frame cut anywhere — inside its header, right after it, inside
+    /// its payload — reaches the stream whole, in order and once, and none of
+    /// the payload is parked in `remaining` on the way.
+    #[test]
+    fn a_data_frame_cut_anywhere_is_delivered_in_pieces() {
+        let payload = body(300);
+        let mut input = Vec::new();
+        push_frame(&mut input, DATA, 0, 1, &payload);
+        push_frame(&mut input, DATA, END_STREAM, 1, &payload);
+        push_frame(&mut input, PING, 0, 0, &[7; 8]);
+
+        for cut in 1..input.len() {
+            let mut rec = DataRecorder::default();
+            let mut decoder = FrameDecoder::client();
+            for piece in [&input[..cut], &input[cut..]] {
+                decoder.decode_with(piece, &mut rec);
+                assert!(
+                    decoder.remaining.len() < FRAME_HEADER_SIZE + 8,
+                    "cut {cut}: {} bytes gathered",
+                    decoder.remaining.len()
+                );
+            }
+
+            assert_eq!(rec.errors, [], "cut {cut}");
+            assert_eq!(
+                rec.body(),
+                [payload.clone(), payload.clone()].concat(),
+                "cut {cut}"
+            );
+            assert_eq!(rec.data_frames, 2, "cut {cut}: `on_frame` is per frame");
+            assert_eq!(rec.pings, 1, "cut {cut}: what follows is still framed");
+            assert!(rec.calls.len() <= 3, "cut {cut}: one cut, one extra call");
+            for call in &rec.calls {
+                assert!(!call.1.is_empty(), "cut {cut}: a piece is never empty");
+                assert_eq!(call.2, call.1.len(), "cut {cut}: each accounts for itself");
+            }
+            let ends: Vec<bool> = rec.calls.iter().map(|call| call.3).collect();
+            assert_eq!(
+                ends.iter().filter(|end| **end).count(),
+                1,
+                "cut {cut}: END_STREAM once"
+            );
+            assert_eq!(ends.last(), Some(&true), "cut {cut}: and on the last piece");
+        }
+    }
+
+    /// The worst a peer or a network can do to the framing.
+    #[test]
+    fn a_data_frame_fed_a_byte_at_a_time_adds_up() {
+        let payload = body(64);
+        let mut input = Vec::new();
+        push_frame(&mut input, DATA, END_STREAM, 3, &payload);
+        push_frame(&mut input, PING, 0, 0, &[7; 8]);
+
+        let mut rec = DataRecorder::default();
+        let mut decoder = FrameDecoder::client();
+        for byte in &input {
+            decoder.decode_with(std::slice::from_ref(byte), &mut rec);
+        }
+
+        assert_eq!(rec.errors, []);
+        assert_eq!(rec.body(), payload);
+        assert_eq!(rec.calls.iter().map(|call| call.2).sum::<usize>(), 64);
+        assert_eq!(rec.calls.iter().filter(|call| call.3).count(), 1);
+        assert_eq!((rec.data_frames, rec.pings), (1, 1));
+    }
+
+    /// Padding is at the far end of the frame, so a padded one is still
+    /// gathered whole: one call, the body alone, flow control for all of it.
+    #[test]
+    fn a_padded_data_frame_is_still_delivered_whole() {
+        let mut framed = vec![4u8];
+        framed.extend_from_slice(&body(20));
+        framed.extend_from_slice(&[0; 4]);
+        let mut input = Vec::new();
+        push_frame(&mut input, DATA, PADDED | END_STREAM, 1, &framed);
+
+        for cut in 1..input.len() {
+            let mut rec = DataRecorder::default();
+            let mut decoder = FrameDecoder::client();
+            decoder.decode_with(&input[..cut], &mut rec);
+            decoder.decode_with(&input[cut..], &mut rec);
+
+            assert_eq!(rec.errors, [], "cut {cut}");
+            assert_eq!(rec.calls, [(1, body(20), 25, true)], "cut {cut}");
+        }
+    }
+
+    /// A frame that would be refused whole is refused before any of it lands.
+    #[test]
+    fn a_partial_data_frame_on_stream_zero_delivers_nothing() {
+        let mut input = Vec::new();
+        push_frame(&mut input, DATA, 0, 0, &body(100));
+
+        let mut rec = DataRecorder::default();
+        let mut decoder = FrameDecoder::client();
+        decoder.decode_with(&input[..50], &mut rec);
+        decoder.decode_with(&input[50..], &mut rec);
+
+        assert_eq!(
+            rec.errors,
+            [(PROTOCOL_ERROR, "DATA frame with stream ID 0")]
+        );
+        assert_eq!(rec.calls, []);
     }
 }

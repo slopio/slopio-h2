@@ -20,7 +20,7 @@ OUT="${OUT:-$ROOT/bench/results-heavy}"
 DURATION="${DURATION:-10}"
 WARMUP="${WARMUP:-3}"
 SWEEP="${SWEEP:-all}"
-RING="${RING:-64x512}"
+RING="${RING:-64x128+512}"
 mkdir -p "$OUT"
 
 for bin in "$AFTER" "$BEFORE"; do

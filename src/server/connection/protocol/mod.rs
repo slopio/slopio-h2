@@ -173,8 +173,19 @@ impl<H: Handler> Streams<H> {
             ));
         }
 
+        // Not idle and not in the map: the stream existed and is gone. If the
+        // peer closed it, or never opened it in this order, that is its fault
+        // and the connection's end (§5.1, §5.1.1). But it may be one we reset
+        // ourselves — an early response, a violation — with trailers the peer
+        // had already sent, and §5.1 has whoever sends RST_STREAM tolerate
+        // what was in flight. Those get the answer DATA in the same place
+        // gets. HPACK is already in sync: the decoder ran the block before we
+        // saw it.
         if raw <= self.last_client_stream_id {
-            return Err(Rejected::Fatal(STREAM_CLOSED, "HEADERS on closed stream"));
+            return Err(match shared.take_reset(raw) {
+                true => Rejected::Refused(STREAM_CLOSED),
+                false => Rejected::Fatal(STREAM_CLOSED, "HEADERS on closed stream"),
+            });
         }
 
         self.spend(raw);
@@ -438,7 +449,12 @@ impl<H: Handler> Protocol<H> {
     /// Kills the stream if it exists, and sends RST_STREAM either way: a
     /// REFUSED_STREAM answers an id that was never opened.
     fn reset_stream(&mut self, stream_id: StreamId, error_code: u32) {
-        self.streams.remove(stream_id.into(), &self.shared);
+        // One the peer had not finished with may still have trailers coming.
+        if let Some(stream) = self.streams.remove(stream_id.into(), &self.shared)
+            && !stream.input_ended()
+        {
+            self.shared.note_reset(stream_id.into());
+        }
         self.shared
             .write_frame(|out| encode_rst_stream(out, stream_id, error_code));
     }

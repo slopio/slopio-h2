@@ -1,0 +1,16 @@
+//! Everything that is gRPC rather than HTTP/2, in one place — so that it can
+//! become a feature, and so that nothing of HTTP/2 has to know what a message
+//! is.
+
+mod frame;
+mod input;
+mod prefix;
+mod request;
+
+pub use frame::{
+    Accumulating, CompressedGrpcFrame, DecompressError, FrameOverflow, GrpcEncoding, GrpcFrame,
+    UncompressedGrpcFrame,
+};
+pub use input::GrpcError;
+pub(crate) use input::GrpcInput;
+pub use request::GrpcFormat;

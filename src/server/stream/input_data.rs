@@ -1,28 +1,19 @@
 use crate::server::connection::{CONNECTION_RECV_WINDOW, MAX_CONCURRENT_STREAMS};
 
-/// Largest body handed to the task in one piece. Two bounds constrain it, and
-/// this value is the smaller:
-///
-/// - a body held whole must fit in its stream's receive window, since nothing
-///   is consumed until it is complete and accumulation can therefore issue no
-///   mid-body WINDOW_UPDATE;
-/// - `limit * MAX_CONCURRENT_STREAMS` must fit in the connection window, or
-///   streams accumulating at once drain it between them and all deadlock,
-///   each holding an incomplete body no handler will ever be woken for.
-pub const BUFFER_ONESHOT_LIMIT: usize = 16384;
-
-const _: () = assert!(
-    BUFFER_ONESHOT_LIMIT * MAX_CONCURRENT_STREAMS as usize <= CONNECTION_RECV_WINDOW as usize,
-    "streams accumulating at once must fit in the connection receive window"
-);
-
 /// Where a request body's bytes land. What separates the variants is the
 /// contract with the stream task, not the storage: `Capped` is delivered
 /// whole and once, the other two are drained as they fill.
 pub enum InputData {
     /// Length known and small enough to hold: allocated once, exactly, and
-    /// written at an offset since nothing consumes it before the end.
-    Capped { data: Box<[u8]> },
+    /// appended to since nothing consumes it before the end. `len` is what
+    /// was declared, which is also the capacity.
+    ///
+    /// Reserved, not zeroed. `vec![0u8; len]` writes every byte of a buffer
+    /// whose every byte is about to be written again by the body — and
+    /// writes it *now*, at HEADERS, so a peer that declares 16 KiB on each of
+    /// its streams and sends none of it had us commit and touch all of that
+    /// memory for nothing. Capacity that is never filled is never resident.
+    Capped { len: usize, data: Vec<u8> },
     /// Length known but too large to hold. `len` is what was declared — kept
     /// for the §8.1.1 check, never allocated.
     BufferedCapped { len: usize, data: Vec<u8> },
@@ -31,12 +22,46 @@ pub enum InputData {
     Uncapped { data: Vec<u8> },
 }
 
+/// A payload that would take the body past the length it declared (§8.1.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyOverflow {
+    pub declared: u64,
+    pub at: u64,
+    pub pushed: usize,
+}
+
+const _: () = assert!(
+    InputData::ONESHOT_LIMIT * MAX_CONCURRENT_STREAMS as usize <= CONNECTION_RECV_WINDOW as usize,
+    "streams accumulating at once must fit in the connection receive window"
+);
+
 impl InputData {
+    /// Largest body handed to the task in one piece. Two bounds constrain it,
+    /// and this value is the smaller:
+    ///
+    /// - a body held whole must fit in its stream's receive window, since
+    ///   nothing is consumed until it is complete and accumulation can
+    ///   therefore issue no mid-body WINDOW_UPDATE;
+    /// - `limit * MAX_CONCURRENT_STREAMS` must fit in the connection window,
+    ///   or streams accumulating at once drain it between them and all
+    ///   deadlock, each holding an incomplete body no handler will ever be
+    ///   woken for.
+    ///
+    /// This form's, and no other's: both bounds come from handing back no
+    /// credit before the end, which is this contract and not a property of
+    /// bodies. An input that credits differently has its own limit to argue.
+    pub const ONESHOT_LIMIT: usize = 16384;
+
+    /// What a drained buffer starts with. The same number as
+    /// [`ONESHOT_LIMIT`](Self::ONESHOT_LIMIT) and unrelated to it — see
+    /// [`buffered_capped`](Self::buffered_capped).
+    const DRAINED_CAPACITY: usize = 16384;
+
     /// `content_length` is the declared body length, `None` when the request
     /// declared none.
     pub fn new(content_length: Option<u64>) -> Self {
         match content_length {
-            Some(len) if len <= BUFFER_ONESHOT_LIMIT as u64 => Self::capped(len as usize),
+            Some(len) if len <= Self::ONESHOT_LIMIT as u64 => Self::capped(len as usize),
             Some(len) => Self::buffered_capped(len as usize),
             None => Self::uncapped(),
         }
@@ -44,7 +69,8 @@ impl InputData {
 
     fn capped(len: usize) -> Self {
         Self::Capped {
-            data: vec![0u8; len].into_boxed_slice(),
+            len,
+            data: Vec::with_capacity(len),
         }
     }
 
@@ -52,8 +78,7 @@ impl InputData {
         Self::Uncapped { data: Vec::new() }
     }
 
-    /// The capacity here is `BUFFER_ONESHOT_LIMIT`'s second and unrelated
-    /// job, and it is not the body's size — a drained buffer holds what one
+    /// The capacity here is not the body's size — a drained buffer holds what one
     /// turn of the connection loop delivered to *this* stream, which the
     /// handler then takes in full. The declared length would be the obvious
     /// thing to reserve instead, and it is the wrong thing: measured on 64
@@ -69,36 +94,49 @@ impl InputData {
     fn buffered_capped(len: usize) -> Self {
         Self::BufferedCapped {
             len,
-            data: Vec::with_capacity(BUFFER_ONESHOT_LIMIT),
+            data: Vec::with_capacity(Self::DRAINED_CAPACITY),
         }
     }
 
-    /// The declared body length, which only the growable forms have to carry
-    /// explicitly — for `Capped` it is the buffer itself.
+    /// The declared body length.
     pub fn expected(&self) -> Option<u64> {
         match self {
-            Self::Capped { data } => Some(data.len() as u64),
-            Self::BufferedCapped { len, .. } => Some(*len as u64),
+            Self::Capped { len, .. } | Self::BufferedCapped { len, .. } => Some(*len as u64),
             Self::Uncapped { .. } => None,
         }
     }
 
-    /// `at` is how many body bytes already landed. `Capped` needs it as a
-    /// write cursor, having been allocated to its full size up front; the
-    /// growable forms track their own end.
+    /// Appends `payload`, all of it or none of it.
     ///
-    /// The caller must have checked `at + payload.len()` against `expected`,
-    /// which is what keeps the `Capped` slicing in bounds.
-    pub fn push(&mut self, at: u64, payload: &[u8]) {
+    /// `at` is how many body bytes already landed. For `Capped` that is where
+    /// its buffer ends, nothing being consumed from it before the end; the
+    /// drained forms have given some of theirs away, so it is the only record
+    /// of how much of the declared length is spent.
+    ///
+    /// This is what decides whether it fits, and not the caller: a payload
+    /// that takes the body past its declared length is refused whole, which is
+    /// also what keeps `Capped` inside the capacity it reserved. `Uncapped`
+    /// declared nothing and refuses nothing — the receive window is its bound.
+    pub fn push(&mut self, at: u64, payload: &[u8]) -> Result<(), BodyOverflow> {
+        if let Some(declared) = self.expected()
+            && at + payload.len() as u64 > declared
+        {
+            return Err(BodyOverflow {
+                declared,
+                at,
+                pushed: payload.len(),
+            });
+        }
         match self {
-            Self::Capped { data } => {
-                let at = at as usize;
-                data[at..at + payload.len()].copy_from_slice(payload);
+            Self::Capped { data, .. } => {
+                debug_assert_eq!(at as usize, data.len());
+                data.extend_from_slice(payload);
             }
             Self::BufferedCapped { data, .. } | Self::Uncapped { data } => {
                 data.extend_from_slice(payload);
             }
         }
+        Ok(())
     }
 
     /// A body held whole is only useful complete, so its task is woken once.
@@ -138,8 +176,55 @@ impl InputData {
     /// The whole body, for the form that is delivered in one piece.
     pub fn into_oneshot(self) -> Option<Box<[u8]>> {
         match self {
-            Self::Capped { data } => Some(data),
+            // Full by the time anyone asks — the stream checked the body
+            // against `len` at END_STREAM — so length is capacity and this
+            // moves the allocation rather than copying it.
+            Self::Capped { data, .. } => Some(data.into_boxed_slice()),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Whether a payload fits is `push`'s to say, for the form held whole —
+    /// and refused means nothing was written, so the capacity it reserved is
+    /// never outgrown.
+    #[test]
+    fn a_held_body_refuses_what_takes_it_past_its_declared_length() {
+        let mut body = InputData::new(Some(4));
+        assert_eq!(body.push(0, b"ab"), Ok(()));
+        assert_eq!(
+            body.push(2, b"cde"),
+            Err(BodyOverflow {
+                declared: 4,
+                at: 2,
+                pushed: 3
+            })
+        );
+        assert_eq!(body.push(2, b"cd"), Ok(()));
+        assert_eq!(body.into_oneshot().as_deref(), Some(&b"abcd"[..]));
+    }
+
+    /// The drained form has given bytes away, so `at` is the only record of
+    /// how much of the declared length is spent.
+    #[test]
+    fn a_drained_body_counts_what_it_has_already_handed_over() {
+        let declared = InputData::ONESHOT_LIMIT as u64 + 10;
+        let mut body = InputData::new(Some(declared));
+        assert_eq!(body.push(0, &[0; 100]), Ok(()));
+        body.consume(100);
+
+        assert!(body.push(declared - 5, &[0; 6]).is_err());
+        assert_eq!(body.available().len(), 0, "nothing of it was taken");
+        assert_eq!(body.push(declared - 5, &[0; 5]), Ok(()));
+    }
+
+    #[test]
+    fn a_body_that_declared_nothing_refuses_nothing() {
+        let mut body = InputData::new(None);
+        assert_eq!(body.push(0, &[0; 70_000]), Ok(()));
     }
 }

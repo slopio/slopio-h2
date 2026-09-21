@@ -11,6 +11,7 @@
 //! `client`.
 
 use std::cell::{Cell, RefCell, UnsafeCell};
+use std::collections::VecDeque;
 use std::task::{Poll, Waker};
 
 use http::HeaderName;
@@ -19,6 +20,7 @@ use crate::shared::codec::frames::{
     encode::{encode_data_header, encode_header_block, encode_window_update},
     stream_id::StreamId,
 };
+use crate::shared::connection::STREAM_ID;
 use crate::shared::connection::output::Output;
 use crate::shared::hpack::{Encoder, Header};
 
@@ -26,6 +28,10 @@ use crate::shared::hpack::{Encoder, Header};
 /// moves them — only a WINDOW_UPDATE on stream 0 does. An end that wants more
 /// announces the gap itself.
 pub const CONNECTION_INITIAL_WINDOW_SIZE: u32 = 65_535;
+
+/// How many of its own resets a connection remembers. As many as it has
+/// streams: more than that cannot have been reset within one round trip.
+const RESETS_REMEMBERED: usize = 64;
 
 /// What writing a body needs of a stream, whichever end of the connection the
 /// stream belongs to.
@@ -179,6 +185,17 @@ pub struct SharedConnection {
     encoder: UnsafeCell<Encoder>,
     /// The peer's SETTINGS_MAX_FRAME_SIZE: the largest payload we may emit.
     max_frame_size: Cell<u32>,
+    /// Streams we reset while the peer's half was still open, most recent
+    /// last. §5.1: whoever sends RST_STREAM has to tolerate what the peer had
+    /// in flight, and a HEADERS frame — trailers — is the one such frame that
+    /// is a connection error on any *other* closed stream. This is the record
+    /// that tells the two apart.
+    ///
+    /// Here rather than with the streams because one of the resets is a
+    /// stream task's own, on its way out, and this is what it can reach.
+    /// Bounded: what is in flight is a round trip's worth, and an id that
+    /// falls off the front is one the peer has long since heard about.
+    reset_by_us: RefCell<VecDeque<STREAM_ID>>,
     /// Shared because a stream has to read it before writing: §6.9.1 debits a
     /// DATA frame against this window as well as its stream's, so neither side
     /// alone says whether a write can go out.
@@ -247,6 +264,7 @@ impl SharedConnection {
             // is there for.
             encoder: UnsafeCell::new(Encoder::new(header_table_size as usize, 0)),
             max_frame_size: Cell::new(max_frame_size),
+            reset_by_us: RefCell::new(VecDeque::new()),
             // §6.9.2: both halves start at 65535 and SETTINGS never moves
             // them. The gap up to `recv_window` is announced by a
             // WINDOW_UPDATE on stream 0, by whoever opens the connection.
@@ -405,6 +423,28 @@ impl SharedConnection {
                 }
             }
         })
+    }
+
+    /// Records a stream as reset by this end with the peer's half still open.
+    pub fn note_reset(&self, id: STREAM_ID) {
+        let mut resets = self.reset_by_us.borrow_mut();
+        if resets.len() == RESETS_REMEMBERED {
+            resets.pop_front();
+        }
+        resets.push_back(id);
+    }
+
+    /// Whether `id` is a stream this end reset, forgetting it if so: asked
+    /// for a HEADERS frame, which is the last thing the peer sends on it.
+    pub fn take_reset(&self, id: STREAM_ID) -> bool {
+        let mut resets = self.reset_by_us.borrow_mut();
+        match resets.iter().position(|reset| *reset == id) {
+            Some(at) => {
+                resets.remove(at);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Hands the peer back connection-level credit, writing the

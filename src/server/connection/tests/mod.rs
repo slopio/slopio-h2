@@ -45,7 +45,7 @@ use crate::shared::transport::PlainMessages;
 // 16 KiB buffers, as the server uses. Four of them: the loop recycles each
 // chunk as soon as it is decoded, so depth only has to cover what is in
 // flight at once.
-runtime_core::define_buf_ring!(TestRing, bgid = 7, buffer_size = 16384, ring_size = 4);
+runtime_core::define_buf_ring!(TestRing, bgid = 2, buffer_size = 16384, ring_size = 4);
 
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
@@ -68,9 +68,9 @@ async fn echo(stream: crate::server::Stream) {
         total
     };
 
-    stream.respond(http::StatusCode::OK, &http::HeaderMap::new(), false);
+    stream.write_headers(http::StatusCode::OK, &http::HeaderMap::new());
     let body = format!("read {received} bytes\n");
-    stream.write(body.as_bytes(), true).await;
+    stream.write_data_final(body.as_bytes()).await;
 }
 
 const DATA: u8 = 0x0;
@@ -244,6 +244,95 @@ fn a_handler_that_answers_nothing_still_ends_the_stream() {
     );
     // §8.1: and it ends the message, so the peer stops waiting.
     assert_eq!(head.flags & FLAG_END_STREAM, FLAG_END_STREAM);
+}
+
+/// §8.1: a response that ends with a trailer section — head, body, and a last
+/// HEADERS carrying END_STREAM and no pseudo-header. What a gRPC response is.
+#[test]
+fn a_response_can_end_with_trailers() {
+    let written = run_connection_with(
+        deliveries(&a_get()).into_iter().map(Into::into).collect(),
+        |_, _| {},
+        |stream: crate::server::Stream| async move {
+            stream.write_headers(http::StatusCode::OK, &http::HeaderMap::new());
+            stream.write_data(b"a message").await;
+
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+            stream.write_trailers(&trailers);
+        },
+    );
+
+    let ours: Vec<&Frame> = written.iter().filter(|f| f.stream_id == 1).collect();
+    let kinds: Vec<u8> = ours.iter().map(|f| f.kind).collect();
+    assert_eq!(
+        kinds,
+        [HEADERS, DATA, HEADERS],
+        "head, body, trailers — once"
+    );
+
+    let (head, body, trailers) = (ours[0], ours[1], ours[2]);
+    assert_eq!(head.flags & FLAG_END_STREAM, 0);
+    assert_eq!(body.payload, b"a message");
+    assert_eq!(body.flags & FLAG_END_STREAM, 0, "the body does not end it");
+
+    assert_eq!(
+        trailers.flags & (FLAG_END_STREAM | FLAG_END_HEADERS),
+        FLAG_END_STREAM | FLAG_END_HEADERS,
+        "the trailers do"
+    );
+    let fields = decode_block(&trailers.payload);
+    assert_eq!(fields.get("grpc-status").map(String::as_str), Some("0"));
+    assert!(!fields.contains_key(":status"), "§8.1: no pseudo-header");
+}
+
+/// Trailers the peer has had no head for are a malformed response, so they
+/// are not written — and a handler that did nothing else has answered nothing.
+#[test]
+fn trailers_without_a_head_are_not_a_response() {
+    let written = run_connection_with(
+        deliveries(&a_get()).into_iter().map(Into::into).collect(),
+        |_, _| {},
+        |stream: crate::server::Stream| async move {
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+            stream.write_trailers(&trailers);
+        },
+    );
+
+    let ours: Vec<&Frame> = written.iter().filter(|f| f.stream_id == 1).collect();
+    assert_eq!(ours.len(), 1);
+    assert_eq!(
+        decode_block(&ours[0].payload)
+            .get(":status")
+            .map(String::as_str),
+        Some("500")
+    );
+}
+
+/// The other way to leave a peer waiting: a head, some body, and a handler
+/// that returns before its END_STREAM — between the last `write_data` and the
+/// trailers, say. The stream is reset rather than finished on its behalf,
+/// since ending it cleanly would pass a truncated response off as a whole one.
+#[test]
+fn a_response_left_unfinished_is_reset() {
+    let written = run_connection_with(
+        deliveries(&a_get()).into_iter().map(Into::into).collect(),
+        |_, _| {},
+        |stream: crate::server::Stream| async move {
+            stream.write_headers(http::StatusCode::OK, &http::HeaderMap::new());
+            stream.write_data(b"half of it").await;
+        },
+    );
+
+    let ours: Vec<&Frame> = written.iter().filter(|f| f.stream_id == 1).collect();
+    let kinds: Vec<u8> = ours.iter().map(|f| f.kind).collect();
+    assert_eq!(kinds, [HEADERS, DATA, RST_STREAM]);
+    assert!(ours.iter().all(|f| f.flags & FLAG_END_STREAM == 0));
+    assert_eq!(
+        u32::from_be_bytes(ours[2].payload[..4].try_into().unwrap()),
+        crate::shared::codec::types::INTERNAL_ERROR
+    );
 }
 
 /// Cuts a byte stream into deliveries the ring's buffers can hold.

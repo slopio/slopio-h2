@@ -56,7 +56,7 @@ fn a_slow_handler_is_not_a_starved_body() {
         |_, _| {},
         |stream: crate::server::Stream| async move {
             Sleep::during(Duration::from_secs(8)).await;
-            stream.respond(http::StatusCode::OK, &http::HeaderMap::new(), true);
+            stream.write_headers_final(http::StatusCode::OK, &http::HeaderMap::new());
         },
     );
 
@@ -96,7 +96,7 @@ fn a_finished_body_is_not_judged_on_its_rate() {
                 stream.consume(taken);
             }
             Sleep::during(Duration::from_secs(8)).await;
-            stream.respond(http::StatusCode::OK, &http::HeaderMap::new(), true);
+            stream.write_headers_final(http::StatusCode::OK, &http::HeaderMap::new());
         },
     );
 
@@ -132,10 +132,10 @@ fn a_response_paced_by_its_handler_is_not_a_starved_one() {
         inbound,
         |_, _| {},
         |stream: crate::server::Stream| async move {
-            stream.respond(http::StatusCode::OK, &http::HeaderMap::new(), false);
-            stream.write(b"event: one\n\n", false).await;
+            stream.write_headers(http::StatusCode::OK, &http::HeaderMap::new());
+            stream.write_data(b"event: one\n\n").await;
             Sleep::during(Duration::from_secs(8)).await;
-            stream.write(b"event: two\n\n", true).await;
+            stream.write_data_final(b"event: two\n\n").await;
         },
     );
 
@@ -213,7 +213,7 @@ fn a_peer_with_no_hpack_table_is_not_sent_indexed_fields() {
         |stream: crate::server::Stream| async move {
             let mut fields = http::HeaderMap::new();
             fields.insert("x-request-tag", "the-same-value-twice".parse().unwrap());
-            stream.respond(http::StatusCode::OK, &fields, true);
+            stream.write_headers_final(http::StatusCode::OK, &fields);
         },
     );
 
@@ -271,12 +271,11 @@ fn a_body_in_flight_behind_a_malformed_request_does_not_end_the_connection() {
 
 /// A handler that answers before the upload is over — a `401`, a `413` — and
 /// returns. §8.1 lets the server follow a complete response with
-/// RST_STREAM(NO_ERROR) to stop the body; short of that, the bytes still
-/// arriving have to be discarded and their credit handed back. Doing neither
-/// leaves an honest peer parked on a stream window nobody will ever reopen,
-/// holding one of `MAX_CONCURRENT_STREAMS` until `body_is_starving` blames it.
+/// RST_STREAM(NO_ERROR) to stop the body, and the stream's token does, on its
+/// way out. Without it an honest peer is left parked on a stream window nobody
+/// will ever reopen, holding one of `MAX_CONCURRENT_STREAMS` until
+/// `body_is_starving` blames it.
 #[test]
-#[ignore = "known gap: nothing drains or resets a stream whose handler left before the body ended"]
 fn an_early_response_does_not_strand_the_upload() {
     let mut bytes = preface();
     bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, GET_BLOCK));
@@ -293,16 +292,114 @@ fn an_early_response_does_not_strand_the_upload() {
         inbound,
         |_, _| {},
         |stream: crate::server::Stream| async move {
-            stream.respond(http::StatusCode::UNAUTHORIZED, &http::HeaderMap::new(), true);
+            stream.write_headers_final(http::StatusCode::UNAUTHORIZED, &http::HeaderMap::new());
         },
     );
 
-    let stopped = written.iter().any(|f| f.kind == RST_STREAM && f.stream_id == 1);
-    let reopened = written
+    let reset = written
         .iter()
-        .any(|f| f.kind == super::WINDOW_UPDATE && f.stream_id == 1);
+        .find(|f| f.kind == RST_STREAM && f.stream_id == 1)
+        .unwrap_or_else(|| panic!("60 KB into a 64 KB window, and the peer was told nothing: {written:?}"));
+    assert_eq!(
+        u32::from_be_bytes(reset.payload[..4].try_into().unwrap()),
+        crate::shared::codec::types::NO_ERROR,
+        "the response was complete: nothing went wrong"
+    );
     assert!(
-        stopped || reopened,
-        "60 KB into a 64 KB window, and the peer was told nothing: {written:?}"
+        !written.iter().any(|f| f.kind == GOAWAY),
+        "the body still in flight is a race, not a fault: {written:?}"
+    );
+}
+
+/// §5.1: whoever sends RST_STREAM tolerates what the peer had in flight. A
+/// handler that answers early has its stream reset on the way out, and
+/// trailers the peer sent before it could have seen that land on an id that
+/// is gone — which is a race, and used to cost every stream on the connection.
+#[test]
+fn trailers_in_flight_after_an_early_response_do_not_end_the_connection() {
+    let mut first = preface();
+    first.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, GET_BLOCK));
+    first.extend_from_slice(&frame(DATA, 0, 1, b"some of the body"));
+
+    // `x: y`, as a literal without indexing.
+    let mut later = frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &[0x00, 1, b'x', 1, b'y'],
+    );
+    later.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        3,
+        GET_BLOCK,
+    ));
+
+    let inbound: Vec<Scripted> = vec![
+        ReadEvent::Data(first).into(),
+        ReadEvent::Data(later).after(Duration::from_millis(50)),
+        ReadEvent::Eof.after(Duration::from_secs(1)),
+    ];
+    let written = run_connection_with(
+        inbound,
+        |_, _| {},
+        |stream: crate::server::Stream| async move {
+            stream.write_headers_final(http::StatusCode::UNAUTHORIZED, &http::HeaderMap::new());
+        },
+    );
+
+    assert!(
+        !written.iter().any(|f| f.kind == GOAWAY),
+        "trailers that raced our reset are not a protocol error: {:?}",
+        written.iter().find(|f| f.kind == GOAWAY)
+    );
+    assert!(
+        written.iter().any(|f| f.kind == HEADERS && f.stream_id == 3),
+        "and the next request was served: {written:?}"
+    );
+}
+
+/// A gRPC call that ends on its HEADERS has no message, and is still a gRPC
+/// call: the handler has to know, to answer with a `grpc-status` and not as
+/// the HTTP request it would otherwise take it for.
+#[cfg(feature = "grpc")]
+#[test]
+fn a_grpc_call_with_no_body_is_still_grpc() {
+    // `:method POST`, `:scheme http`, `:path /`, then `content-type` as a
+    // literal on the static table's name (index 31).
+    let mut block = vec![0x83, 0x86, 0x84, 0x0f, 0x10, 21];
+    block.extend_from_slice(b"application/grpc+json");
+
+    let mut bytes = preface();
+    bytes.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &block,
+    ));
+
+    let written = run_connection_with(
+        deliveries(&bytes).into_iter().map(Into::into).collect(),
+        |_, _| {},
+        |stream: crate::server::Stream| async move {
+            assert!(stream.is_grpc());
+            assert_eq!(stream.grpc_format(), Some(crate::grpc::GrpcFormat::Json));
+            assert!(stream.message().await.is_none(), "half-closed, nothing sent");
+
+            let mut fields = http::HeaderMap::new();
+            fields.insert("grpc-status", http::HeaderValue::from_static("13"));
+            stream.write_headers_final(http::StatusCode::OK, &fields);
+        },
+    );
+
+    let head = written
+        .iter()
+        .find(|f| f.kind == HEADERS && f.stream_id == 1)
+        .expect("answered");
+    assert_eq!(
+        super::decode_block(&head.payload)
+            .get("grpc-status")
+            .map(String::as_str),
+        Some("13")
     );
 }
