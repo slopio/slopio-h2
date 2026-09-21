@@ -114,6 +114,32 @@ impl GrpcFrame {
                 Self::Uncompressed(frame) => frame.bytes.len(),
             }
     }
+
+    /// The message, decoded as protobuf — for the handler that takes every
+    /// message the same way and would rather not match.
+    ///
+    /// The two things matching would have told it are the two errors it can
+    /// answer instead: a frame still compressed, and a request whose
+    /// `content-type` named something other than protobuf.
+    pub fn decode<M: prost::Message + Default>(&self) -> Result<M, MessageError> {
+        match self {
+            Self::Uncompressed(frame) => frame.decode(),
+            Self::Compressed(frame) => Err(MessageError::Compressed(frame.encoding)),
+        }
+    }
+}
+
+/// Why a whole message is not the message the handler asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MessageError {
+    /// Still in the encoding `grpc-encoding` named: decompress it first.
+    /// INTERNAL, or UNIMPLEMENTED if this end cannot.
+    Compressed(GrpcEncoding),
+    /// The request's `content-type` named a format that is not protobuf, so
+    /// its bytes are not protobuf either. INTERNAL.
+    NotProto(GrpcFormat),
+    /// Protobuf, and not the message that was asked for. INVALID_ARGUMENT.
+    Decode(prost::DecodeError),
 }
 
 /// A whole message, still in the encoding the request's `grpc-encoding` named.
@@ -166,6 +192,24 @@ impl TryFrom<CompressedGrpcFrame> for UncompressedGrpcFrame {
 impl UncompressedGrpcFrame {
     pub fn format(&self) -> GrpcFormat {
         self.format
+    }
+
+    /// The message, decoded as protobuf into whatever the caller derived
+    /// `Message` on.
+    ///
+    /// Zero bytes is not an absence: proto3 writes nothing for a field at its
+    /// default, so a value whose fields are all default encodes to nothing and
+    /// decodes back from nothing. `HealthCheckRequest { service: "" }` — the
+    /// whole-server health probe — is that message and five bytes on the wire.
+    ///
+    /// Refused unless the request's `content-type` said protobuf: `+json` is
+    /// someone else's bytes, and `prost` would read them as a malformed
+    /// message rather than as JSON.
+    pub fn decode<M: prost::Message + Default>(&self) -> Result<M, MessageError> {
+        if self.format != GrpcFormat::Proto {
+            return Err(MessageError::NotProto(self.format));
+        }
+        M::decode(&*self.bytes).map_err(MessageError::Decode)
     }
 
     pub fn data(&self) -> &[u8] {
@@ -238,6 +282,81 @@ mod tests {
     fn an_empty_frame_finishes_at_once() {
         let frame = Accumulating::new(0, None, GrpcFormat::Proto).finish().ok().unwrap();
         assert!(data_of(frame).is_empty());
+    }
+
+    /// `grpc.health.v1.HealthCheckRequest`, the one every probe sends.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct HealthCheckRequest {
+        #[prost(string, tag = "1")]
+        service: String,
+    }
+
+    fn uncompressed(format: GrpcFormat, bytes: &[u8]) -> UncompressedGrpcFrame {
+        let mut frame = Accumulating::new(bytes.len(), None, format);
+        frame.push(bytes).unwrap();
+        match frame.finish().ok().unwrap() {
+            GrpcFrame::Uncompressed(frame) => frame,
+            GrpcFrame::Compressed(_) => unreachable!("no encoding"),
+        }
+    }
+
+    #[test]
+    fn a_message_decodes_into_what_the_caller_derived() {
+        // Field 1, length-delimited, two bytes: `service = "db"`.
+        let frame = uncompressed(GrpcFormat::Proto, &[0x0A, 0x02, b'd', b'b']);
+        assert_eq!(
+            frame.decode::<HealthCheckRequest>(),
+            Ok(HealthCheckRequest {
+                service: "db".into()
+            })
+        );
+    }
+
+    /// The whole-server health probe: proto3 writes nothing for a field at its
+    /// default, so the request is five bytes of prefix and no content — and it
+    /// decodes back into the value that produced it.
+    #[test]
+    fn a_message_of_no_bytes_decodes_into_one_of_all_defaults() {
+        let frame = uncompressed(GrpcFormat::Proto, b"");
+        assert_eq!(
+            frame.decode::<HealthCheckRequest>(),
+            Ok(HealthCheckRequest {
+                service: String::new()
+            })
+        );
+    }
+
+    #[test]
+    fn json_bytes_are_not_offered_to_protobuf() {
+        let frame = uncompressed(GrpcFormat::Json, br#"{"service":"db"}"#);
+        assert_eq!(
+            frame.decode::<HealthCheckRequest>(),
+            Err(MessageError::NotProto(GrpcFormat::Json))
+        );
+    }
+
+    #[test]
+    fn bytes_that_are_not_the_message_asked_for_are_an_error() {
+        // Field 1 as a varint, where the message declares a string.
+        let frame = uncompressed(GrpcFormat::Proto, &[0x08, 0x2A]);
+        assert!(matches!(
+            frame.decode::<HealthCheckRequest>(),
+            Err(MessageError::Decode(_))
+        ));
+    }
+
+    /// The handler that does not match takes the same two facts as errors.
+    #[test]
+    fn decoding_through_the_enum_answers_for_a_compressed_frame() {
+        let mut frame = Accumulating::new(2, Some(GrpcEncoding::Gzip), GrpcFormat::Proto);
+        frame.push(b"zz").unwrap();
+        assert_eq!(
+            frame.finish().ok().unwrap().decode::<HealthCheckRequest>(),
+            Err(MessageError::Compressed(GrpcEncoding::Gzip))
+        );
+
+        let whole = GrpcFrame::Uncompressed(uncompressed(GrpcFormat::Proto, b""));
+        assert!(whole.decode::<HealthCheckRequest>().is_ok());
     }
 
     #[test]

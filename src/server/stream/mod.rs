@@ -847,7 +847,14 @@ impl Stream {
     #[cfg(feature = "grpc")]
     pub async fn message(&self) -> Option<Result<GrpcFrame, GrpcError>> {
         let taken = self.state().message().await;
-        if let Some(Ok(frame)) = &taken {
+        // Nothing to credit a peer that has finished sending, and a unary
+        // call — most calls — is one message and a half-close, so the frame
+        // would go out on every one of them for nothing. What the message
+        // held of the connection window goes back where an HTTP body's does,
+        // when the stream retires.
+        if let Some(Ok(frame)) = &taken
+            && !self.state().input_ended()
+        {
             self.token
                 .shared()
                 .release_message(self.id(), self.state(), frame.wire_len() as u32);
@@ -912,6 +919,29 @@ impl Stream {
             .shared()
             .write_data(self.id(), self.state(), data, false)
             .await;
+    }
+
+    /// Writes one gRPC message: its five-byte prefix, then the message
+    /// encoded as protobuf.
+    ///
+    /// No `_final` to go with it, and none is missing. A gRPC response ends
+    /// with its trailers and never with END_STREAM on a DATA frame, so every
+    /// message a handler writes has something after it —
+    /// [`write_trailers`](Self::write_trailers) at the very least, carrying
+    /// the `grpc-status`.
+    ///
+    /// Protobuf, whatever the request's [`grpc_format`](Self::grpc_format)
+    /// said, and unlike [`decode`] this does not refuse: those are the
+    /// handler's own bytes and it picked the method, where a request's bytes
+    /// are the peer's and reading them as the wrong thing is a correctness
+    /// question. Serving `+json` means framing it with
+    /// [`write_data`](Self::write_data) instead — `grpc::frame_message` is
+    /// what this one uses.
+    ///
+    /// [`decode`]: crate::grpc::UncompressedGrpcFrame::decode
+    #[cfg(feature = "grpc")]
+    pub async fn write_message<M: prost::Message>(&self, message: &M) {
+        self.write_data(&crate::grpc::frame_message(message)).await;
     }
 
     /// Writes the last of the response body, END_STREAM on its last frame.

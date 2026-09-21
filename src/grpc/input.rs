@@ -178,7 +178,11 @@ impl GrpcInput {
                 declared: read.length,
             });
         }
-        Ok(Accumulating::new(read.length as usize, encoding, self.format))
+        Ok(Accumulating::new(
+            read.length as usize,
+            encoding,
+            self.format,
+        ))
     }
 
     /// The peer's END_STREAM. It has to fall between two messages: there is

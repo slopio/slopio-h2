@@ -29,6 +29,8 @@
 
 mod cve;
 mod dst;
+#[cfg(feature = "grpc")]
+mod grpc;
 mod logic;
 
 use std::time::Duration;
