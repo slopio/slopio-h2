@@ -73,58 +73,68 @@ fn scripted(bytes: &[u8]) -> Vec<Scripted> {
     ]
 }
 
-/// What a gRPC stream is granted when it opens, so that one message may be
-/// larger than §6.9.2's starting window.
-fn opening_grant() -> u32 {
-    (crate::grpc::GrpcInput::MESSAGE_LIMIT + 5) as u32 - 65_535
-}
-
-/// The response, without that grant: it leads every gRPC stream and says
-/// nothing about what the handler did.
 fn on_stream_1(written: &[Frame]) -> Vec<&Frame> {
-    let mut ours: Vec<&Frame> = written.iter().filter(|f| f.stream_id == 1).collect();
-    if let Some(first) = ours.first()
-        && first.kind == WINDOW_UPDATE
-        && u32::from_be_bytes(first.payload[..4].try_into().unwrap()) == opening_grant()
-    {
-        ours.remove(0);
+    written.iter().filter(|f| f.stream_id == 1).collect()
+}
+
+/// A message larger than the stream's window flows through it: the bytes of
+/// a message being assembled are consumed as they land, so the credit goes
+/// back before the message is whole, and the peer is never short of window
+/// for the one it is sending. Here, a message of three windows, sent as the
+/// peer would: one window, wait for credit, the next.
+#[test]
+fn a_message_larger_than_the_window_is_credited_as_it_fills() {
+    const WINDOW: usize = 65_535;
+    let request = HealthCheckRequest {
+        service: "a".repeat(3 * WINDOW),
     }
-    ours
-}
+    .encode_to_vec();
+    let body = framed(&request);
+    assert!(body.len() > 3 * WINDOW);
 
-/// A gRPC stream is told up front that it may send a whole message, its unit
-/// of delivery not fitting in the 65535 every stream starts with.
-#[test]
-fn a_grpc_stream_is_granted_room_for_one_whole_message() {
-    let mut bytes = opening();
-    bytes.extend_from_slice(&frame(DATA, FLAG_END_STREAM, 1, &framed(&[])));
+    // Each round is what fits in the window the peer has at that point, sent
+    // as frames under max_frame_size — one read event each, the fake ring's
+    // buffers being 16 KiB. The next round comes after a delay, by which time
+    // the credit for the previous has gone out.
+    let mut events = vec![ReadEvent::Data(opening()).into()];
+    let mut at = 0;
+    let mut wait = Duration::ZERO;
+    while at < body.len() {
+        let end = (at + WINDOW).min(body.len());
+        for piece in body[at..end].chunks(16_000) {
+            events.push(ReadEvent::Data(frame(DATA, 0, 1, piece)).after(wait));
+            wait = Duration::ZERO;
+        }
+        wait = Duration::from_millis(20);
+        at = end;
+    }
+    events.push(ReadEvent::Data(frame(DATA, FLAG_END_STREAM, 1, &[])).after(wait));
+    events.push(ReadEvent::Eof.after(Duration::from_secs(1)));
 
-    let written = run_connection_with(scripted(&bytes), |_, _| {}, service(answers_at_once, not_grpc));
+    let expected = request.clone();
+    let written = run_connection_with(events, |_, _| {}, move |stream: Stream| {
+        let expected = expected.clone();
+        async move {
+            let frame = stream.message().await.expect("a message").expect("well formed");
+            let decoded: HealthCheckRequest = frame.decode().unwrap();
+            assert_eq!(decoded.encode_to_vec(), expected);
+            stream.write_headers_final(http::StatusCode::OK, &http::HeaderMap::new());
+        }
+    });
 
-    let first = written
+    let credited: u32 = written
         .iter()
-        .find(|f| f.stream_id == 1)
-        .expect("something on the stream");
-    assert_eq!(first.kind, WINDOW_UPDATE, "before anything else: {written:?}");
-    assert_eq!(
-        u32::from_be_bytes(first.payload[..4].try_into().unwrap()),
-        opening_grant()
-    );
-}
-
-/// An HTTP request asks for nothing of the sort: its body is drained as it
-/// arrives, so the starting window is all it ever needs.
-#[test]
-fn an_http_stream_is_granted_nothing() {
-    let mut bytes = PREFACE.to_vec();
-    bytes.extend_from_slice(&frame(SETTINGS, 0, 0, &[]));
-    bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, &grpc_block(b"text/plain")));
-    bytes.extend_from_slice(&frame(DATA, FLAG_END_STREAM, 1, b"hello"));
-
-    let written = run_connection_with(scripted(&bytes), |_, _| {}, service(answers_at_once, not_grpc));
+        .filter(|f| f.kind == WINDOW_UPDATE && f.stream_id == 1)
+        .map(|f| u32::from_be_bytes(f.payload[..4].try_into().unwrap()))
+        .sum();
     assert!(
-        !written.iter().any(|f| f.kind == WINDOW_UPDATE && f.stream_id == 1),
-        "{written:?}"
+        credited as usize >= body.len() - WINDOW,
+        "credited {credited} of {}: the peer must have had window for all of it — {written:?}",
+        body.len()
+    );
+    assert!(
+        !written.iter().any(|f| f.kind == GOAWAY),
+        "no flow control error: {written:?}"
     );
 }
 
@@ -189,13 +199,9 @@ fn a_unary_call_is_read_decoded_and_answered() {
     // END_STREAM came with it, and a peer that has finished sending has no
     // use for a window. A unary call is most calls, and this is the frame it
     // does not pay for.
-    assert_eq!(
-        written
-            .iter()
-            .filter(|f| f.kind == WINDOW_UPDATE && f.stream_id == 1)
-            .count(),
-        1,
-        "the opening grant and nothing after it: {written:?}"
+    assert!(
+        !written.iter().any(|f| f.kind == WINDOW_UPDATE && f.stream_id == 1),
+        "nothing left to credit: {written:?}"
     );
 
     assert_eq!(
@@ -481,7 +487,6 @@ fn a_peer_still_sending_is_credited_for_each_message_it_takes() {
         .iter()
         .filter(|f| f.kind == WINDOW_UPDATE && f.stream_id == 1)
         .map(|f| u32::from_be_bytes(f.payload[..4].try_into().unwrap()))
-        .skip(1)
         .collect();
     assert_eq!(
         credits,

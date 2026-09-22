@@ -203,14 +203,6 @@ impl<H: Handler> Streams<H> {
         }
 
         let stream = Rc::new(StreamState::create(settings, headers).map_err(Rejected::Violation)?);
-
-        // §6.9.2 starts every stream at 65535, which suits a body drained as
-        // it arrives and not one delivered a whole unit at a time. The stream
-        // says what it needs; what that is, is its business.
-        if let Some(more) = stream.window_wanted() {
-            shared.write_frame(|out| encode_window_update(out, id, more));
-        }
-
         let token = StreamToken::new(
             id,
             Rc::clone(&stream),
@@ -260,7 +252,7 @@ impl<H: Handler> Streams<H> {
         payload: &[u8],
         padded_len: u32,
         end_stream: bool,
-    ) -> Result<(), Rejected> {
+    ) -> Result<u32, Rejected> {
         // §5.1: an idle stream only accepts HEADERS and PRIORITY.
         if id > self.last_client_stream_id {
             return Err(Rejected::Fatal(PROTOCOL_ERROR, "DATA on idle stream"));
@@ -591,19 +583,22 @@ impl<H: Handler> FrameHandler for Protocol<H> {
         // application, so it is spent the moment it lands; on a frame we drop,
         // all of it is. Either way it goes back now — release only what a
         // handler consumes and the window shrinks by the padding for good,
-        // until the connection stalls with nothing to show for it.
-        self.shared.release_stream_credit(match received {
-            Ok(()) => padded_len - payload.len() as u32,
-            Err(_) => padded_len,
-        });
-
-        // The same padding was debited from the stream's window, and the
-        // handler's `consume` only ever returns payload. Not worth a frame on
-        // a stream the peer has just finished with.
+        // until the connection stalls with nothing to show for it. Payload the
+        // stream consumed on the spot — a gRPC message filling — goes back
+        // with it.
         let padding = padded_len - payload.len() as u32;
-        if received.is_ok() && !end_stream && padding > 0 {
+        let spent = match received {
+            Ok(consumed) => padding + consumed,
+            Err(_) => padded_len,
+        };
+        self.shared.release_stream_credit(spent);
+
+        // The same bytes were debited from the stream's window, and the
+        // handler's `consume` only ever returns what it took. Not worth a
+        // frame on a stream the peer has just finished with.
+        if received.is_ok() && !end_stream && spent > 0 {
             if let Some(stream) = self.streams.streams.get(raw)
-                && let Some(increment) = stream.release_recv(padding)
+                && let Some(increment) = stream.release_recv(spent)
             {
                 self.shared
                     .write_frame(|out| encode_window_update(out, stream_id, increment));

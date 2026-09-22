@@ -432,29 +432,6 @@ impl StreamState {
         self.no_more_output.set(true);
     }
 
-    /// Receive window this stream wants beyond §6.9.2's 65535, `None` for one
-    /// that is content with it.
-    ///
-    /// Asked once, when the stream opens, and answered by what its body is: an
-    /// HTTP body is drained as it arrives and never needs more, a gRPC one is
-    /// delivered a whole message at a time and cannot take a message larger
-    /// than the window in one go.
-    ///
-    /// Reported rather than acted on, the stream having no way to write a
-    /// frame. Whoever asks must write the WINDOW_UPDATE it is handed.
-    #[must_use]
-    pub fn window_wanted(&self) -> Option<u32> {
-        #[cfg(feature = "grpc")]
-        if matches!(*self.input.borrow(), Input::Grpc(_)) {
-            let wanted = (GrpcInput::MESSAGE_LIMIT + 5) as u32;
-            return wanted
-                .checked_sub(crate::shared::connection::stream_window::LOCAL_INITIAL_WINDOW_SIZE)
-                .filter(|more| *more > 0)
-                .inspect(|more| self.window.grant_recv(*more));
-        }
-        None
-    }
-
     /// Whether the peer's half is done: its END_STREAM came, or we stopped
     /// expecting one.
     pub fn input_ended(&self) -> bool {
@@ -648,7 +625,19 @@ impl StreamState {
     ///
     /// The length that matters here is `payload.len()`, never the padded one:
     /// flow control accounts for padding, `content-length` does not.
-    pub fn recv_data(&self, payload: &[u8], end_stream: bool) -> Result<(), StreamViolation> {
+    ///
+    /// `Ok(n)` is how much of the payload was consumed on the spot and owes
+    /// the peer its credit back now — on the connection, and on the stream
+    /// unless `end_stream` made that pointless. The caller writes the frames,
+    /// this half cannot. An HTTP body answers zero: its bytes wait for the
+    /// handler's `consume`. A gRPC body answers the whole payload as long as
+    /// no whole message is waiting for the handler — the bytes went into a
+    /// message being assembled, which is what consuming them is — and zero
+    /// once one is, so that a handler that has fallen behind is a peer that
+    /// waits. What is held goes back through [`release_held`].
+    ///
+    /// [`release_held`]: Self::release_held
+    pub fn recv_data(&self, payload: &[u8], end_stream: bool) -> Result<u32, StreamViolation> {
         if self.no_more_input.get() {
             return Err(StreamViolation::DataAfterEndStream);
         }
@@ -672,20 +661,20 @@ impl StreamState {
         // it happens — no reason to take the rest of the body first. Whether a
         // payload fits is for what holds the body to say, and `push` is where
         // an HTTP body says it.
-        let wake = match &mut *input {
+        let (wake, consumed) = match &mut *input {
             // No buffer at all is a declared length of zero, so any byte is
             // one too many.
             Input::None if !payload.is_empty() => {
                 return Err(StreamViolation::ContentLengthMismatch);
             }
-            Input::None => end_stream,
+            Input::None => (end_stream, 0),
             Input::Http(input) => {
                 input
                     .push(at, payload)
                     .map_err(|_| StreamViolation::ContentLengthMismatch)?;
                 // A body held whole is worth waking for only once; a drained
                 // one has something to take on every frame.
-                end_stream || input.wakes_per_frame()
+                (end_stream || input.wakes_per_frame(), 0)
             }
             #[cfg(feature = "grpc")]
             Input::Grpc(input) => {
@@ -696,23 +685,31 @@ impl StreamState {
                 if end_stream {
                     input.end();
                 }
-                wake || end_stream
+                // Consumed into the message being assembled, unless a whole
+                // one is waiting: then the handler is behind, and these bytes
+                // keep their credit until it takes one.
+                let consumed = if input.has_ready() {
+                    0
+                } else {
+                    payload.len() as u32
+                };
+                (wake || end_stream, consumed)
             }
         };
 
-        // Only now: a payload that was refused never landed. Whatever holds
-        // it, it holds connection credit until a handler takes it — bounded
-        // by the receive window, so it cannot outgrow a u32.
+        // Only now: a payload that was refused never landed. What was not
+        // consumed on the spot holds connection credit until a handler takes
+        // it — bounded by the receive window, so it cannot outgrow a u32.
         self.received.set(received);
         self.unreleased
-            .set(self.unreleased.get() + payload.len() as u32);
+            .set(self.unreleased.get() + payload.len() as u32 - consumed);
         if end_stream {
             self.no_more_input.set(true);
         }
         if wake {
             self.wake();
         }
-        Ok(())
+        Ok(consumed)
     }
 
     /// The next gRPC message, once it is whole.
@@ -738,20 +735,21 @@ impl StreamState {
         })
     }
 
-    /// Lets go of the credit a taken gRPC message was holding, `len` being
-    /// what it took on the wire. The connection's is the caller's to hand
-    /// back; `Some` is the stream's, to announce.
+    /// Lets go of every byte still holding credit — what arrived while a
+    /// whole message was waiting, now that the handler has taken one. The
+    /// first is the connection's share, the caller's to hand back; the second
+    /// is the stream's, to announce.
     ///
-    /// At once rather than accumulated, unlike [`release_recv`]: the next
-    /// message may need the whole window to fit, and credit held back below a
-    /// threshold is credit its sender waits for while we wait for the message.
+    /// At once rather than accumulated, unlike [`release_recv`]: the peer
+    /// was made to wait on exactly this, and credit held back below a
+    /// threshold is credit it keeps waiting for.
     ///
     /// [`release_recv`]: Self::release_recv
     #[cfg(feature = "grpc")]
     #[must_use]
-    pub fn release_message(&self, len: u32) -> Option<u32> {
-        self.unreleased.set(self.unreleased.get() - len);
-        self.window.release_recv_now(len)
+    pub fn release_held(&self) -> (u32, Option<u32>) {
+        let held = self.unreleased.replace(0);
+        (held, self.window.release_recv_now(held))
     }
 
     fn wake(&self) {
@@ -866,21 +864,22 @@ impl Stream {
     /// being gRPC — a message over the limit, a bad flag, an END_STREAM in the
     /// middle of one — for the handler to answer with a `grpc-status`.
     ///
-    /// Taking a message is what gives the peer the credit to send the next.
+    /// A message's bytes are credited back as they arrive, so a peer is
+    /// never short of window for the one it is sending. Only while a whole
+    /// message is waiting here do the bytes after it keep their credit, and
+    /// taking a message is what lets go of it.
     #[cfg(feature = "grpc")]
     pub async fn message(&self) -> Option<Result<GrpcFrame, GrpcError>> {
         let taken = self.state().message().await;
         // Nothing to credit a peer that has finished sending, and a unary
         // call — most calls — is one message and a half-close, so the frame
-        // would go out on every one of them for nothing. What the message
-        // held of the connection window goes back where an HTTP body's does,
-        // when the stream retires.
-        if let Some(Ok(frame)) = &taken
+        // would go out on every one of them for nothing. What is still held
+        // of the connection window goes back where an HTTP body's does, when
+        // the stream retires.
+        if let Some(Ok(_)) = &taken
             && !self.state().input_ended()
         {
-            self.token
-                .shared()
-                .release_message(self.id(), self.state(), frame.wire_len() as u32);
+            self.token.shared().release_held(self.id(), self.state());
         }
         taken
     }

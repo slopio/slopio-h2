@@ -3,9 +3,8 @@ use std::collections::VecDeque;
 use http::HeaderMap;
 
 use super::frame::{Accumulating, GrpcFrame};
-use super::prefix::{PREFIX_LEN, Prefix, PrefixRead};
+use super::prefix::{Prefix, PrefixRead};
 use super::request::{AnnouncedEncoding, GrpcFormat};
-use crate::server::connection::CONNECTION_RECV_WINDOW;
 
 /// Why a gRPC request body stopped being one. Handed to the handler rather
 /// than turned into a RST_STREAM, because the answer to each of these is a
@@ -58,28 +57,19 @@ pub struct GrpcInput {
     declared: Option<u64>,
 }
 
-/// A message must be able to arrive at all: the connection window is what
-/// bounds everything held unread, so one that cannot hold a single message
-/// would deadlock the first large one.
-const _: () = assert!(
-    GrpcInput::MESSAGE_LIMIT + PREFIX_LEN <= CONNECTION_RECV_WINDOW as usize,
-    "a whole message must fit in the connection receive window"
-);
-
 impl GrpcInput {
     /// Largest message held, and gRPC's own default.
     ///
-    /// A message is delivered whole, so nothing of it is consumed until all of
-    /// it has arrived, so no credit goes back while it fills: it has to fit in
-    /// its stream's receive window in one go. That window starts at §6.9.2's
-    /// 65535, which the interop suite's `large_unary` — 272 KB in, 314 KB out
-    /// — is far past, and so is most real traffic. So a gRPC stream is granted
-    /// the difference when it opens; see `StreamState::window_wanted`.
+    /// Not tied to any window. A message fills from the bytes of DATA frames,
+    /// each of which is consumed — copied in here — the moment it lands, and
+    /// credited back to the peer as an HTTP handler's `consume` would. So a
+    /// message may be far larger than a stream's window: it flows through it,
+    /// as every gRPC transport has it flow. What bounds memory is this limit,
+    /// checked at the prefix, times the streams open at once.
     ///
-    /// What still bounds memory is the *connection* window, which a message
-    /// holds until the handler takes it, exactly as an HTTP body does. Raising
-    /// the stream's lets one message be large; it does not let the connection
-    /// hold more unread than it could before.
+    /// The one time bytes keep their credit is when a whole message is already
+    /// waiting for the handler: then the handler is behind, and the window is
+    /// what tells the peer to wait too. See `StreamState::recv_data`.
     pub const MESSAGE_LIMIT: usize = 4 * 1024 * 1024;
 
     /// Most messages waiting to be taken.
@@ -112,13 +102,20 @@ impl GrpcInput {
         self.declared
     }
 
+    /// Whether a whole message is waiting for the handler. While one is, the
+    /// bytes that arrive hold their credit: the handler is behind, and the
+    /// window is what tells the peer so.
+    pub fn has_ready(&self) -> bool {
+        !self.ready.is_empty()
+    }
+
     /// Takes the next of the body. `true` when the task has something new to
     /// be woken for: a frame became whole, or the body went wrong.
     ///
-    /// Nothing here knows about flow control. A frame holds its credit, the
-    /// stream's and the connection's, from the moment its bytes land until the
-    /// handler takes it — the contract `InputData::Capped` has, once per
-    /// message instead of once per body.
+    /// Nothing here knows about flow control: whether the bytes keep their
+    /// credit is decided by whoever calls this, from [`has_ready`] after it.
+    ///
+    /// [`has_ready`]: Self::has_ready
     pub fn push(&mut self, mut payload: &[u8]) -> bool {
         let mut wake = false;
         while !payload.is_empty() && self.failed.is_none() {

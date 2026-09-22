@@ -197,16 +197,19 @@ impl SharedConnection {
         self.write_headers(stream_id, headers, end_stream);
     }
 
-    /// Gives the peer back the credit a taken gRPC message was holding, on
-    /// the stream and on the connection both — [`consume`](Self::consume) for
-    /// a whole message, with the stream's half announced at once: see
-    /// [`StreamState::release_message`].
+    /// Gives the peer back whatever credit a gRPC stream was holding, on the
+    /// stream and on the connection both — [`consume`](Self::consume) for
+    /// everything held, with the stream's half announced at once: see
+    /// [`StreamState::release_held`].
     #[cfg(feature = "grpc")]
-    pub fn release_message(&self, stream_id: StreamId, stream: &StreamState, credit: u32) {
-        if let Some(increment) = stream.release_message(credit) {
+    pub fn release_held(&self, stream_id: StreamId, stream: &StreamState) {
+        let (held, increment) = stream.release_held();
+        if let Some(increment) = increment {
             self.write_frame(|out| encode_window_update(out, stream_id, increment));
         }
-        self.release_stream_credit(credit);
+        if held > 0 {
+            self.release_stream_credit(held);
+        }
     }
 
     /// Writes a trailer section: the fields and END_STREAM, no pseudo-header
