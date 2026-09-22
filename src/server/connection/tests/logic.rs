@@ -251,6 +251,227 @@ fn answering_pings_does_not_hold_a_stream_without_its_body() {
     );
 }
 
+/// A request whose handler takes a moment, from a peer that says goodbye
+/// while it works. GOAWAY(NO_ERROR) is the peer opening nothing more, not
+/// the peer giving up on what it asked (§6.8): the connection drains, the
+/// answer goes out, and only then does it close. It used to close at once
+/// and kill the handler, and the peer got nothing.
+#[test]
+fn a_peer_that_says_goodbye_still_gets_its_answer() {
+    let mut open = preface();
+    open.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        GET_BLOCK,
+    ));
+    // Last stream id 0 — we opened none — and NO_ERROR.
+    let goaway = frame(GOAWAY, 0, 0, &[0; 8]);
+
+    let inbound: Vec<Scripted> = vec![
+        ReadEvent::Data(open).into(),
+        ReadEvent::Data(goaway).after(Duration::from_millis(10)),
+        // Far past the answer: the connection has to end on its own, when
+        // its last stream does, and not wait for this.
+        ReadEvent::Eof.after(Duration::from_secs(1000)),
+    ];
+    let written = run_connection_with(inbound, |_, _| {}, slow_ok);
+
+    let head = written
+        .iter()
+        .find(|f| f.kind == HEADERS && f.stream_id == 1)
+        .unwrap_or_else(|| panic!("the request in flight was answered: {written:?}"));
+    assert_eq!(status_of(head).as_deref(), Some("200"));
+    assert!(
+        !written.iter().any(|f| f.kind == GOAWAY),
+        "the peer left in good order, and so do we: {written:?}"
+    );
+}
+
+/// The same, with the peer closing its half of the transport instead: it
+/// sends no more, and can still read. The answer goes out.
+#[test]
+fn a_peer_that_half_closes_still_gets_its_answer() {
+    let mut open = preface();
+    open.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        GET_BLOCK,
+    ));
+
+    let inbound: Vec<Scripted> = vec![
+        ReadEvent::Data(open).into(),
+        ReadEvent::Eof.after(Duration::from_millis(10)),
+    ];
+    let written = run_connection_with(inbound, |_, _| {}, slow_ok);
+
+    let head = written
+        .iter()
+        .find(|f| f.kind == HEADERS && f.stream_id == 1)
+        .unwrap_or_else(|| panic!("the request in flight was answered: {written:?}"));
+    assert_eq!(status_of(head).as_deref(), Some("200"));
+}
+
+/// What a half-close does to a request whose body was still coming: it will
+/// never come. The stream is reset rather than left to a handler that would
+/// read the end of the input as the end of the body — while the request
+/// beside it, which the peer finished sending, is answered as usual.
+#[test]
+fn a_half_close_resets_the_bodies_it_cut_short() {
+    let mut open = preface();
+    open.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, GET_BLOCK));
+    open.extend_from_slice(&frame(DATA, 0, 1, b"half of a bo"));
+    open.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        3,
+        GET_BLOCK,
+    ));
+
+    let inbound: Vec<Scripted> = vec![
+        ReadEvent::Data(open).into(),
+        ReadEvent::Eof.after(Duration::from_millis(10)),
+    ];
+    let written = run_connection_with(inbound, |_, _| {}, slow_ok);
+
+    let reset = written
+        .iter()
+        .find(|f| f.kind == RST_STREAM && f.stream_id == 1)
+        .unwrap_or_else(|| panic!("the cut body's stream was reset: {written:?}"));
+    assert_eq!(
+        u32::from_be_bytes(reset.payload[..4].try_into().unwrap()),
+        crate::shared::codec::types::CANCEL
+    );
+    assert!(
+        !written.iter().any(|f| f.kind == HEADERS && f.stream_id == 1),
+        "and its handler did not answer a body it never got: {written:?}"
+    );
+    assert!(
+        written.iter().any(|f| f.kind == HEADERS && f.stream_id == 3),
+        "the finished request beside it was answered: {written:?}"
+    );
+}
+
+/// A half-closed peer cannot answer a PING, so the wait for its answers is
+/// bounded by time alone: a handler that never finishes does not hold the
+/// connection past `HALF_CLOSED_TICKS`.
+#[test]
+fn a_half_closed_peer_is_not_waited_on_forever() {
+    let mut open = preface();
+    open.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        GET_BLOCK,
+    ));
+
+    let inbound: Vec<Scripted> = vec![
+        ReadEvent::Data(open).into(),
+        ReadEvent::Eof.after(Duration::from_millis(10)),
+    ];
+    let written = run_connection_with(
+        inbound,
+        |_, _| {},
+        |stream: crate::server::Stream| async move {
+            // Held, so the stream stays unanswered rather than dropped.
+            let _held = stream;
+            std::future::pending::<()>().await;
+        },
+    );
+
+    let goaway = written
+        .iter()
+        .find(|f| f.kind == GOAWAY)
+        .unwrap_or_else(|| panic!("the connection was closed, and said so: {written:?}"));
+    assert_eq!(&goaway.payload[8..], b"peer half-closed, answers not finished");
+    assert!(
+        !written.iter().any(|f| f.kind == PING && f.flags & 0x1 == 0),
+        "and nobody asked a peer that cannot answer: {written:?}"
+    );
+}
+
+/// A response larger than the window the peer left open cannot finish once
+/// the peer has half-closed: the WINDOW_UPDATE it needs will never come. So
+/// it is reset as soon as its writer runs dry, rather than held until
+/// `HALF_CLOSED_TICKS` — whether it ran dry before the EOF (stream 1, which
+/// spends the whole connection window at once) or after it (stream 3, which
+/// starts its body once there is no credit left anywhere).
+///
+/// Stream 3 sends its head before the EOF, so that running dry after it
+/// writes nothing at all: the only thing that can tell the loop is the
+/// writer parking, which is the wake this is about. Without it the reset
+/// still comes, on the next tick — so stream 5, answered two seconds on, is
+/// what tells the two apart: the reset has to be out before its answer.
+#[test]
+fn a_half_closed_peer_does_not_hold_responses_out_of_credit() {
+    let mut open = preface();
+    for id in [1, 3, 5] {
+        open.extend_from_slice(&frame(
+            HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            id,
+            GET_BLOCK,
+        ));
+    }
+
+    let inbound: Vec<Scripted> = vec![
+        ReadEvent::Data(open).into(),
+        ReadEvent::Eof.after(Duration::from_millis(10)),
+    ];
+    let written = run_connection_with(
+        inbound,
+        |_, _| {},
+        |stream: crate::server::Stream| async move {
+            if u32::from(stream.id()) == 5 {
+                Sleep::during(Duration::from_secs(2)).await;
+                stream.write_headers_final(http::StatusCode::OK, &http::HeaderMap::new());
+                return;
+            }
+            // Past the 65 535 bytes of credit both windows start with.
+            let body = vec![b'x'; 100_000];
+            stream.write_headers(http::StatusCode::OK, &http::HeaderMap::new());
+            if u32::from(stream.id()) == 3 {
+                Sleep::during(Duration::from_millis(100)).await;
+            }
+            stream.write_data_final(&body).await;
+        },
+    );
+
+    for id in [1, 3] {
+        let reset = written
+            .iter()
+            .find(|f| f.kind == RST_STREAM && f.stream_id == id)
+            .unwrap_or_else(|| panic!("stream {id}, out of credit, was reset: {written:?}"));
+        assert_eq!(
+            u32::from_be_bytes(reset.payload[..4].try_into().unwrap()),
+            crate::shared::codec::types::CANCEL
+        );
+    }
+    let reset = written
+        .iter()
+        .position(|f| f.kind == RST_STREAM && f.stream_id == 3);
+    let answer = written
+        .iter()
+        .position(|f| f.kind == HEADERS && f.stream_id == 5)
+        .unwrap_or_else(|| panic!("the working handler was answered: {written:?}"));
+    assert!(
+        reset < Some(answer),
+        "stream 3 was reset when it ran dry, not on a later turn: {written:?}"
+    );
+    assert!(
+        !written.iter().any(|f| f.kind == GOAWAY),
+        "and nothing was left to time out: {:?}",
+        written.iter().find(|f| f.kind == GOAWAY)
+    );
+}
+
+/// A handler that answers `200` a hundred milliseconds in.
+async fn slow_ok(stream: crate::server::Stream) {
+    Sleep::during(Duration::from_millis(100)).await;
+    stream.write_headers_final(http::StatusCode::OK, &http::HeaderMap::new());
+}
+
 /// A small upload, complete, whose handler then thinks for a while. The body
 /// is all there — END_STREAM came — so its rate has nothing left to say.
 #[test]

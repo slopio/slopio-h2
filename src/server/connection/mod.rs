@@ -4,7 +4,7 @@ use std::task::Poll;
 use std::time::{Duration, SystemTime};
 
 use crate::server::Handler;
-use crate::server::connection::protocol::Protocol;
+use crate::server::connection::protocol::{Phase, Protocol};
 use crate::shared::{
     codec::frames::FrameDecoder,
     transport::{RecvError, Transport},
@@ -156,6 +156,20 @@ pub const ACTIVE_TICKS: u32 = 6;
 /// 4 ticks of 5s: twenty seconds.
 pub const PING_TIMEOUT_TICKS: u32 = 4;
 
+/// How long a peer that closed its half of the transport waits for the
+/// answers it is still owed.
+///
+/// The same thirty seconds a peer with a stream open is given before we ask
+/// about it, and final, because here we cannot ask: the peer can read, but
+/// nothing it sends will reach us, so a PING has no answer to wait for.
+///
+/// Only handlers still working are waited on. A stream waiting on the peer —
+/// for the rest of its body, or for credit to send more of its response — is
+/// waiting on nothing, and is reset the moment it is found.
+///
+/// 6 ticks of 5s: thirty seconds.
+pub const HALF_CLOSED_TICKS: u32 = 6;
+
 /// How long a peer may leave something half-sent.
 ///
 /// The slowloris deadline, and the strict one, because a half-sent thing is
@@ -274,14 +288,18 @@ impl<T: Transport, H: Handler> Connection<T, H> {
         }
     }
 
-    /// Drives the connection to completion, until the peer closes or a
-    /// connection error is answered.
+    /// Drives the connection to completion.
     ///
     /// A turn is one of two things: a chunk in, with everything it produced
     /// out; or output a handler wrote while the loop was waiting on the peer.
     /// The second used to wait for the first — a response written a second
     /// after its request left only with the peer's next chunk, and to a peer
     /// with nothing more to say, that was the idle GOAWAY two minutes later.
+    ///
+    /// What a turn waits for, and when the loop is over, is the
+    /// [`Phase`]'s to say: reading and writing while the peer can talk,
+    /// writing alone once it has half-closed, and nothing once the connection
+    /// is closing. Every way out goes through the one close at the bottom.
     pub async fn run(mut self) {
         // When the peer last sent anything. Silence is measured from here,
         // not counted in ticks: the tick restarts every time a handler's
@@ -298,16 +316,16 @@ impl<T: Transport, H: Handler> Connection<T, H> {
                 // Queued, which wakes the loop's own flush: the next turn
                 // sends it.
                 Due::Ping => self.protocol.ping(),
-                Due::Close(reason) => {
-                    // §6.8: say so rather than vanishing. The GOAWAY is
-                    // queued, so it needs the drain to carry it.
-                    self.protocol.time_out(reason);
-                    let _ = self.drain().await;
-                    let _ = self.transport.shutdown().await;
-                    return;
-                }
+                // §6.8: say so rather than vanishing. The GOAWAY is queued,
+                // and the phase is now `Closing`, whose drain carries it.
+                Due::Close(reason) => self.protocol.time_out(reason),
             }
-            let chunk = match timeout(DEADLINE_TICK, self.next_event()).await {
+            let waited = match self.protocol.phase() {
+                Phase::Open | Phase::Draining => timeout(DEADLINE_TICK, self.next_event()).await,
+                Phase::HalfClosed { .. } => timeout(DEADLINE_TICK, self.next_output()).await,
+                Phase::Closing => break,
+            };
+            let chunk = match waited {
                 // A tick with nothing to do: only the deadlines above had
                 // anything to decide.
                 Err(()) => continue,
@@ -316,14 +334,27 @@ impl<T: Transport, H: Handler> Connection<T, H> {
                 // silence, and the sweep that judges the peer waits for a
                 // chunk of its own.
                 Ok(Event::Flush) => {
+                    // Half-closed, a wake may be a writer that ran out of
+                    // credit for good. Ended before the drain, so its reset
+                    // goes out with it.
+                    self.protocol.reset_stalled();
                     if self.drain().await.is_err() {
                         return;
                     }
+                    if self.protocol.is_done() {
+                        break;
+                    }
                     continue;
                 }
-                // Half-close: the peer sends no more, but is still owed
-                // whatever is queued.
-                Ok(Event::Closed) => break,
+                // Half-close: the peer sends no more, but is still owed the
+                // answers to what it did send.
+                Ok(Event::Closed) => {
+                    self.protocol.peer_closed();
+                    if self.protocol.is_done() {
+                        break;
+                    }
+                    continue;
+                }
                 // The ring was empty, not the connection. Yielding is the
                 // whole remedy: a buffer comes back when another connection on
                 // this worker recycles one, which happens when it is polled,
@@ -365,14 +396,17 @@ impl<T: Transport, H: Handler> Connection<T, H> {
             self.probe_sent = None;
             dry_reads = 0;
             self.sweep_if_due();
-            // The drain carries the GOAWAY, if there was one. An invalid
-            // preface queued nothing, so it closes in silence (§3.4).
-            if self.drain().await.is_err() || self.is_closing() {
+            if self.drain().await.is_err() {
                 return;
             }
+            if self.protocol.is_done() {
+                break;
+            }
         }
-        // The peer half-closed and whatever was owed has gone out. On a
-        // transport with a goodbye of its own, this is where it goes.
+        // The one way out that still has a peer to talk to. The drain
+        // carries the GOAWAY, if there was one; an invalid preface queued
+        // nothing, so it closes in silence (§3.4). On a transport with a
+        // goodbye of its own, this is where it goes.
         let _ = self.drain().await;
         let _ = self.transport.shutdown().await;
     }
@@ -425,10 +459,26 @@ impl<T: Transport, H: Handler> Connection<T, H> {
     ///
     /// Clocks that step backwards floor at zero, as `Stream::age` does, so an
     /// adjustment cannot close a connection.
+    ///
+    /// All of that is for a peer that can still talk. One that half-closed
+    /// cannot, so nothing it leaves half-sent will be finished and no PING
+    /// will be answered: it gets `HALF_CLOSED_TICKS` from its EOF, and that is
+    /// all.
     #[inline]
     fn due(&mut self, last_heard: SystemTime) -> Due {
         let now = runtime::runtime::now();
         let since = |then: SystemTime| now.duration_since(then).unwrap_or_default();
+
+        match self.protocol.phase() {
+            Phase::Open | Phase::Draining => {}
+            Phase::HalfClosed { since: closed } => {
+                return match since(closed) >= DEADLINE_TICK * HALF_CLOSED_TICKS {
+                    true => Due::Close("peer half-closed, answers not finished"),
+                    false => Due::Nothing,
+                };
+            }
+            Phase::Closing => return Due::Nothing,
+        }
 
         if !self.decoder.preface_seen() || self.decoder.header_pending() {
             let started = *self.partial_since.get_or_insert(now);
@@ -476,13 +526,6 @@ impl<T: Transport, H: Handler> Connection<T, H> {
             self.last_swept = now;
             self.protocol.sweep_starving_streams();
         }
-    }
-
-    /// Once true, nothing more should be read: a connection error has been
-    /// answered — or, for an invalid preface, deliberately not — and what
-    /// remains is to flush and close.
-    pub fn is_closing(&self) -> bool {
-        self.protocol.is_closing()
     }
 
     /// Sends everything written since the last flush, as one gather write.
@@ -554,6 +597,32 @@ impl<T: Transport, H: Handler> Connection<T, H> {
                         false => Poll::Ready(Event::Flush),
                     }
                 }
+            }
+        })
+    }
+
+    /// [`next_event`](Self::next_event) with the peer gone quiet for good:
+    /// waits for the flusher to be woken, and nothing else.
+    ///
+    /// Any wake is a turn, not only one that brought output: a writer that
+    /// runs out of credit wakes the flusher too, with nothing written, and
+    /// the turn is what resets its stream. A wake that meant neither costs
+    /// one pass of the loop.
+    ///
+    /// The transport is not polled at all. It has said `None`, and a stream
+    /// that has ended promises nothing about being asked again.
+    fn next_output(&self) -> impl Future<Output = Event<T::Buf>> + '_ {
+        let shared = self.protocol.shared();
+        let mut parked = false;
+        std::future::poll_fn(move |cx| {
+            if parked || !shared.output_is_empty() {
+                return Poll::Ready(Event::Flush);
+            }
+            parked = true;
+            shared.park_flusher(cx.waker());
+            match shared.output_is_empty() {
+                true => Poll::Pending,
+                false => Poll::Ready(Event::Flush),
             }
         })
     }

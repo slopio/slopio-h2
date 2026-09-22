@@ -246,6 +246,10 @@ pub struct SharedConnection {
     /// happens to send something — which, having nothing more to say, it may
     /// never do.
     flusher: RefCell<Option<Waker>>,
+    /// The peer can send nothing more, so no WINDOW_UPDATE will ever come:
+    /// a writer out of credit is out of it for good. Set by a server whose
+    /// peer half-closed; see [`Self::close_credit`].
+    credit_closed: Cell<bool>,
 }
 
 impl SharedConnection {
@@ -282,6 +286,7 @@ impl SharedConnection {
             },
             output: UnsafeCell::new(Output::new()),
             flusher: RefCell::new(None),
+            credit_closed: Cell::new(false),
         }
     }
 
@@ -411,6 +416,12 @@ impl SharedConnection {
                     if credit == 0 {
                         stream.register_send_waker(cx.waker());
                         self.window.wait_send(cx.waker());
+                        // Nothing will ever wake this one. The loop is told,
+                        // since it is the one that can end the stream — the
+                        // writer parking says nothing to it otherwise.
+                        if self.credit_closed.get() {
+                            self.wake_flusher();
+                        }
                     }
                     if room == 0 {
                         // SAFETY: the reference dies with the expression;
@@ -529,6 +540,13 @@ impl SharedConnection {
 
     /// Parks the loop that flushes this output until there is something to
     /// send. Only one such loop exists per connection, hence one slot.
+    /// The peer half-closed: no credit will come back. From here a writer
+    /// that runs out of it wakes the flusher on its way to parking, rather
+    /// than wait for a WINDOW_UPDATE that cannot arrive.
+    pub(crate) fn close_credit(&self) {
+        self.credit_closed.set(true);
+    }
+
     pub(crate) fn park_flusher(&self, waker: &Waker) {
         let mut slot = self.flusher.borrow_mut();
         if !slot.as_ref().is_some_and(|w| w.will_wake(waker)) {

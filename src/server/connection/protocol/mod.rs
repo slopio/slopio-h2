@@ -18,11 +18,12 @@ use crate::shared::codec::{
         stream_id::StreamId,
     },
     types::{
-        DecodeError, ENHANCE_YOUR_CALM, FLOW_CONTROL_ERROR, NO_ERROR, PROTOCOL_ERROR,
+        CANCEL, DecodeError, ENHANCE_YOUR_CALM, FLOW_CONTROL_ERROR, NO_ERROR, PROTOCOL_ERROR,
         REFUSED_STREAM, STREAM_CLOSED, Setting, StreamViolation,
     },
 };
 use crate::shared::connection::{STREAM_ID, SharedConnection, settings::Settings};
+use std::time::SystemTime;
 
 /// How far a connection's stream errors — ours to report or the peer's to
 /// send — may run *ahead of the streams it has finished* before it is closed
@@ -151,10 +152,9 @@ pub struct Protocol<H: Handler> {
     /// answered on the wire at all: §3.4 wants an invalid preface met with
     /// silence, not a GOAWAY.
     preface_seen: bool,
-    /// Set once, by the first connection error. The loop stops reading on
-    /// it; whatever is already queued — the GOAWAY, typically — still goes
-    /// out.
-    closing: bool,
+    /// Where the connection is in its life, which is what decides what the
+    /// loop waits for, which deadlines apply, and when it is over.
+    phase: Phase,
     /// Stream errors so far, against `FAULT_LIMIT`.
     faults: u32,
     /// Control frames since the last request frame, against
@@ -165,6 +165,34 @@ pub struct Protocol<H: Handler> {
     odd_frames: u32,
     /// Keepalive PINGs sent, which is what their opaques count.
     pings_sent: u64,
+}
+
+/// Where a connection is in its life.
+///
+/// Every way a connection ends used to be a way out of the loop — a `return`
+/// here, a `break` there — and the loop knew only one way to be alive. So a
+/// peer that said goodbye, or half-closed, had its requests in flight killed
+/// with the connection, where §6.8 has them finish. The phases are what the
+/// loop now asks instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Phase {
+    /// Reading and writing: the ordinary life of a connection.
+    Open,
+    /// The peer sent GOAWAY(NO_ERROR): it is leaving, and its streams in
+    /// flight are to finish (§6.8). Read as in `Open` — their bodies, their
+    /// WINDOW_UPDATEs and their resets still come — and over when the last
+    /// of them is.
+    Draining,
+    /// The peer closed its half of the transport: nothing more will be
+    /// read, and the transport must not be asked again. What is left is
+    /// writing, until the streams are done or `HALF_CLOSED_TICKS` is up.
+    /// A stream waiting on the peer — for its body, or for credit — waits
+    /// on nothing and is reset at once; the time bound is for handlers still
+    /// working, since the peer cannot answer a PING any more.
+    HalfClosed { since: SystemTime },
+    /// Nothing left but to flush and close: a connection error we answered,
+    /// a deadline that ran out, or a peer that left on an error of its own.
+    Closing,
 }
 
 struct Streams<H: Handler> {
@@ -410,7 +438,7 @@ impl<H: Handler> Protocol<H> {
             },
             expect_settings: false,
             preface_seen: false,
-            closing: false,
+            phase: Phase::Open,
             faults: 0,
             control_frames: 0,
             odd_frames: 0,
@@ -455,18 +483,72 @@ impl<H: Handler> Protocol<H> {
             .write_frame(|out| encode_ping(out, opaque, false));
     }
 
-    pub(super) fn is_closing(&self) -> bool {
-        self.closing
+    pub(super) fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    /// Whether a connection that is on its way out has nothing left to wait
+    /// for: every stream the peer had in flight is done.
+    pub(super) fn is_done(&self) -> bool {
+        matches!(self.phase, Phase::Draining | Phase::HalfClosed { .. }) && !self.has_live_streams()
+    }
+
+    /// The peer closed its half of the transport.
+    ///
+    /// From here nothing it could send will arrive — no body, and no credit.
+    /// The streams that were waiting on either are ended now (see
+    /// [`reset_stalled`](Self::reset_stalled)), and the rest — requests the
+    /// peer finished sending, handlers still working on them — are answered
+    /// as usual, which is the point of staying.
+    pub(super) fn peer_closed(&mut self) {
+        if self.phase == Phase::Closing {
+            return;
+        }
+        self.phase = Phase::HalfClosed {
+            since: runtime::runtime::now(),
+        };
+        self.shared.close_credit();
+        self.reset_stalled();
+    }
+
+    /// Resets every stream a half-closed peer has left with nothing to wait
+    /// for.
+    ///
+    /// Two kinds. A stream whose body was still coming will never have it,
+    /// and its handler would read the end of the input as the end of the
+    /// body — acting on a truncated one as if it were whole. And a stream
+    /// whose writer is out of credit will never get more, so its response
+    /// cannot finish: RST_STREAM tells the peer, which can still read, where
+    /// a close would leave it holding a body cut short without a word.
+    ///
+    /// CANCEL, and not counted as faults: a peer that stops sending is not
+    /// misbehaving at us. Nothing to do before the half-close, when either
+    /// could still arrive; called again whenever a writer runs dry after it.
+    pub(super) fn reset_stalled(&mut self) {
+        if !matches!(self.phase, Phase::HalfClosed { .. }) {
+            return;
+        }
+        let credit = self.shared.window.available_send();
+        let mut stalled = Vec::new();
+        let _ = self.streams.streams.try_for_each(|stream| {
+            if !stream.input_ended() || stream.is_stalled_on_credit(credit) {
+                stalled.push(stream.id());
+            }
+            Ok::<(), ()>(())
+        });
+        for id in stalled {
+            self.reset_stream(id, CANCEL);
+        }
     }
 
     /// §5.4.1: a GOAWAY naming the last stream we took up, then no more
     /// reading. Idempotent — the first error is the one the peer hears
     /// about, later ones change nothing.
     fn fail_connection(&mut self, error_code: u32, reason: &'static str) {
-        if self.closing {
+        if self.phase == Phase::Closing {
             return;
         }
-        self.closing = true;
+        self.phase = Phase::Closing;
 
         // §6.8: anything above `last` was never processed and the peer may
         // retry it elsewhere; anything arriving above it from now on is
@@ -832,12 +914,21 @@ impl<H: Handler> FrameHandler for Protocol<H> {
             .write_frame(|out| encode_ping(out, opaque, true));
     }
 
-    /// The peer is leaving: `NO_ERROR` is a graceful shutdown, anything else
-    /// a fault it found on our side. Basic for now — we close too. The
-    /// graceful version keeps serving what is in flight and closes once the
-    /// map drains.
-    fn on_goaway(&mut self, _last_stream_id: StreamId, _error_code: u32, _debug_data: &[u8]) {
-        self.closing = true;
+    /// The peer is leaving. `NO_ERROR` is a graceful shutdown: what it has in
+    /// flight is still to be answered (§6.8), and the connection drains. Any
+    /// other code is a fault it found on our side, and a peer that says so
+    /// is closing on us whatever we do — nothing is gained by answering it.
+    ///
+    /// `last_stream_id` names the streams *we* opened that it processed, and
+    /// we open none.
+    fn on_goaway(&mut self, _last_stream_id: StreamId, error_code: u32, _debug_data: &[u8]) {
+        self.phase = match (self.phase, error_code) {
+            (Phase::Open, NO_ERROR) => Phase::Draining,
+            // Already on the way out, and a second goodbye changes nothing
+            // about which way.
+            (phase, NO_ERROR) => phase,
+            _ => Phase::Closing,
+        };
     }
 
     /// After a `DecodeError::Connection` the decoder poisons itself and emits

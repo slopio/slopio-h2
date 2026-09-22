@@ -396,6 +396,16 @@ impl StreamState {
         self.window.available_send()
     }
 
+    /// Whether the writer is parked for want of credit, and still has none.
+    ///
+    /// Both halves, because the first alone can go stale: a writer woken by
+    /// credit that then found the output full is parked on room, not credit,
+    /// and has not written anything to clear the mark yet.
+    /// `connection_credit` is the other window a DATA frame spends.
+    pub fn is_stalled_on_credit(&self, connection_credit: u32) -> bool {
+        self.send_blocked_since.get().is_some() && self.available_send().min(connection_credit) == 0
+    }
+
     /// Debits the send window for a DATA frame of ours. `Err` is the peer's
     /// credit running short, with nothing debited.
     pub fn debit_send(&self, len: u32) -> Result<(), ()> {
