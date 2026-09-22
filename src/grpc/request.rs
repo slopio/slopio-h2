@@ -35,6 +35,21 @@ impl GrpcFormat {
         Self::of_suffix(&value[GRPC.len()..])
     }
 
+    /// The same question asked of a *response*, where there is no method to
+    /// check and the fields have already been turned into a `HeaderMap`.
+    ///
+    /// §4.1 requires the same `content-type` back, and a response without one
+    /// is not carrying messages — most often a proxy's error page, which is
+    /// why this is asked before a body is read as anything.
+    pub(crate) fn of_response(fields: &HeaderMap) -> Option<Self> {
+        const GRPC: &[u8] = b"application/grpc";
+        let value = fields.get(header::CONTENT_TYPE)?.as_bytes();
+        if value.len() < GRPC.len() || !value[..GRPC.len()].eq_ignore_ascii_case(GRPC) {
+            return None;
+        }
+        Self::of_suffix(&value[GRPC.len()..])
+    }
+
     /// What follows `application/grpc`: nothing, `;parameters`, or `+subtype`
     /// and perhaps parameters after it. Anything else is another media type
     /// that only starts the same way.
@@ -115,7 +130,11 @@ mod tests {
             ("-web", None),
             ("web+proto", None),
         ] {
-            assert_eq!(GrpcFormat::of_suffix(suffix.as_bytes()), expected, "{suffix:?}");
+            assert_eq!(
+                GrpcFormat::of_suffix(suffix.as_bytes()),
+                expected,
+                "{suffix:?}"
+            );
         }
     }
 

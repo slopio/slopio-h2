@@ -24,6 +24,9 @@ use crate::shared::connection::DEADLINE_TICK;
 use crate::shared::connection::settings::Settings;
 use crate::shared::transport::PlainMessages;
 
+#[cfg(feature = "grpc")]
+mod grpc;
+
 runtime_core::define_buf_ring!(TestRing, bgid = 3, buffer_size = 16384, ring_size = 4);
 
 const DATA: u8 = 0x0;
