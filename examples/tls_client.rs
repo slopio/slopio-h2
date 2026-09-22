@@ -1,30 +1,34 @@
-//! Opens one HTTP/2 connection over TLS, makes a request on it and reads the
-//! response.
+//! Fetches one URL over HTTP/2 and TLS, verifying the server on the way in.
 //!
 //!     cargo run --release --features tls --example tls_client
+//!     cargo run --release --features tls --example tls_client https://cloudflare.com/
 //!
-//! `ADDR` overrides the default of `127.0.0.1:8443`, `HOST` the name the
-//! certificate is checked against (and the one in `:authority`), and `TARGET`
-//! the path. Those three are separate on purpose: the address says where to
-//! send the packets, the host says who the peer must prove to be.
+//! The default is `https://www.google.com/`, so with no arguments this makes
+//! a real request to a real server and checks its certificate against
+//! Mozilla's roots — which is the part a local test cannot prove.
 //!
-//! It points at anything speaking h2 over TLS, which is the useful thing about
-//! it — a server of ours, or nghttpd:
+//! Two environment variables, for the two reasons a local server is
+//! different. `ADDR` sends the packets somewhere other than where the name
+//! resolves, and the certificate is still checked against the name. `INSECURE`
+//! turns the checking off, which is the only way to talk to a self-signed
+//! server and is never right anywhere else:
 //!
 //!     openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
 //!         -days 1 -nodes -subj /CN=localhost
 //!     nghttpd -d /tmp/docroot 8443 key.pem cert.pem
-//!     TARGET=/hello.txt cargo run --features tls --example tls_client
+//!     INSECURE=1 cargo run --features tls --example tls_client \
+//!         https://localhost:8443/hello.txt
 //!
-//! **This example does not verify the server's certificate.** That is what
-//! lets it talk to the self-signed one above, and it is exactly what a real
-//! client must not do: build a `ClientConfig` over a `RootCertStore` instead,
-//! with `popple_tls::client_config`.
+//! Who to trust is the application's choice, which is why the roots are this
+//! example's and not the library's: `webpki-roots` here, the OS store via
+//! `rustls-native-certs`, or one pinned CA of your own.
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 
 use popple_h2::client;
-use popple_tls::{ServerName, client_config_dangerous_no_verification};
+use popple_tls::{
+    ClientSettings, ServerName, client_config, client_config_dangerous_no_verification,
+};
 use runtime::main_thread_with;
 
 // Smaller than the server's: a client holding one connection has nothing to
@@ -36,44 +40,110 @@ runtime::define_buf_ring!(ClientRing, bgid = 1, buffer_size = 16384, ring_size =
 /// spoken HTTP/2 at.
 const H2: &[&[u8]] = &[b"h2"];
 
+/// The three parts of a URL this needs, which is all of them it understands.
+struct Target {
+    host: String,
+    port: u16,
+    path: String,
+}
+
+/// `https://host[:port][/path]`, by hand. A URL parser is a dependency this
+/// does not need to make a request with.
+fn parse(url: &str) -> Result<Target, String> {
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("{url}: only https:// URLs, since this is the TLS example"))?;
+    let (authority, path) = match rest.find('/') {
+        Some(at) => (&rest[..at], &rest[at..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (
+            host,
+            port.parse().map_err(|_| format!("{port}: not a port"))?,
+        ),
+        None => (authority, 443),
+    };
+    if host.is_empty() {
+        return Err(format!("{url}: no host"));
+    }
+    Ok(Target {
+        host: host.to_owned(),
+        port,
+        path: path.to_owned(),
+    })
+}
+
 fn main() {
     // rustls needs a crypto provider installed before any config is built.
     // The application's job, once, at startup — not the library's.
-    if rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .is_err()
-    {
-        eprintln!("a crypto provider was already installed");
-    }
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let addr: SocketAddr = std::env::var("ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:8443".into())
-        .parse()
-        .expect("ADDR must be host:port");
-    let host = std::env::var("HOST").unwrap_or_else(|_| "localhost".into());
-    let path = std::env::var("TARGET").unwrap_or_else(|_| "/".into());
+    let url = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "https://www.google.com/".into());
+    let target = match parse(&url) {
+        Ok(target) => target,
+        Err(e) => return eprintln!("{e}"),
+    };
+
+    // Resolution is the standard library's, and it happens before the runtime
+    // starts: this runtime has no resolver, and a DNS lookup is not what the
+    // example is about.
+    let addr: SocketAddr = match std::env::var("ADDR") {
+        Ok(addr) => match addr.parse() {
+            Ok(addr) => addr,
+            Err(_) => return eprintln!("ADDR must be ip:port"),
+        },
+        Err(_) => match (target.host.as_str(), target.port).to_socket_addrs() {
+            Ok(mut addrs) => match addrs.next() {
+                Some(addr) => addr,
+                None => return eprintln!("{}: resolved to nothing", target.host),
+            },
+            Err(e) => return eprintln!("{}: {e}", target.host),
+        },
+    };
+
+    let insecure = std::env::var_os("INSECURE").is_some();
+    let config = match insecure {
+        // Never right off a loopback address, and the warning is printed
+        // rather than commented so that it is seen by whoever ran it.
+        true => {
+            eprintln!("INSECURE: the server's certificate is not being checked\n");
+            client_config_dangerous_no_verification(Some(H2))
+        }
+        false => client_config(ClientSettings {
+            roots: rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            },
+            alpn_protocols: Some(H2),
+        }),
+    };
+    let config = match config {
+        Ok(config) => config,
+        Err(e) => return eprintln!("could not build a TLS config: {e}"),
+    };
+
+    let name = match ServerName::try_from(target.host.clone()) {
+        Ok(name) => name,
+        Err(_) => return eprintln!("{}: not a valid server name", target.host),
+    };
 
     main_thread_with::<ClientRing, _>(async move {
-        let config = client_config_dangerous_no_verification(Some(H2)).expect("a client config");
-        let name = ServerName::try_from(host.clone()).expect("HOST must be a valid server name");
-
         let client = match client::connect_tls::<ClientRing>(addr, name, config).await {
             Ok(client) => client,
             Err(e) => return eprintln!("could not connect to {addr}: {e}"),
         };
-
-        let peer = client.peer_settings();
-        println!("connected to {addr} as {host}, over TLS");
         println!(
-            "  max_concurrent_streams  {:?}",
-            peer.max_concurrent_streams
+            "{} via {addr}, {} over TLS, h2 agreed\n",
+            target.host,
+            match insecure {
+                true => "UNVERIFIED",
+                false => "verified",
+            }
         );
-        println!("  initial_window_size     {}", peer.initial_window_size);
-        println!("  max_frame_size          {}", peer.max_frame_size);
 
-        let request = http::Request::get(format!("https://{host}{path}"))
-            .body(())
-            .expect("a valid request");
+        let request = http::Request::get(&url).body(()).expect("a valid request");
         let stream = match client.send_request(&request, true) {
             Ok(stream) => stream,
             Err(e) => return eprintln!("could not open a stream: {e}"),
@@ -83,7 +153,7 @@ fn main() {
             Ok(response) => response,
             Err(e) => return eprintln!("no response: {e}"),
         };
-        println!("\n{} {}", response.status().as_u16(), path);
+        println!("{} {}", response.status().as_u16(), target.path);
         for (name, value) in response.headers() {
             println!("  {name}: {}", value.to_str().unwrap_or("<binary>"));
         }
@@ -96,17 +166,20 @@ fn main() {
                 Err(e) => return eprintln!("body ended early: {e}"),
             }
         }
-        println!("\n{} bytes:", body.len());
-        println!("{}", String::from_utf8_lossy(&body));
+        println!("\n{} bytes of body", body.len());
+        // Enough to see it is the page that was asked for, without pasting a
+        // megabyte of minified HTML into a terminal.
+        let head: String = String::from_utf8_lossy(&body).chars().take(200).collect();
+        println!("{head}");
 
         if let Some(trailers) = stream.trailers() {
-            println!("trailers: {trailers:?}");
+            println!("\ntrailers: {trailers:?}");
         }
 
         // §6.8: say goodbye and wait for the peer's, rather than vanishing.
         client.close();
         if let Err(e) = client.closed().await {
-            eprintln!("the connection ended: {e}");
+            eprintln!("\nthe connection ended: {e}");
         }
     });
 }
