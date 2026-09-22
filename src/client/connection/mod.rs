@@ -6,23 +6,26 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::Poll;
 
+use runtime::runtime::time::timeout;
 use runtime_streams::StreamExt;
 
 use crate::client::shared::ClientShared;
-use crate::client::{CONNECTION_RECV_WINDOW, Client};
+use crate::client::{CONNECTION_RECV_WINDOW, Client, STREAM_RECV_WINDOW};
 use crate::shared::codec::frames::{
     CLIENT_PREFACE, DECODE_MAX_HEADER_LIST_SIZE, FrameDecoder,
-    encode::{encode_settings, encode_window_update},
+    encode::{encode_ping, encode_settings, encode_window_update},
     stream_id::StreamId,
 };
 use crate::shared::codec::types::{NO_ERROR, Setting};
-use crate::shared::connection::CONNECTION_INITIAL_WINDOW_SIZE;
+use crate::shared::connection::{CONNECTION_INITIAL_WINDOW_SIZE, DEADLINE_TICK};
 use crate::shared::transport::{RecvError, Transport};
 
+mod keepalive;
 mod protocol;
 #[cfg(test)]
 mod tests;
 
+use keepalive::Due;
 use protocol::Protocol;
 
 /// What one turn of the connection loop found to do.
@@ -122,6 +125,11 @@ impl<T: Transport> Connection<T> {
                     // We accept no pushed streams (§8.2), so say so before the
                     // peer can promise one.
                     Setting::EnablePush(0),
+                    // §6.9.2: what every stream of ours starts with. Unlike
+                    // the connection window below, this one SETTINGS carries,
+                    // and a client that left it at the default would take
+                    // every response 64 KiB at a time.
+                    Setting::InitialWindowSize(STREAM_RECV_WINDOW),
                     // The decoder drops fields past this; telling the peer
                     // lets it stay under rather than find out by refusal.
                     Setting::MaxHeaderListSize(DECODE_MAX_HEADER_LIST_SIZE as u32),
@@ -199,12 +207,15 @@ impl<T: Transport> Connection<T> {
     /// anything, it will not. [`Connection::next_event`] is what waits on
     /// both.
     ///
-    /// What is deliberately missing is a deadline. The server bounds how long
-    /// a peer may say nothing, because its connections are a resource
-    /// strangers can hold; a client's connection is held by its own
-    /// application, and how long a request may take is that application's
-    /// business, not this loop's. A request that must not hang forever wraps
-    /// its own `timeout` around `response()` today.
+    /// What this loop does not do is put a deadline on the peer for its own
+    /// sake. The server bounds how long a peer may say nothing, because its
+    /// connections are a resource strangers can hold; a client's connection is
+    /// held by its own application, and how long a request may take is that
+    /// application's business — [`Stream::with_deadline`] is where it says so.
+    /// The tick below is not that bound: it is the clock the keepalive counts
+    /// silence in, and a peer that answers its probes may take all day.
+    ///
+    /// [`Stream::with_deadline`]: crate::client::Stream::with_deadline
     ///
     /// `Ok` is a connection that ended because it was finished with — by this
     /// client, or by a peer that closed or said goodbye. `Err` is one that
@@ -217,9 +228,32 @@ impl<T: Transport> Connection<T> {
                 break self.farewell().await;
             }
 
-            let event = self.next_event().await;
+            // The tick is the keepalive's clock and nothing else's: it fires
+            // only when neither the peer nor the application has given this
+            // loop anything to do, and `DEADLINE_TICK` is the one duration the
+            // runtime serves outside its timewheel, so arming and cancelling
+            // it on every turn is what it is for. Dropping the wait is safe:
+            // `MultiRecv` queues its completions in a buffer it owns, so the
+            // read stays armed and nothing is lost between one poll and the
+            // next.
+            let event = match timeout(DEADLINE_TICK, self.next_event()).await {
+                Ok(event) => event,
+                Err(()) => match self.probe() {
+                    Ok(()) => continue,
+                    Err(reason) => {
+                        // §6.8: say so rather than vanishing. The peer is very
+                        // likely not listening, which is why the flush is
+                        // allowed to fail.
+                        self.protocol.fail(NO_ERROR, reason);
+                        let _ = self.flush().await;
+                        break Ended::Failed(reason);
+                    }
+                },
+            };
             match event {
                 Event::Inbound(chunk) => {
+                    // Whatever it says, it came from a peer that is alive.
+                    self.protocol.keepalive.heard();
                     self.decoder.decode_with(chunk.as_ref(), &mut self.protocol);
                 }
                 Event::Flush => {
@@ -253,6 +287,27 @@ impl<T: Transport> Connection<T> {
         // waiting on frames that will never come.
         self.protocol.shared.shut_down(ended.reason());
         ended.into_result()
+    }
+
+    /// One tick with nothing from the peer, and what the keepalive makes of
+    /// it: a PING queued, nothing, or `Err` with the reason this connection is
+    /// over.
+    ///
+    /// Nothing is flushed here. `write_frame` wakes the flusher, so the next
+    /// turn of the loop finds the output non-empty and sends it — the same
+    /// path every other frame this end produces takes, and one fewer place
+    /// that has to remember to send.
+    fn probe(&mut self) -> Result<(), &'static str> {
+        let in_flight = self.protocol.shared.streams.len() > 0;
+        match self.protocol.keepalive.tick(in_flight) {
+            Due::Nothing => Ok(()),
+            Due::Ping(opaque) => {
+                self.protocol
+                    .write_frame(|out| encode_ping(out, opaque, false));
+                Ok(())
+            }
+            Due::Unanswered => Err("the peer did not answer a keepalive PING"),
+        }
     }
 
     /// §6.8: a connection that is done is said to be done. The GOAWAY is

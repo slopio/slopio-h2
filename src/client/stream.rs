@@ -17,13 +17,18 @@ use std::io;
 use std::pin::pin;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
+use std::time::{Duration, SystemTime};
 
 use http::HeaderMap;
+use runtime::runtime::time::timeout;
 
+use crate::client::STREAM_RECV_WINDOW;
 use crate::client::shared::ClientShared;
 use crate::shared::codec::frames::{encode::encode_window_update, stream_id::StreamId};
 use crate::shared::codec::types::CANCEL;
-use crate::shared::connection::{SendSide, settings::Settings, stream_window::StreamWindow};
+use crate::shared::connection::{
+    DEADLINE_TICK, SendSide, settings::Settings, stream_window::StreamWindow,
+};
 
 /// Why a stream ended before it was done.
 ///
@@ -38,6 +43,14 @@ pub(crate) enum Failure {
     /// a GOAWAY said this request was never processed (§6.8), or this client
     /// cancelled it.
     Gone(&'static str),
+    /// The deadline this request was given ran out, and the stream was
+    /// cancelled for it.
+    ///
+    /// Its own variant rather than a [`Gone`](Self::Gone) with a good message,
+    /// because it is the one failure a caller acts on differently: a timeout
+    /// is `ErrorKind::TimedOut`, which is what a retry decides on without
+    /// reading prose.
+    Expired,
 }
 
 impl Failure {
@@ -45,6 +58,10 @@ impl Failure {
         match self {
             Self::Reset(code) => io::Error::other(format!("stream reset by peer (code {code:#x})")),
             Self::Gone(reason) => io::Error::other(reason),
+            Self::Expired => io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the deadline on this request passed",
+            ),
         }
     }
 }
@@ -72,8 +89,9 @@ pub(crate) struct StreamState {
     ///
     /// Bounded without a limit of its own: nothing is credited back to the
     /// peer until the application takes a chunk, so what can pile up here is
-    /// exactly the receive window — 64 KiB a stream — and that is the whole
-    /// argument for buffering at all rather than pushing back on the loop.
+    /// exactly the receive window — [`STREAM_RECV_WINDOW`] a stream — and that
+    /// is the whole argument for buffering at all rather than pushing back on
+    /// the loop.
     chunks: RefCell<VecDeque<Vec<u8>>>,
     /// §8.1: the trailers, if the response had any.
     trailers: RefCell<Option<HeaderMap>>,
@@ -104,7 +122,7 @@ impl StreamState {
     pub(crate) fn new(id: StreamId, settings: &Settings, end_stream: bool) -> Self {
         Self {
             id,
-            window: StreamWindow::from(settings),
+            window: StreamWindow::new(settings, STREAM_RECV_WINDOW),
             response: RefCell::new(None),
             response_seen: Cell::new(false),
             chunks: RefCell::new(VecDeque::new()),
@@ -310,6 +328,13 @@ pub struct Stream {
     id: StreamId,
     state: Rc<StreamState>,
     shared: Rc<ClientShared>,
+    /// When this request runs out of time, if it was given a deadline.
+    ///
+    /// Held by the handle rather than the state, because it is the handle that
+    /// waits: the connection loop has no opinion about how long a request may
+    /// take, and a deadline it enforced would be a timer per stream armed on
+    /// the loop's behalf for something only the application asked for.
+    deadline: Option<SystemTime>,
     /// Set by [`Stream::close`], so that the drop that follows does nothing a
     /// second time.
     closed: Cell<bool>,
@@ -321,8 +346,36 @@ impl Stream {
             id,
             state,
             shared,
+            deadline: None,
             closed: Cell::new(false),
         }
+    }
+
+    /// Gives this request `within` to finish, from now.
+    ///
+    /// The deadline covers the whole exchange rather than one call on it —
+    /// writing the body, waiting for the head, reading to the end of it — so
+    /// what it bounds is the thing a caller actually cares about. When it
+    /// passes, the stream is cancelled the way [`close`](Self::close) cancels
+    /// it (§8.1: RST_STREAM CANCEL, so the peer stops working and stops
+    /// sending), and every call on the handle answers `ErrorKind::TimedOut`
+    /// from then on — the one that timed out and the ones after it alike.
+    ///
+    /// It is enforced where the application waits, which is the whole of it: a
+    /// deadline on a handle nobody is awaiting passes unnoticed until the next
+    /// call, and a handle nobody awaits *at all* cancels the stream when it is
+    /// dropped anyway. What this is not is a bound the connection keeps on the
+    /// peer's behalf — see [`Connection::run`].
+    ///
+    /// Without one, a request waits as long as the exchange takes. That is
+    /// often right: a server-streaming call has no natural deadline, and the
+    /// keepalive is what notices a peer that has gone rather than one that is
+    /// slow.
+    ///
+    /// [`Connection::run`]: crate::client::Connection::run
+    pub fn with_deadline(mut self, within: Duration) -> Self {
+        self.deadline = Some(runtime::runtime::now() + within);
+        self
     }
 
     /// The id this request went out on (§5.1.1: odd, and never reused).
@@ -344,6 +397,10 @@ impl Stream {
     /// sent: the connection loop owns the send, and an error there ends the
     /// connection rather than this call.
     pub async fn write(&self, data: &[u8], end_stream: bool) -> io::Result<()> {
+        self.within(self.write_body(data, end_stream)).await
+    }
+
+    async fn write_body(&self, data: &[u8], end_stream: bool) -> io::Result<()> {
         if let Some(failure) = self.state.failure.get() {
             return Err(failure.error());
         }
@@ -386,6 +443,10 @@ impl Stream {
     /// second call is an error and not a wait, which is the difference
     /// between a mistake that is reported and one that hangs.
     pub async fn response(&self) -> io::Result<http::Response<()>> {
+        self.within(self.await_response()).await
+    }
+
+    async fn await_response(&self) -> io::Result<http::Response<()>> {
         std::future::poll_fn(|cx| {
             if let Some(response) = self.state.response.borrow_mut().take() {
                 return Poll::Ready(Ok(response));
@@ -416,6 +477,10 @@ impl Stream {
     /// Whatever arrived is delivered before any failure is reported: a body
     /// cut short by a reset is still a body as far as it goes.
     pub async fn read(&self) -> io::Result<Option<Vec<u8>>> {
+        self.within(self.next_chunk()).await
+    }
+
+    async fn next_chunk(&self) -> io::Result<Option<Vec<u8>>> {
         let chunk = std::future::poll_fn(|cx| {
             if let Some(chunk) = self.state.chunks.borrow_mut().pop_front() {
                 return Poll::Ready(Ok(Some(chunk)));
@@ -443,6 +508,37 @@ impl Stream {
         self.state.trailers.borrow_mut().take()
     }
 
+    /// Ends the request with a trailer section: §8.1's second HEADERS, after
+    /// the body, carrying END_STREAM.
+    ///
+    /// This is what `write(.., true)` would otherwise have done, so it is one
+    /// or the other — a request whose body already ended has nothing left to
+    /// put trailers on, and says so rather than sending a frame the peer would
+    /// answer with a stream error.
+    ///
+    /// §8.3 forbids a pseudo-header anywhere in a trailer section, which
+    /// `HeaderMap` already makes impossible: `:` is not a character a
+    /// `HeaderName` may contain. What it does not check is whether the peer
+    /// wants trailers at all — a server is free to ignore them, and §8.1 only
+    /// asks that a sender not put anything essential there.
+    ///
+    /// Not `async`: a trailer section is one small frame, written to the
+    /// output for the loop to send, with no window to wait on (§6.9 meters
+    /// DATA and nothing else).
+    pub fn send_trailers(&self, fields: &HeaderMap) -> io::Result<()> {
+        if let Some(failure) = self.state.failure.get() {
+            return Err(failure.error());
+        }
+        if self.state.no_more_output.get() {
+            return Err(io::Error::other("the request body already ended"));
+        }
+
+        self.shared.core.write_trailers(self.id, fields);
+        self.state.end_output();
+        self.shared.retire_if_closed(self.id.into());
+        Ok(())
+    }
+
     /// Ends this stream now.
     ///
     /// A stream that has finished both halves is merely forgotten. One that
@@ -460,6 +556,52 @@ impl Stream {
         // the connection, and the loop is parked waiting to be told something
         // changed. Letting go is the one change nothing else reports.
         self.shared.core.wake_flusher();
+    }
+
+    /// Runs `op` under this stream's deadline, if it has one.
+    ///
+    /// The wait is taken in slices rather than armed once, for a reason that
+    /// is the runtime's: it serves [`DEADLINE_TICK`] from a store of its own
+    /// and anything else from a timewheel that holds a minute at most, so a
+    /// deadline of five minutes has no timer that fits it. Slicing gives
+    /// arbitrary deadlines the cheap store for the long stretch and the wheel
+    /// only for the last, sub-tick part of the wait — and the precision is the
+    /// wheel's, not the tick's, since the final slice is exactly what is left.
+    ///
+    /// `op` is held across slices rather than restarted: it is polled through
+    /// a `Pin`, so a timed-out slice drops the borrow and not the future, and
+    /// a half-written body stays half-written.
+    async fn within<T>(&self, op: impl Future<Output = io::Result<T>>) -> io::Result<T> {
+        let Some(deadline) = self.deadline else {
+            return op.await;
+        };
+
+        let mut op = pin!(op);
+        loop {
+            let left = deadline
+                .duration_since(runtime::runtime::now())
+                .unwrap_or_default();
+            if left.is_zero() {
+                return Err(self.expire());
+            }
+            match timeout(left.min(DEADLINE_TICK), op.as_mut()).await {
+                Ok(done) => return done,
+                Err(()) => continue,
+            }
+        }
+    }
+
+    /// The deadline passed: the stream is failed with the reason, and then
+    /// cancelled.
+    ///
+    /// In that order, because [`StreamState::fail`] keeps the first failure it
+    /// is given and the cancel brings one of its own. This way everything
+    /// waiting on the stream — and every later call on the handle — reports
+    /// the timeout rather than the reset that carried it out.
+    fn expire(&self) -> io::Error {
+        self.state.fail(Failure::Expired);
+        self.close();
+        Failure::Expired.error()
     }
 
     /// Hands the peer back the credit `len` received bytes were holding, on

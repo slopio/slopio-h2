@@ -8,6 +8,7 @@
 
 use std::rc::Rc;
 
+use crate::client::connection::keepalive::Keepalive;
 use crate::client::shared::ClientShared;
 use crate::shared::codec::{
     frames::{
@@ -45,6 +46,10 @@ pub(super) struct Protocol {
     /// the windows and the live streams.
     pub(super) shared: Rc<ClientShared>,
     pub(super) handshake: Handshake,
+    /// §6.7: how long the peer has been silent, and the probe waiting on it.
+    /// Driven by the loop, which owns the clock; kept here because the ACK
+    /// that answers a probe arrives as a frame.
+    pub(super) keepalive: Keepalive,
     /// Set once this connection must stop being read — a connection error has
     /// been answered with a GOAWAY, or the peer sent one and nothing is left
     /// to answer. Distinct from the shared `closing` flag, which only stops
@@ -61,6 +66,7 @@ impl Protocol {
         Self {
             shared,
             handshake: Handshake::default(),
+            keepalive: Keepalive::default(),
             closing: false,
             failure: None,
         }
@@ -182,11 +188,12 @@ impl FrameHandler for Protocol {
         self.write_frame(encode_settings_ack);
     }
 
-    /// §6.7: a probe is echoed with ACK set. An ACK is the answer to a probe
-    /// of ours, and we send none yet.
+    /// §6.7: a probe is echoed with ACK set, and an ACK is the answer to a
+    /// probe of ours — the keepalive's, since it sends the only ones.
     fn on_ping(&mut self, ack: bool, opaque: [u8; 8]) {
-        if !ack {
-            self.write_frame(|out| encode_ping(out, opaque, true));
+        match ack {
+            true => self.keepalive.acknowledged(opaque),
+            false => self.write_frame(|out| encode_ping(out, opaque, true)),
         }
     }
 

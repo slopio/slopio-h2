@@ -25,6 +25,18 @@
 //! handle reach the same state through an `Rc`, which is why neither is
 //! `Send`: this runtime is a thread per core and a connection belongs to one.
 //!
+//! Two things happen without being asked for, because a connection that is a
+//! task is a connection nobody is watching. It keeps itself honest about the
+//! peer: §6.7 PINGs go out once the peer has been silent for
+//! [`ACTIVE_PING_TICKS`] with a request outstanding, or [`IDLE_PING_TICKS`]
+//! without, and a probe that goes unanswered ends the connection and every
+//! stream on it — the failure TCP alone takes minutes to report. And it
+//! announces windows worth downloading through ([`STREAM_RECV_WINDOW`]), which
+//! a client feels more than a server does.
+//!
+//! What it does not do is bound how long a request may take. That is the
+//! application's to say, with [`Stream::with_deadline`].
+//!
 //! Most of what all this needs is shared with the server, because it was never
 //! server-specific: the frame decoder has a [`client`] constructor, the HPACK
 //! encoder takes request pseudo-headers exactly as it takes `:status`, and the
@@ -57,15 +69,32 @@ pub use connection::Connection;
 pub use shared::Unavailable;
 pub use stream::Stream;
 
+/// The receive window every stream of ours starts with: what this client
+/// announces as `SETTINGS_INITIAL_WINDOW_SIZE`, and so what a server may send
+/// on one response before it needs credit back.
+///
+/// The one knob of inbound flow control, as the server's twin of it is. It sets
+/// how much of a response arrives per round trip — a body below it arrives in
+/// one — and, since credit goes back only for bytes the application has read,
+/// how much one response can pile up against a caller that stops reading: this
+/// much, at most, and once per stream it has open.
+///
+/// A client is the end that mostly downloads, so leaving this at §6.9.2's 65535
+/// is the one setting a client feels immediately: every 64 KiB of every
+/// response stalls until a WINDOW_UPDATE completes a round trip. A megabyte is
+/// where hyper, Netty and grpc-go's tuning land too.
+pub const STREAM_RECV_WINDOW: u32 = 1024 * 1024;
+
 /// The connection receive window this client announces, once the handshake is
 /// done.
 ///
-/// Ours to choose, where the send side is the peer's to credit, and chosen
-/// larger than §6.9.2's 65535 default for the same reason the server's is: a
-/// window that small stalls a download every 64 KiB until a WINDOW_UPDATE
-/// completes a round trip. A client is the end that mostly downloads, so it
-/// is the end where this matters most.
-pub const CONNECTION_RECV_WINDOW: u32 = 1024 * 1024;
+/// As large as §6.9.1 allows, so that it never binds: backpressure is
+/// [`STREAM_RECV_WINDOW`]'s job, and the connection window is only ever the
+/// thing a stream waits on by mistake. Sized like the server's and for the same
+/// reason, with one difference in what it rests on — a server bounds the
+/// streams a stranger may open, where what a client has in flight unconsumed is
+/// bounded by the requests the application itself chose to make.
+pub const CONNECTION_RECV_WINDOW: u32 = i32::MAX as u32;
 
 /// How long [`connect`] has to produce a connection that can carry a request.
 ///
@@ -91,6 +120,58 @@ pub const CONNECTION_RECV_WINDOW: u32 = 1024 * 1024;
 /// trip of SETTINGS. A peer that cannot manage both in ten seconds is not one
 /// a request was going to go well over.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ticks of silence with a stream open before a keepalive PING goes out.
+///
+/// HTTP/2 has no `Keep-Alive` header — §8.2.2 forbids it along with
+/// `Connection` — and the RFC sets no idle timeout anywhere. §6.7's PING is the
+/// whole mechanism: a frame the peer must echo, which proves the connection is
+/// alive in both directions and, incidentally, resets whatever idle timer the
+/// peer keeps.
+///
+/// Four ticks is twenty seconds, and the number is chosen against the strictest
+/// timeout we know of, which is our own server's: it drops a peer that has a
+/// stream open and has said nothing for `ACTIVE_TICKS` — thirty seconds. A
+/// client waiting on a response *is* a silent peer, and a slow handler or a
+/// server-streaming call is silence it cannot help. Probing at twenty leaves a
+/// tick of slack for the granularity, since a deadline counted in ticks fires
+/// up to one late.
+///
+/// The cost of being wrong in the other direction is a peer that thinks it is
+/// being flooded: gRPC servers enforce a minimum interval between pings and
+/// answer a client that beats it with GOAWAY ENHANCE_YOUR_CALM. That
+/// enforcement is aimed at pings on connections with nothing in flight, which
+/// is what [`IDLE_PING_TICKS`] is the conservative half of.
+pub const ACTIVE_PING_TICKS: u32 = 4;
+
+/// Ticks of silence with nothing in flight before a keepalive PING goes out.
+///
+/// Twelve ticks is a minute, against the two minutes our server lets an idle
+/// peer sit there (`IDLE_TICKS`) — the same halving as
+/// [`ACTIVE_PING_TICKS`], applied to the budget that is four times longer.
+///
+/// What this buys is a connection that survives being held for reuse: the
+/// NAT and load-balancer tables that forget an idle flow do so in minutes, and
+/// a connection nobody has noticed is dead fails the next request rather than
+/// this one. What it costs is a frame a minute per connection the application
+/// is not using, and the risk that a strict peer counts it as a flood. A client
+/// that holds many idle connections to one gRPC server is the case to raise
+/// this for.
+pub const IDLE_PING_TICKS: u32 = 12;
+
+/// Ticks a keepalive PING may go unanswered before the connection is given up
+/// on.
+///
+/// Four ticks is twenty seconds, which is generous for a frame the peer's
+/// protocol layer echoes without asking anything above it: §6.7 requires the
+/// ACK as soon as the frame is read, so this outlasts a handful of
+/// retransmissions and not much else. A peer that has not answered by then is
+/// one whose socket is open and whose other end is gone — the failure TCP alone
+/// takes minutes to report, and the whole reason to probe.
+///
+/// Only one probe is outstanding at a time, so this is the full budget and not
+/// the first of several.
+pub const PING_TIMEOUT_TICKS: u32 = 4;
 
 /// A connection to one server: the handle requests are made on.
 ///

@@ -20,6 +20,7 @@ use runtime_core::runtime::time::timeout;
 use super::Connection;
 use crate::client::{Client, Unavailable};
 use crate::shared::codec::frames::CLIENT_PREFACE;
+use crate::shared::connection::DEADLINE_TICK;
 use crate::shared::connection::settings::Settings;
 use crate::shared::transport::PlainMessages;
 
@@ -507,14 +508,18 @@ fn a_request_body_goes_out_as_data_frames() {
 /// the credit has to flow or the peer stops at 64 KiB.
 #[test]
 fn reading_the_body_credits_the_peer() {
-    // Four frames that pass the stream's release threshold (half of 65535)
-    // only together, so the WINDOW_UPDATE is the last read's: one frame for
-    // the lot, which is the accumulation working. Each is within the 16384
-    // this client allows a frame to be, since a peer that sent more would be
-    // answered with a connection error instead.
-    let chunk = vec![b'x'; 10_000];
+    // Frames that pass the stream's release threshold — half of
+    // `STREAM_RECV_WINDOW` — only together, so the WINDOW_UPDATE is the last
+    // read's: one frame for the lot, which is the accumulation working. Each
+    // is within the 16384 this client allows a frame to be, since a peer that
+    // sent more would be answered with a connection error instead.
+    const CHUNK: usize = 10_000;
+    let chunks = (crate::client::STREAM_RECV_WINDOW as usize / 2).div_ceil(CHUNK);
+    let body = chunks * CHUNK;
+
+    let chunk = vec![b'x'; CHUNK];
     let mut response = frame(HEADERS, FLAG_END_HEADERS, 1, STATUS_200);
-    for _ in 0..4 {
+    for _ in 0..chunks {
         response.extend_from_slice(&frame(DATA, 0, 1, &chunk));
     }
 
@@ -522,7 +527,7 @@ fn reading_the_body_credits_the_peer() {
     inbound.extend(split(response, Duration::from_millis(10)));
     inbound.push(ReadEvent::Eof.after(Duration::from_millis(200)));
 
-    let (read, written) = with_client(inbound, |client| async move {
+    let (read, written) = with_client(inbound, move |client| async move {
         let request = http::Request::get("http://example.test/big")
             .body(())
             .unwrap();
@@ -532,7 +537,7 @@ fn reading_the_body_credits_the_peer() {
         // By size and not by count: a read hands over what arrived, and a
         // frame cut by the end of a segment arrives in pieces.
         let mut total = 0;
-        while total < 40_000 {
+        while total < body {
             total += stream
                 .read()
                 .await
@@ -544,17 +549,26 @@ fn reading_the_body_credits_the_peer() {
         total
     });
 
-    assert_eq!(read, 40_000);
+    assert_eq!(read, body);
 
     let updates: Vec<Frame> = frames(&written)
         .into_iter()
         .filter(|f| f.kind == WINDOW_UPDATE && f.stream_id == 1)
         .collect();
-    assert_eq!(updates.len(), 1, "one frame for four chunks, not one each");
     assert_eq!(
-        u32::from_be_bytes(updates[0].payload[..4].try_into().unwrap()),
-        40_000,
-        "everything read so far"
+        updates.len(),
+        1,
+        "one frame for {chunks} chunks, not one each"
+    );
+    // What it credits is everything read when the threshold was crossed, and
+    // the read that crossed it is whatever the ring happened to deliver — a
+    // DATA frame cut by the end of a segment arrives in pieces. So the amount
+    // is bounded rather than exact: at least the threshold, since that is what
+    // released it, and no more than has been read.
+    let credited = u32::from_be_bytes(updates[0].payload[..4].try_into().unwrap()) as usize;
+    assert!(
+        (crate::client::STREAM_RECV_WINDOW as usize / 2..=body).contains(&credited),
+        "the accumulated credit, announced once it was worth a frame: {credited}"
     );
 }
 
@@ -965,4 +979,319 @@ fn the_end_can_be_asked_for_after_it_has_happened() {
     );
 
     assert!(ended);
+}
+
+/// §6.9.2: a stream's receive window is what its owner announced in SETTINGS,
+/// and a client that announces nothing gets 65535 — every response stalled
+/// every 64 KiB until a WINDOW_UPDATE completes a round trip. The one setting
+/// a downloading client feels immediately.
+#[test]
+fn the_stream_window_is_announced_in_the_handshake() {
+    let (_, written) = handshake(vec![ReadEvent::Data(server_opening())]);
+
+    let settings = frames(&written)
+        .into_iter()
+        .find(|f| f.kind == SETTINGS && f.flags & FLAG_ACK == 0)
+        .expect("our SETTINGS went out");
+
+    // §6.5.1: an identifier/value pair per six bytes. 0x4 is
+    // SETTINGS_INITIAL_WINDOW_SIZE.
+    let announced = settings
+        .payload
+        .chunks(6)
+        .find(|entry| u16::from_be_bytes([entry[0], entry[1]]) == 0x4)
+        .map(|entry| u32::from_be_bytes(entry[2..6].try_into().unwrap()))
+        .expect("SETTINGS_INITIAL_WINDOW_SIZE is one of them");
+    assert_eq!(announced, crate::client::STREAM_RECV_WINDOW);
+}
+
+/// Lets `d` of virtual time pass. The clock is the simulation's, so a minute
+/// of it costs the test nothing — and the connection loop, which wakes on its
+/// own tick, has the thread while we are not using it.
+async fn wait(d: Duration) {
+    let _ = timeout(d, std::future::pending::<()>()).await;
+}
+
+/// §6.7: a peer that has said nothing while a request is outstanding is asked
+/// whether it is still there.
+///
+/// The silence a client cannot distinguish from a dead peer is exactly the
+/// silence a slow handler produces, which is why the probe exists: it is the
+/// only way to tell them apart, and the answer also resets whatever idle timer
+/// the peer keeps against *us*.
+#[test]
+fn a_silent_peer_with_a_request_in_flight_is_probed() {
+    let probe_due = DEADLINE_TICK * crate::client::ACTIVE_PING_TICKS;
+
+    let (_, written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            // The response never comes, and the peer never hangs up: the
+            // failure a probe is for looks exactly like a slow server.
+            ReadEvent::Eof.after(probe_due * 4),
+        ],
+        move |client| async move {
+            let request = http::Request::get("http://example.test/slow")
+                .body(())
+                .unwrap();
+            let stream = client.send_request(&request, true).expect("a stream");
+            // Comfortably past the budget, comfortably short of giving up.
+            wait(probe_due + DEADLINE_TICK).await;
+            drop(stream);
+        },
+    );
+
+    let probes: Vec<Frame> = frames(&written)
+        .into_iter()
+        .filter(|f| f.kind == PING && f.flags & FLAG_ACK == 0)
+        .collect();
+    assert_eq!(probes.len(), 1, "one probe, not one per tick");
+    assert_eq!(probes[0].stream_id, 0, "§6.7: PING is the connection's");
+    assert_eq!(probes[0].payload.len(), 8, "§6.7: eight opaque bytes");
+}
+
+/// A connection whose probe is never answered is not a connection, whatever
+/// the socket says — and everything waiting on it is told so rather than
+/// waiting for the kernel to finish retransmitting, minutes later.
+#[test]
+fn a_peer_that_never_answers_a_probe_is_given_up_on() {
+    let probe_due = DEADLINE_TICK * crate::client::ACTIVE_PING_TICKS;
+    let give_up = probe_due + DEADLINE_TICK * crate::client::PING_TIMEOUT_TICKS;
+
+    let ((failure, closed), written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            // Long after the client should have stopped waiting.
+            ReadEvent::Eof.after(give_up * 4),
+        ],
+        move |client| async move {
+            let request = http::Request::get("http://example.test/gone")
+                .body(())
+                .unwrap();
+            let stream = client.send_request(&request, true).expect("a stream");
+            // The stream is failed by the connection ending, which is what
+            // resolves this: no deadline of its own is involved.
+            let failure = stream
+                .response()
+                .await
+                .expect_err("the connection went")
+                .to_string();
+            drop(stream);
+            (failure, client.is_closed())
+        },
+    );
+
+    assert!(
+        failure.contains("keepalive"),
+        "the stream is told why the connection went: {failure}"
+    );
+    assert!(closed, "and the client knows it can take no more requests");
+
+    // §6.8: said out loud rather than dropped, on the chance the peer is
+    // listening after all.
+    assert!(
+        frames(&written).iter().any(|f| f.kind == GOAWAY),
+        "a GOAWAY went out"
+    );
+}
+
+/// Any frame is an answer: the question a probe asks is whether the peer is
+/// there, and a peer that says anything at all has answered it.
+#[test]
+fn a_peer_that_answers_keeps_the_connection() {
+    let probe_due = DEADLINE_TICK * crate::client::ACTIVE_PING_TICKS;
+    let give_up = probe_due + DEADLINE_TICK * crate::client::PING_TIMEOUT_TICKS;
+
+    // §6.7: the opaque comes back byte for byte, and the first probe of a
+    // connection carries the first counter.
+    let ack = frame(PING, FLAG_ACK, 0, &1u64.to_be_bytes());
+
+    let (closed, _) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(ack).after(probe_due + Duration::from_millis(10)),
+            ReadEvent::Eof.after(give_up * 4),
+        ],
+        move |client| async move {
+            let request = http::Request::get("http://example.test/slow")
+                .body(())
+                .unwrap();
+            let stream = client.send_request(&request, true).expect("a stream");
+            // Past the point an unanswered probe would have ended this.
+            wait(give_up + DEADLINE_TICK).await;
+            let closed = client.is_closed();
+            drop(stream);
+            closed
+        },
+    );
+
+    assert!(!closed, "the answer kept it alive");
+}
+
+/// An idle connection is probed on the longer budget. A client holding
+/// connections for reuse that probed each of them as often as one with a
+/// request outstanding is the shape a gRPC server answers with GOAWAY
+/// ENHANCE_YOUR_CALM.
+#[test]
+fn an_idle_connection_is_not_probed_on_the_active_budget() {
+    let active = DEADLINE_TICK * crate::client::ACTIVE_PING_TICKS;
+    let idle = DEADLINE_TICK * crate::client::IDLE_PING_TICKS;
+
+    let (_, written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Eof.after(idle * 4),
+        ],
+        move |client| async move {
+            // Held, with nothing on it, well past the active budget.
+            wait(active + DEADLINE_TICK).await;
+            drop(client);
+        },
+    );
+
+    assert!(
+        !frames(&written)
+            .iter()
+            .any(|f| f.kind == PING && f.flags & FLAG_ACK == 0),
+        "nothing was in flight, so nothing was asked"
+    );
+}
+
+/// §8.1: a request may end with a trailer section exactly as a response does.
+#[test]
+fn a_request_can_end_with_trailers() {
+    let (_, written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let request = http::Request::post("http://example.test/upload")
+                .body(())
+                .unwrap();
+            let stream = client.send_request(&request, false).expect("a stream");
+            stream.write(b"body", false).await.expect("a body");
+
+            let mut fields = http::HeaderMap::new();
+            fields.insert("x-checksum", "42".parse().unwrap());
+            stream.send_trailers(&fields).expect("a trailer section");
+
+            // The body is over, so there is nothing left to write.
+            let refused = stream.write(b"more", true).await;
+            assert!(refused.is_err(), "the request already ended");
+
+            settle().await;
+        },
+    );
+
+    let blocks: Vec<Frame> = frames(&written)
+        .into_iter()
+        .filter(|f| f.kind == HEADERS && f.stream_id == 1)
+        .collect();
+    assert_eq!(blocks.len(), 2, "the request head, and its trailers");
+    assert_eq!(
+        blocks[0].flags & FLAG_END_STREAM,
+        0,
+        "the head does not end a request that has a body"
+    );
+    assert_eq!(
+        blocks[1].flags & FLAG_END_STREAM,
+        FLAG_END_STREAM,
+        "§8.1: the trailer section ends the message"
+    );
+
+    let trailers = decode_block(&blocks[1].payload);
+    assert_eq!(trailers.get("x-checksum").map(String::as_str), Some("42"));
+    assert!(
+        !trailers.keys().any(|name| name.starts_with(':')),
+        "§8.3: no pseudo-header in a trailer section"
+    );
+}
+
+/// A request that runs out of time is cancelled, and says why.
+///
+/// The stream goes with a RST_STREAM rather than the caller merely walking
+/// away from it: §8.1's way of telling a server to stop working on something
+/// nobody is waiting for any more, which it cannot infer from a client that
+/// simply stops reading.
+#[test]
+fn a_deadline_cancels_the_request() {
+    let (outcome, written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Eof.after(Duration::from_secs(60)),
+        ],
+        |client| async move {
+            let request = http::Request::get("http://example.test/slow")
+                .body(())
+                .unwrap();
+            let stream = client
+                .send_request(&request, true)
+                .expect("a stream")
+                .with_deadline(Duration::from_secs(1));
+
+            let timed_out = stream.response().await.expect_err("nothing answered");
+            // Every later call reports the same thing, rather than the reset
+            // that carried it out or a wait that will not end.
+            let after = stream.read().await.expect_err("the stream is over");
+
+            settle().await;
+            (timed_out.kind(), after.kind(), client.live_streams())
+        },
+    );
+
+    assert_eq!(outcome.0, io::ErrorKind::TimedOut, "the deadline passed");
+    assert_eq!(outcome.1, io::ErrorKind::TimedOut, "and it keeps saying so");
+    assert_eq!(outcome.2, 0, "the stream is off the connection");
+
+    let reset = frames(&written)
+        .into_iter()
+        .find(|f| f.kind == RST_STREAM)
+        .expect("§8.1: the peer is told to stop");
+    assert_eq!(reset.stream_id, 1);
+    assert_eq!(
+        u32::from_be_bytes(reset.payload[..4].try_into().unwrap()),
+        crate::shared::codec::types::CANCEL,
+        "CANCEL: nobody is waiting for this any more"
+    );
+}
+
+/// A deadline longer than any single timer the runtime has. It is served in
+/// slices, and the slicing must not be visible: what expires is the deadline,
+/// not the first slice of it.
+#[test]
+fn a_deadline_longer_than_one_tick_is_still_one_deadline() {
+    let past_a_tick = DEADLINE_TICK * 3 + Duration::from_millis(500);
+
+    let (kind, _) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            // The response arrives while the deadline still has a slice to
+            // run, so a client that expired at the end of a slice would fail
+            // a request that was answered in time.
+            ReadEvent::Data(frame(
+                HEADERS,
+                FLAG_END_HEADERS | FLAG_END_STREAM,
+                1,
+                STATUS_200,
+            ))
+            .after(DEADLINE_TICK * 2),
+            ReadEvent::Eof.after(DEADLINE_TICK * 10),
+        ],
+        move |client| async move {
+            let request = http::Request::get("http://example.test/slow")
+                .body(())
+                .unwrap();
+            let stream = client
+                .send_request(&request, true)
+                .expect("a stream")
+                .with_deadline(past_a_tick);
+            stream.response().await.map(|response| response.status())
+        },
+    );
+
+    assert_eq!(
+        kind.expect("answered within the deadline"),
+        http::StatusCode::OK
+    );
 }
