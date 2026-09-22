@@ -108,20 +108,13 @@ const _: () = assert!(
 /// once that day comes, since the rate is the thing actually meant.
 pub const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The one duration any read deadline is ever armed for.
+/// The one duration any read deadline is ever armed for, and the unit every
+/// wait below is counted in. Shared with the client, which arms it just as
+/// often and for the same reason.
 ///
-/// Every wait below is a count of these rather than a timer of its own length,
-/// and that is a performance decision, not a stylistic one. The runtime keeps a
-/// store for exactly this duration, separate from its timewheel, and it is the
-/// only one a read can afford: a timer is armed and cancelled on *every* chunk,
-/// some 300k times a second per core, and a wheel entry is reclaimed when the
-/// wheel ticks past it rather than when it is cancelled. Arming 30s on the
-/// wheel at that rate measured 178 MB of RSS at 100 connections against 10 MB
-/// here — half a minute of dead slots, all live at once.
-///
-/// It also caps how long anything below can hold a connection: a deadline is
-/// only as precise as this, and all of them are multiples of it.
-pub const DEADLINE_TICK: Duration = Duration::from_secs(5);
+/// It caps how long anything below can hold a connection: a deadline is only as
+/// precise as this, and all of them are multiples of it.
+pub use crate::shared::connection::DEADLINE_TICK;
 
 /// How long a peer with nothing outstanding may send nothing at all.
 ///

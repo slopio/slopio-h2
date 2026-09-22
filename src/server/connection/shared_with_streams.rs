@@ -212,17 +212,6 @@ impl SharedConnection {
         }
     }
 
-    /// Writes a trailer section: the fields and END_STREAM, no pseudo-header
-    /// (§8.1). Whether the stream is in a state to take one is the caller's
-    /// to have checked.
-    pub fn write_trailers(&self, stream_id: StreamId, fields: &HeaderMap) {
-        let headers = fields.iter().map(|(name, value)| Header::Field {
-            name: Some(name.clone()),
-            value: value.clone(),
-        });
-        self.write_headers(stream_id, headers, true);
-    }
-
     /// Takes `n` body bytes off the stream on the handler's behalf and gives
     /// the peer back the credit they were holding — on the stream and on the
     /// connection both, §6.9.1 having debited both when they arrived.

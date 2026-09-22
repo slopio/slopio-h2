@@ -14,7 +14,7 @@ use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::VecDeque;
 use std::task::{Poll, Waker};
 
-use http::HeaderName;
+use http::{HeaderMap, HeaderName};
 
 use crate::shared::codec::frames::{
     encode::{encode_data_header, encode_header_block, encode_window_update},
@@ -331,6 +331,20 @@ impl SharedConnection {
         let limit = (self.max_frame_size.get() as usize).max(1);
 
         self.write_frame(|out| encode_header_block(out, stream_id, &block, limit, end_stream));
+    }
+
+    /// Writes a trailer section: the fields and END_STREAM, no pseudo-header
+    /// (§8.1). Whether the stream is in a state to take one is the caller's to
+    /// have checked.
+    ///
+    /// Neither end's, which is why it is here: §8.1 lets a request carry
+    /// trailers exactly as a response does, and the frame is the same one.
+    pub fn write_trailers(&self, stream_id: StreamId, fields: &HeaderMap) {
+        let headers = fields.iter().map(|(name, value)| Header::Field {
+            name: Some(name.clone()),
+            value: value.clone(),
+        });
+        self.write_headers(stream_id, headers, true);
     }
 
     /// Writes a body as DATA frames, END_STREAM on the last one. Resolves once
