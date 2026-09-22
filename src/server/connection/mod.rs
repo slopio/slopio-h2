@@ -129,15 +129,32 @@ pub use crate::shared::connection::DEADLINE_TICK;
 /// 24 ticks of 5s: two minutes.
 pub const IDLE_TICKS: u32 = 24;
 
-/// How long a peer that has a stream open may send nothing.
+/// How long a peer that has a stream open may send nothing before we ask,
+/// with a PING (§6.7), whether it is still there.
 ///
-/// Stricter than idle because the connection is holding state on its behalf: a
-/// live stream owns one of `MAX_CONCURRENT_STREAMS`, a receive window, and
-/// whatever its body has buffered. A peer that opens 64 streams and goes quiet
-/// is not idle, it is parked on everything the connection has.
+/// Asked rather than assumed, because silence here proves nothing. A peer
+/// waiting on a slow handler, a long poll or a server-streaming call has
+/// nothing to say, and closing on it blamed the peer for time that was ours —
+/// most clients send no keepalive of their own. What silence cannot tell apart
+/// from that is a peer that is gone, and an unanswered PING can.
+///
+/// What the old deadline also caught, a peer that opens streams and then
+/// holds them without sending their bodies, is the sweep's: it runs on
+/// whatever the peer sends, the PING's answer included, and
+/// `body_is_starving` resets a stream whose body is not coming.
 ///
 /// 6 ticks of 5s: thirty seconds.
 pub const ACTIVE_TICKS: u32 = 6;
+
+/// How long our PING may go unanswered before the peer is taken to be gone.
+///
+/// §6.7 has the ACK sent as soon as the frame is read, by the protocol layer
+/// and without asking the application, so this outlasts a few
+/// retransmissions and not much else — the same budget the client gives its
+/// own probes.
+///
+/// 4 ticks of 5s: twenty seconds.
+pub const PING_TIMEOUT_TICKS: u32 = 4;
 
 /// How long a peer may leave something half-sent.
 ///
@@ -207,6 +224,16 @@ enum Event<B> {
     Failed,
 }
 
+/// What the peer's silence calls for, at the top of a turn.
+enum Due {
+    /// Nothing yet: whatever it is waiting on is within its budget.
+    Nothing,
+    /// Ask it whether it is still there.
+    Ping,
+    /// It is out of time, and this is what the GOAWAY says.
+    Close(&'static str),
+}
+
 /// One HTTP/2 connection: bytes come in through `transport`, `decoder` cuts
 /// them into frames, and each frame is dispatched into `protocol`.
 ///
@@ -229,6 +256,10 @@ pub struct Connection<T: Transport, H: Handler> {
     partial_since: Option<std::time::SystemTime>,
     /// When the streams were last swept for a starving one.
     last_swept: std::time::SystemTime,
+    /// When our PING went out, while it is unanswered. Anything the peer
+    /// sends answers it: a frame of any kind comes from an end that is alive,
+    /// which is all the probe was asking.
+    probe_sent: Option<SystemTime>,
 }
 
 impl<T: Transport, H: Handler> Connection<T, H> {
@@ -239,6 +270,7 @@ impl<T: Transport, H: Handler> Connection<T, H> {
             protocol: Protocol::new(handler),
             partial_since: None,
             last_swept: runtime::runtime::now(),
+            probe_sent: None,
         }
     }
 
@@ -261,13 +293,19 @@ impl<T: Transport, H: Handler> Connection<T, H> {
         // ring that will not refill, not one that was briefly empty.
         let mut dry_reads = 0;
         loop {
-            if self.wait_expired(last_heard) {
-                // §6.8: say so rather than vanishing. The GOAWAY is queued, so
-                // it needs the drain to carry it.
-                self.protocol.time_out();
-                let _ = self.drain().await;
-                let _ = self.transport.shutdown().await;
-                return;
+            match self.due(last_heard) {
+                Due::Nothing => {}
+                // Queued, which wakes the loop's own flush: the next turn
+                // sends it.
+                Due::Ping => self.protocol.ping(),
+                Due::Close(reason) => {
+                    // §6.8: say so rather than vanishing. The GOAWAY is
+                    // queued, so it needs the drain to carry it.
+                    self.protocol.time_out(reason);
+                    let _ = self.drain().await;
+                    let _ = self.transport.shutdown().await;
+                    return;
+                }
             }
             let chunk = match timeout(DEADLINE_TICK, self.next_event()).await {
                 // A tick with nothing to do: only the deadlines above had
@@ -324,6 +362,7 @@ impl<T: Transport, H: Handler> Connection<T, H> {
             // which is not the shape a benchmark produces.
             self.decoder.decode_with(chunk.as_ref(), &mut self.protocol);
             last_heard = runtime::runtime::now();
+            self.probe_sent = None;
             dry_reads = 0;
             self.sweep_if_due();
             // The drain carries the GOAWAY, if there was one. An invalid
@@ -364,39 +403,63 @@ impl<T: Transport, H: Handler> Connection<T, H> {
         }
     }
 
-    /// How long the peer may say nothing, given what it has left half-said.
+    /// What the peer's silence calls for, given what it has left half-said
+    /// and what it has open.
     ///
-    /// Three states rather than one deadline, because the honest reasons for
-    /// silence differ by an order of magnitude between them. A peer with
-    /// nothing outstanding is entitled to sit there; a peer that stopped in the
-    /// middle of a frame is not.
+    /// Several states rather than one deadline, because the honest reasons for
+    /// silence differ by an order of magnitude between them:
     ///
-    /// Dropping the read future is safe where dropping a send is not:
-    /// `MultiRecv` queues its completions in a buffer it owns and `poll_next`
-    /// drains that queue, so the multishot stays armed and nothing is lost
-    /// between one poll and the next.
-    /// Whether the peer has run out of time to say something.
+    /// - A half-sent frame gets a wall-clock budget from when it started,
+    ///   which more of the same frame does not refill. Nothing legitimate
+    ///   stops in the middle of one.
+    /// - A peer with nothing open is entitled to sit there, for `IDLE_TICKS`.
+    ///   That one is our policy on idle connections, not a question about the
+    ///   peer, so it is not asked with a PING.
+    /// - A peer with a stream open may well be waiting on us, so its silence
+    ///   is a question, asked after `ACTIVE_TICKS` with a PING, and it is
+    ///   closed only when that goes unanswered.
     ///
-    /// Two clocks, because two different things are bounded. A half-sent frame
-    /// gets a wall-clock budget from when it started, which more of the same
-    /// frame does not refill. Everything else gets the silence since the
-    /// peer's last chunk, which any byte resets — and that is right there,
-    /// because a peer sending real frames is a peer making progress.
+    /// Silence is measured from the peer's last chunk, which any byte resets —
+    /// right for everything but the half-sent frame, because a peer sending
+    /// real frames is a peer making progress.
+    ///
+    /// Clocks that step backwards floor at zero, as `Stream::age` does, so an
+    /// adjustment cannot close a connection.
     #[inline]
-    fn wait_expired(&mut self, last_heard: SystemTime) -> bool {
+    fn due(&mut self, last_heard: SystemTime) -> Due {
         let now = runtime::runtime::now();
+        let since = |then: SystemTime| now.duration_since(then).unwrap_or_default();
+
         if !self.decoder.preface_seen() || self.decoder.header_pending() {
-            let since = *self.partial_since.get_or_insert(now);
-            // Floors at zero on a clock that stepped backwards, as
-            // `Stream::age` does, so an adjustment cannot close a connection.
-            return now.duration_since(since).unwrap_or_default() >= PARTIAL_TIMEOUT;
+            let started = *self.partial_since.get_or_insert(now);
+            return match since(started) >= PARTIAL_TIMEOUT {
+                true => Due::Close("idle too long"),
+                false => Due::Nothing,
+            };
         }
         self.partial_since = None;
-        let allowed = match self.protocol.has_live_streams() {
-            true => ACTIVE_TICKS,
-            false => IDLE_TICKS,
-        };
-        now.duration_since(last_heard).unwrap_or_default() >= DEADLINE_TICK * allowed
+
+        // Asked first: the question stands whatever has closed since, and a
+        // peer that cannot answer it is gone either way.
+        if let Some(sent) = self.probe_sent {
+            return match since(sent) >= DEADLINE_TICK * PING_TIMEOUT_TICKS {
+                true => Due::Close("keepalive PING unanswered"),
+                false => Due::Nothing,
+            };
+        }
+
+        let silent = since(last_heard);
+        if !self.protocol.has_live_streams() {
+            return match silent >= DEADLINE_TICK * IDLE_TICKS {
+                true => Due::Close("idle too long"),
+                false => Due::Nothing,
+            };
+        }
+        if silent < DEADLINE_TICK * ACTIVE_TICKS {
+            return Due::Nothing;
+        }
+        self.probe_sent = Some(now);
+        Due::Ping
     }
 
     /// Sweeps for starving streams, a few seconds apart at most.

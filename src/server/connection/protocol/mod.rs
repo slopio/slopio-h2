@@ -163,6 +163,8 @@ pub struct Protocol<H: Handler> {
     /// Purposeless frames since the last request frame, against
     /// `ODD_FRAME_BURST`.
     odd_frames: u32,
+    /// Keepalive PINGs sent, which is what their opaques count.
+    pings_sent: u64,
 }
 
 struct Streams<H: Handler> {
@@ -412,6 +414,7 @@ impl<H: Handler> Protocol<H> {
             faults: 0,
             control_frames: 0,
             odd_frames: 0,
+            pings_sent: 0,
         }
     }
 
@@ -433,9 +436,23 @@ impl<H: Handler> Protocol<H> {
     /// client that reconnects on NO_ERROR is doing the right thing. The peer
     /// that *was* misbehaving — the one holding a half-sent frame — is told
     /// the same thing, because the two are indistinguishable from here and
-    /// nothing is gained by guessing.
-    pub(super) fn time_out(&mut self) {
-        self.fail_connection(NO_ERROR, "idle too long");
+    /// nothing is gained by guessing. So is a peer that did not answer our
+    /// PING, which most likely will never read it.
+    pub(super) fn time_out(&mut self, reason: &'static str) {
+        self.fail_connection(NO_ERROR, reason);
+    }
+
+    /// §6.7: asks the peer whether it is still there.
+    ///
+    /// The opaque is a count of probes, so no two are alike, but nothing
+    /// checks it on the way back: any frame from the peer answers the
+    /// question, and the loop takes it as the answer before the ACK is
+    /// dispatched.
+    pub(super) fn ping(&mut self) {
+        self.pings_sent += 1;
+        let opaque = self.pings_sent.to_be_bytes();
+        self.shared
+            .write_frame(|out| encode_ping(out, opaque, false));
     }
 
     pub(super) fn is_closing(&self) -> bool {
@@ -660,8 +677,9 @@ impl<H: Handler> FrameHandler for Protocol<H> {
         // Judged on DATA because that is when the evidence changes, and only
         // while the body is still coming: a peer that has sent END_STREAM owes
         // nothing more, however slowly it got there. A stream that is starved
-        // of DATA entirely never reaches here at all — `ACTIVE_TICKS` is
-        // what collects that one, at the connection.
+        // of DATA entirely never reaches here at all — the sweep collects
+        // that one, on whatever else the peer sends, the answer to our
+        // keepalive PING included.
         if received.is_ok() && !end_stream && self.streams.body_is_starving(raw) {
             self.reset_stream(stream_id, ENHANCE_YOUR_CALM);
             return self.count_fault("too many starved bodies");
@@ -802,9 +820,10 @@ impl<H: Handler> FrameHandler for Protocol<H> {
     }
 
     /// §6.7: a probe is answered with the same opaque data, ACK set. An ACK
-    /// is the peer answering a probe of ours; we send none yet, so it is
-    /// dropped. The decoder has already enforced stream 0 and the 8-byte
-    /// length.
+    /// is the peer answering a probe of ours, and there is nothing left to do
+    /// with it: arriving at all was the answer, and the loop has already
+    /// taken it (see [`Protocol::ping`]). The decoder has already enforced
+    /// stream 0 and the 8-byte length.
     fn on_ping(&mut self, ack: bool, opaque: [u8; 8]) {
         if ack {
             return;

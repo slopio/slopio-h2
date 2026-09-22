@@ -12,7 +12,7 @@ use runtime_core::runtime::time::Sleep;
 use super::{
     DATA, FLAG_END_HEADERS, FLAG_END_STREAM, Frame, GET_BLOCK, GOAWAY, HEADERS, PING, PREFACE,
     RST_STREAM, SETTINGS, deliveries, frame, run_connection, run_connection_with,
-    run_connection_writes,
+    run_connection_timed, run_connection_writes,
 };
 
 const FLAG_PADDED: u8 = 0x8;
@@ -122,7 +122,8 @@ fn a_late_response_leaves_without_waiting_for_the_peer() {
 /// quiet keeps waking the loop, and a deadline counted in ticks that such a
 /// wake restarts would never expire — the connection would last as long as
 /// the handler kept writing. Silence is measured from the peer's last chunk,
-/// so `ACTIVE_TICKS` still ends it.
+/// so `ACTIVE_TICKS` still brings the PING, and the PING going unanswered
+/// ends it.
 #[test]
 fn a_streaming_response_does_not_keep_a_silent_peer_alive() {
     let mut open = preface();
@@ -154,14 +155,99 @@ fn a_streaming_response_does_not_keep_a_silent_peer_alive() {
         .iter()
         .find(|f| f.kind == GOAWAY)
         .unwrap_or_else(|| panic!("the silent peer was let go: {written:?}"));
-    assert_eq!(&goaway.payload[8..], b"idle too long");
-    // One DATA every two seconds for `ACTIVE_TICKS` of silence, give or take
-    // a tick — not the five hundred the EOF would have allowed.
+    assert_eq!(&goaway.payload[8..], b"keepalive PING unanswered");
+    assert!(
+        written.iter().any(|f| f.kind == PING && f.flags & 0x1 == 0),
+        "it was asked first: {written:?}"
+    );
+    // One DATA every two seconds, for `ACTIVE_TICKS` of silence and then
+    // `PING_TIMEOUT_TICKS` without an answer, give or take a tick — not the
+    // five hundred the EOF would have allowed.
     let data = written.iter().filter(|f| f.kind == DATA).count() as u32;
-    let expected = super::super::ACTIVE_TICKS * 5 / 2;
+    let expected = (super::super::ACTIVE_TICKS + super::super::PING_TIMEOUT_TICKS) * 5 / 2;
     assert!(
         (expected - 3..=expected + 3).contains(&data),
         "{data} DATA frames, expected about {expected}"
+    );
+}
+
+/// A handler that takes longer than `ACTIVE_TICKS` to answer, for a peer that
+/// sent its whole request and has nothing more to say — a slow RPC, a long
+/// poll. Its silence used to close the connection at thirty seconds, blaming
+/// it for time that was the handler's. It is asked with a PING instead, and a
+/// peer that answers is served.
+#[test]
+fn a_handler_slower_than_the_active_deadline_is_waited_for() {
+    let mut open = preface();
+    open.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        GET_BLOCK,
+    ));
+
+    let second = Duration::from_secs(1);
+    let silence = second * 5 * super::super::ACTIVE_TICKS;
+    let inbound: Vec<Scripted> = vec![
+        ReadEvent::Data(open).into(),
+        // The ACK our probe asks for, a few seconds after it went out. Any
+        // opaque will do: whatever the peer sends answers the question.
+        ReadEvent::Data(frame(PING, 0x1, 0, &1u64.to_be_bytes())).after(silence + second * 7),
+        ReadEvent::Eof.after(silence + second * 30),
+    ];
+
+    let written = run_connection_with(
+        inbound,
+        |_, _| {},
+        |stream: crate::server::Stream| async move {
+            Sleep::during(Duration::from_secs(40)).await;
+            stream.write_headers_final(http::StatusCode::OK, &http::HeaderMap::new());
+        },
+    );
+
+    let probe = written
+        .iter()
+        .position(|f| f.kind == PING && f.flags & 0x1 == 0)
+        .unwrap_or_else(|| panic!("the silent peer was asked: {written:?}"));
+    let response = written
+        .iter()
+        .position(|f| f.kind == HEADERS && f.stream_id == 1)
+        .unwrap_or_else(|| panic!("the slow handler's response went out: {written:?}"));
+    assert!(probe < response, "asked while the handler worked: {written:?}");
+    assert_eq!(status_of(&written[response]).as_deref(), Some("200"));
+    assert!(
+        !written[..response].iter().any(|f| f.kind == GOAWAY),
+        "and not closed on before it answered: {written:?}"
+    );
+}
+
+/// What the PING does not change: a peer that opens a stream, sends no body,
+/// and answers every probe is holding the stream, not waiting on us. The
+/// answer is a chunk like any other, the sweep runs on it, and the stream
+/// whose body is not coming is reset.
+#[test]
+fn answering_pings_does_not_hold_a_stream_without_its_body() {
+    let mut open = preface();
+    // No END_STREAM: a body is owed, and never sent.
+    open.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, GET_BLOCK));
+
+    let second = Duration::from_secs(1);
+    let silence = second * 5 * super::super::ACTIVE_TICKS;
+    let inbound: Vec<Scripted> = vec![
+        ReadEvent::Data(open).into(),
+        ReadEvent::Data(frame(PING, 0x1, 0, &1u64.to_be_bytes())).after(silence + second * 7),
+        ReadEvent::Eof.after(silence + second * 30),
+    ];
+
+    let written = run_connection_timed(inbound, |_, _| {});
+
+    let reset = written
+        .iter()
+        .find(|f| f.kind == RST_STREAM && f.stream_id == 1)
+        .unwrap_or_else(|| panic!("the held stream was reset: {written:?}"));
+    assert_eq!(
+        u32::from_be_bytes(reset.payload[..4].try_into().unwrap()),
+        crate::shared::codec::types::ENHANCE_YOUR_CALM
     );
 }
 
