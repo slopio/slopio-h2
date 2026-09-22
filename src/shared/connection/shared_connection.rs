@@ -187,9 +187,9 @@ pub struct SharedConnection {
     max_frame_size: Cell<u32>,
     /// Streams we reset while the peer's half was still open, most recent
     /// last. §5.1: whoever sends RST_STREAM has to tolerate what the peer had
-    /// in flight, and a HEADERS frame — trailers — is the one such frame that
-    /// is a connection error on any *other* closed stream. This is the record
-    /// that tells the two apart.
+    /// in flight — its trailers, and the DATA of a body — where the same
+    /// frames on any *other* closed stream are the peer's fault. This is the
+    /// record that tells the two apart.
     ///
     /// Here rather than with the streams because one of the resets is a
     /// stream task's own, on its way out, and this is what it can reach.
@@ -469,6 +469,12 @@ impl SharedConnection {
             resets.pop_front();
         }
         resets.push_back(id);
+    }
+
+    /// Whether `id` is a stream this end reset. Asked for DATA, which may
+    /// keep coming, so the id stays remembered.
+    pub fn was_reset(&self, id: STREAM_ID) -> bool {
+        self.reset_by_us.borrow().contains(&id)
     }
 
     /// Whether `id` is a stream this end reset, forgetting it if so: asked

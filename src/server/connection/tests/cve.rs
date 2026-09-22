@@ -28,7 +28,9 @@ use super::{
     PREFACE, PRIORITY, RST_STREAM, SETTINGS, WINDOW_UPDATE, deliveries, frame, pings,
     run_connection, run_connection_timed,
 };
-use crate::shared::codec::types::{COMPRESSION_ERROR, ENHANCE_YOUR_CALM, NO_ERROR, REFUSED_STREAM};
+use crate::shared::codec::types::{
+    COMPRESSION_ERROR, ENHANCE_YOUR_CALM, NO_ERROR, REFUSED_STREAM, STREAM_CLOSED,
+};
 
 /// The GOAWAY a connection was closed with, if it was.
 fn goaway(written: &[Frame]) -> Option<(u32, String)> {
@@ -510,6 +512,110 @@ fn made_you_reset() {
 
     let (code, _) = goaway(&written).expect("a peer that keeps making us reset is closed");
     assert_eq!(code, ENHANCE_YOUR_CALM);
+}
+
+/// MadeYouReset again, with the triggers the frame decoder finds rather than
+/// the stream: a WINDOW_UPDATE of zero (§6.9), a PRIORITY of the wrong size
+/// (§6.3) or depending on itself (§5.3.1). Each is a stream error found
+/// before any stream sees the frame, and each used to be answered with a
+/// reset that nothing counted.
+///
+/// One test per trigger: a test thread runs one connection.
+fn made_you_reset_by_the_decoder(kind: u8, trigger: impl Fn(u32) -> Vec<u8>) {
+    let mut bytes = preface();
+    for i in 0..super::super::protocol::FAULT_LIMIT + 1 {
+        let id = 2 * i + 1;
+        bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, id, GET_BLOCK));
+        bytes.extend_from_slice(&frame(kind, 0, id, &trigger(id)));
+    }
+
+    let written = run_connection(deliveries(&bytes), |_, _| {});
+
+    let (code, _) = goaway(&written).expect("a peer that keeps making us reset is closed");
+    assert_eq!(code, ENHANCE_YOUR_CALM);
+}
+
+#[test]
+fn made_you_reset_with_a_zero_window_update() {
+    made_you_reset_by_the_decoder(WINDOW_UPDATE, |_| vec![0; 4]);
+}
+
+#[test]
+fn made_you_reset_with_a_short_priority() {
+    made_you_reset_by_the_decoder(PRIORITY, |_| vec![0; 4]);
+}
+
+#[test]
+fn made_you_reset_with_a_self_dependent_priority() {
+    made_you_reset_by_the_decoder(PRIORITY, |id| {
+        let mut payload = id.to_be_bytes().to_vec();
+        payload.push(15);
+        payload
+    });
+}
+
+/// DATA on a stream the peer itself closed — here by RST_STREAM — is its
+/// fault, and a stream error (§5.1). Answered once: the reset that answers it
+/// is ours, and what follows it on that stream is ignored like any body in
+/// flight behind a reset of ours. Answering every frame made us a reflector —
+/// one RST_STREAM out per byte in — that no budget saw.
+#[test]
+fn data_on_a_stream_the_peer_closed_is_answered_once() {
+    let mut bytes = preface();
+    bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, GET_BLOCK));
+    bytes.extend_from_slice(&frame(RST_STREAM, 0, 1, &0x8u32.to_be_bytes()));
+    for _ in 0..5_000 {
+        bytes.extend_from_slice(&frame(DATA, 0, 1, b"x"));
+    }
+    let mut inbound = deliveries(&bytes);
+    inbound.push(ReadEvent::Eof);
+
+    let written = run_connection(inbound, |_, _| {});
+
+    let resets: Vec<_> = written
+        .iter()
+        .filter(|f| f.kind == RST_STREAM && f.stream_id == 1)
+        .collect();
+    assert_eq!(resets.len(), 1, "one answer, not one per frame");
+    assert_eq!(
+        u32::from_be_bytes(resets[0].payload[..4].try_into().unwrap()),
+        STREAM_CLOSED
+    );
+}
+
+/// DATA on a stream that is gone is not progress. It used to be, so one byte
+/// on a dead stream every few thousand PINGs cleared the control budget, and
+/// the PING flood (CVE-2019-9512) ran as long as the peer liked.
+#[test]
+fn data_on_a_dead_stream_does_not_refresh_the_control_budget() {
+    let mut bytes = preface();
+    // A stream we reset, so the DATA behind it is ignored rather than
+    // counted: the cheapest thing for the peer to send.
+    bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, GET_BLOCK));
+    bytes.extend_from_slice(&frame(WINDOW_UPDATE, 0, 1, &[0, 0, 0, 0]));
+    let burst = super::super::protocol::CONTROL_FRAME_BURST;
+    for _ in 0..3 {
+        for _ in 0..burst / 2 {
+            bytes.extend_from_slice(&frame(PING, 0, 0, b"flooding"));
+        }
+        bytes.extend_from_slice(&frame(DATA, 0, 1, b"x"));
+    }
+    let mut inbound = deliveries(&bytes);
+    inbound.push(ReadEvent::Eof);
+
+    let written = run_connection(inbound, |_, _| {});
+
+    let (code, reason) = goaway(&written).expect("the flood was answered with a GOAWAY");
+    assert_eq!(code, ENHANCE_YOUR_CALM);
+    assert_eq!(reason, "too many control frames");
+    assert_eq!(
+        written
+            .iter()
+            .filter(|f| f.kind == RST_STREAM && f.stream_id == 1)
+            .count(),
+        1,
+        "the body behind our reset is ignored, not answered"
+    );
 }
 
 // ---------------------------------------------------------------------------

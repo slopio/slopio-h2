@@ -95,7 +95,8 @@ enum FrameWorth {
     /// Advances a request. Clears both budgets.
     Progress,
     /// Legal, purposeful and floodable: a keepalive PING, the SETTINGS of a
-    /// preface, the WINDOW_UPDATEs of a download.
+    /// preface, the WINDOW_UPDATEs of a download — and the body still in
+    /// flight on a stream we reset, which is legal and advances nothing.
     Control,
     /// Legal and purposeless — a frame that costs us a decode and a dispatch
     /// and carries the peer nothing.
@@ -103,13 +104,23 @@ enum FrameWorth {
 }
 
 impl FrameWorth {
-    fn of(kind: FrameKind, length: u32, flags: u8) -> Self {
+    /// `stream_live` is whether the frame's stream is one we are serving,
+    /// and only DATA asks: it is the one frame whose worth depends on it.
+    fn of(kind: FrameKind, length: u32, flags: u8, stream_live: bool) -> Self {
         match kind {
             // §6.1: END_STREAM is 0x1. A zero-length DATA frame that ends
             // the body is progress — `write_data` emits exactly that — and
             // one that does not says nothing, while flow control accounts
             // nothing for it either (CVE-2019-9518).
-            FrameKind::Data if length > 0 || flags & 0x1 != 0 => Self::Progress,
+            //
+            // Only on a stream that is still live. DATA on one that is gone
+            // is dropped, so calling it progress let a peer clear both
+            // budgets for free: one byte on a finished stream after every
+            // few thousand PINGs, and the PING flood never ended.
+            FrameKind::Data if length > 0 || flags & 0x1 != 0 => match stream_live {
+                true => Self::Progress,
+                false => Self::Control,
+            },
             // A fragment carrying nothing adds nothing to the header block
             // `MAX_HEADER_BLOCK_SIZE` bounds, so that cap never sees one
             // however many arrive (CVE-2024-27316).
@@ -165,6 +176,9 @@ struct Streams<H: Handler> {
 }
 
 enum Rejected {
+    /// A frame the peer sent before it could see our RST_STREAM: §5.1 has
+    /// us drop it without a word.
+    Ignored,
     /// Reset the id with this code, nothing else is wrong.
     Refused(u32),
     /// A stream error to report on the id.
@@ -194,13 +208,12 @@ impl<H: Handler> Streams<H> {
         // peer closed it, or never opened it in this order, that is its fault
         // and the connection's end (§5.1, §5.1.1). But it may be one we reset
         // ourselves — an early response, a violation — with trailers the peer
-        // had already sent, and §5.1 has whoever sends RST_STREAM tolerate
-        // what was in flight. Those get the answer DATA in the same place
-        // gets. HPACK is already in sync: the decoder ran the block before we
-        // saw it.
+        // had already sent, and §5.1 has whoever sends RST_STREAM ignore
+        // what was in flight, as DATA in the same place is. HPACK is already
+        // in sync: the decoder ran the block before we saw it.
         if raw <= self.last_client_stream_id {
             return Err(match shared.take_reset(raw) {
-                true => Rejected::Refused(STREAM_CLOSED),
+                true => Rejected::Ignored,
                 false => Rejected::Fatal(STREAM_CLOSED, "HEADERS on closed stream"),
             });
         }
@@ -265,6 +278,7 @@ impl<H: Handler> Streams<H> {
 
     fn recv_data(
         &mut self,
+        shared: &SharedConnection,
         id: STREAM_ID,
         payload: &[u8],
         padded_len: u32,
@@ -276,17 +290,18 @@ impl<H: Handler> Streams<H> {
         }
 
         // Not idle and not in the map: the stream existed and is closed.
-        // §5.1 lets a frame on a closed stream be answered STREAM_CLOSED —
-        // the peer sent DATA after its own RST_STREAM or END_STREAM, or
-        // after ours. That last one is the race `credit_send` tolerates,
-        // and the RFC would have us ignore it for a while; but a second
-        // RST_STREAM on a stream the peer already closed is a frame it
-        // must ignore, so answering costs nothing. `Refused` rather than
-        // `Violation`: a body in flight when we reset its stream would
-        // otherwise count one fault per frame, and a refused POST or two
-        // would trip `FAULT_LIMIT`.
+        // After our RST_STREAM that is a body in flight, and §5.1 has us
+        // ignore it — answering each frame with a reset of its own is what
+        // made this a reflector. Otherwise the peer closed the stream itself,
+        // by END_STREAM or RST_STREAM, and sent DATA anyway: its fault, and
+        // counted. The reset that answers it is remembered like any other,
+        // so the rest of that frame, and whatever followed it, is ignored
+        // rather than counted again.
         let Some(stream) = self.streams.get(id) else {
-            return Err(Rejected::Refused(STREAM_CLOSED));
+            return Err(match shared.was_reset(id) {
+                true => Rejected::Ignored,
+                false => Rejected::Violation(StreamViolation::DataAfterEndStream),
+            });
         };
 
         // Flow control is accounted before the content is judged, as at the
@@ -466,11 +481,18 @@ impl<H: Handler> Protocol<H> {
     /// Kills the stream if it exists, and sends RST_STREAM either way: a
     /// REFUSED_STREAM answers an id that was never opened.
     fn reset_stream(&mut self, stream_id: StreamId, error_code: u32) {
-        // One the peer had not finished with may still have trailers coming.
-        if let Some(stream) = self.streams.remove(stream_id.into(), &self.shared)
-            && !stream.input_ended()
-        {
-            self.shared.note_reset(stream_id.into());
+        let raw: STREAM_ID = stream_id.into();
+        // One the peer had not finished with may still have a body or
+        // trailers coming, which §5.1 has us ignore. So may one that never
+        // made it into the map — a request refused before its body arrived —
+        // or one already out of it; only a live stream says for certain that
+        // its input ended. An idle id has sent nothing to tolerate.
+        let peer_done = self
+            .streams
+            .remove(raw, &self.shared)
+            .is_some_and(|stream| stream.input_ended());
+        if !peer_done && raw <= self.streams.last_client_stream_id {
+            self.shared.note_reset(raw);
         }
         self.shared
             .write_frame(|out| encode_rst_stream(out, stream_id, error_code));
@@ -483,8 +505,8 @@ impl<H: Handler> Protocol<H> {
     /// for frames that have none. An odd frame spends both — it is not
     /// progress either — so the strict budget is simply the one that runs
     /// out first, and its message is the one the peer hears.
-    fn count_frame(&mut self, kind: FrameKind, length: u32, flags: u8) {
-        match FrameWorth::of(kind, length, flags) {
+    fn count_frame(&mut self, kind: FrameKind, length: u32, flags: u8, stream_live: bool) {
+        match FrameWorth::of(kind, length, flags, stream_live) {
             FrameWorth::Progress => {
                 self.control_frames = 0;
                 self.odd_frames = 0;
@@ -559,6 +581,7 @@ impl<H: Handler> Protocol<H> {
     /// write.
     fn reject(&mut self, stream_id: StreamId, rejected: Rejected) {
         match rejected {
+            Rejected::Ignored => {}
             Rejected::Refused(code) => self.reset_stream(stream_id, code),
             Rejected::Violation(violation) => self.fail_stream(stream_id, violation),
             Rejected::Fatal(code, reason) => self.fail_connection(code, reason),
@@ -598,7 +621,9 @@ impl<H: Handler> FrameHandler for Protocol<H> {
         }
 
         let raw: STREAM_ID = stream_id.into();
-        let received = self.streams.recv_data(raw, payload, padded_len, end_stream);
+        let received = self
+            .streams
+            .recv_data(&self.shared, raw, payload, padded_len, end_stream);
 
         // Padding is accounted by flow control but never reaches an
         // application, so it is spent the moment it lands; on a frame we drop,
@@ -691,10 +716,8 @@ impl<H: Handler> FrameHandler for Protocol<H> {
             // otherwise holds them at zero for as long as it likes, since
             // `FrameWorth` reads the block and calls it progress.
             //
-            // The `Refused` that `recv_data` raises stays uncounted: that
-            // one is a body still in flight when we reset its stream, a race
-            // rather than a demand, and counting it would cost a fault per
-            // frame of a refused POST.
+            // Trailers that raced our reset are `Ignored`, and uncounted:
+            // a race rather than a demand.
             let refused = matches!(rejected, Rejected::Refused(_));
             self.reject(id, rejected);
             if refused {
@@ -807,7 +830,6 @@ impl<H: Handler> FrameHandler for Protocol<H> {
             DecodeError::Stream {
                 stream_id,
                 violation,
-                code,
                 ..
             } => {
                 // §5.1: a HEADERS frame opens its stream whatever we make of
@@ -816,16 +838,18 @@ impl<H: Handler> FrameHandler for Protocol<H> {
                 // it is a frame on a closed stream, not on an idle one. The
                 // other decoder violations are PRIORITY and WINDOW_UPDATE,
                 // which open nothing.
-                //
-                // Counted like the malformed request `create` finds itself:
-                // `FrameWorth` called this block progress.
-                if violation == StreamViolation::MalformedMessage {
-                    if stream_id.is_client_initiated() {
-                        self.streams.spend(stream_id.into());
-                    }
-                    return self.fail_stream(stream_id, violation);
+                if violation == StreamViolation::MalformedMessage && stream_id.is_client_initiated()
+                {
+                    self.streams.spend(stream_id.into());
                 }
-                self.reset_stream(stream_id, code)
+                // Every one is counted, not only the malformed block
+                // `FrameWorth` called progress. The others — a WINDOW_UPDATE
+                // of zero, a PRIORITY that is the wrong size or depends on
+                // itself — are frames no honest peer sends, and one behind
+                // each HEADERS is MadeYouReset (CVE-2025-8671): a handler
+                // spawned and killed per round, for a frame that costs the
+                // peer nothing, while every HEADERS clears the burst budgets.
+                self.fail_stream(stream_id, violation)
             }
         }
     }
@@ -834,8 +858,12 @@ impl<H: Handler> FrameHandler for Protocol<H> {
     /// §3.4 is checked: the first frame after the client preface must be its
     /// SETTINGS — and not an ACK, which it cannot legitimately send before
     /// having seen ours.
-    fn on_frame(&mut self, kind: FrameKind, _stream_id: StreamId, length: u32, flags: u8) {
-        self.count_frame(kind, length, flags);
+    fn on_frame(&mut self, kind: FrameKind, stream_id: StreamId, length: u32, flags: u8) {
+        // A lookup per DATA frame, and only for DATA: the one frame whose
+        // worth depends on its stream.
+        let stream_live =
+            kind == FrameKind::Data && self.streams.streams.get(stream_id.into()).is_some();
+        self.count_frame(kind, length, flags, stream_live);
 
         if !std::mem::take(&mut self.expect_settings) {
             return;
