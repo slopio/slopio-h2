@@ -647,6 +647,101 @@ fn a_reset_stream_fails_what_was_waiting_on_it() {
     );
 }
 
+/// §8.1: a server may answer before the request is over, and then stop the
+/// upload with RST_STREAM(NO_ERROR) — and clients MUST NOT discard the
+/// response for it. The reset used to fail the stream whole, so the read after
+/// the last chunk said "reset by peer" where it should have said the body was
+/// over, and a `while let Some(..) = read().await?` threw away a response it
+/// had in full.
+///
+/// What the reset does stop is the upload, which is what it is for.
+#[test]
+fn a_reset_after_a_complete_response_leaves_the_response_whole() {
+    let mut answer = frame(HEADERS, FLAG_END_HEADERS, 1, STATUS_200);
+    answer.extend_from_slice(&frame(DATA, 0, 1, b"body"));
+    answer.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &literal("x-checksum", "42"),
+    ));
+    // In the same chunk: by the time anything is read, the reset is in.
+    answer.extend_from_slice(&frame(RST_STREAM, 0, 1, &0u32.to_be_bytes()));
+
+    let (seen, _) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(answer).after(Duration::from_millis(10)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let request = http::Request::post("http://example.test/")
+                .body(())
+                .unwrap();
+            let stream = client.send_request(&request, false).expect("a stream");
+            stream.write(b"the start of", false).await.expect("written");
+            settle().await;
+            settle().await;
+
+            let status = stream.response().await.expect("a response").status();
+            let mut body = Vec::new();
+            while let Some(chunk) = stream.read().await.expect("the body, to its end") {
+                body.extend_from_slice(&chunk);
+            }
+            let trailers = stream.trailers().and_then(|fields| {
+                fields
+                    .get("x-checksum")
+                    .map(|v| v.to_str().unwrap().to_owned())
+            });
+            let upload = stream
+                .write(b" an upload", true)
+                .await
+                .map_err(|e| e.to_string());
+            (status, body, trailers, upload)
+        },
+    );
+
+    let (status, body, trailers, upload) = seen;
+    assert_eq!(status, 200);
+    assert_eq!(body, b"body");
+    assert_eq!(trailers.as_deref(), Some("42"));
+    let refused = upload.expect_err("the upload was stopped");
+    assert!(refused.contains("code 0x0"), "and says by what: {refused}");
+}
+
+/// The other side of the rule: a reset that arrives *before* the peer's
+/// END_STREAM cuts the body short, and the read that finds the cut reports
+/// it — after delivering what had arrived.
+#[test]
+fn a_reset_before_the_end_still_fails_the_body() {
+    let mut answer = frame(HEADERS, FLAG_END_HEADERS, 1, STATUS_200);
+    answer.extend_from_slice(&frame(DATA, 0, 1, b"half"));
+    answer.extend_from_slice(&frame(RST_STREAM, 0, 1, &0u32.to_be_bytes()));
+
+    let (seen, _) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(answer).after(Duration::from_millis(10)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let request = http::Request::get("http://example.test/").body(()).unwrap();
+            let stream = client.send_request(&request, true).expect("a stream");
+            settle().await;
+            settle().await;
+
+            let _ = stream.response().await.expect("a response");
+            let first = stream.read().await.expect("what arrived");
+            let then = stream.read().await.map_err(|e| e.to_string());
+            (first, then)
+        },
+    );
+
+    assert_eq!(seen.0.as_deref(), Some(&b"half"[..]));
+    let cut = seen.1.expect_err("the body was cut short");
+    assert!(cut.contains("reset by peer"), "and says so: {cut}");
+}
+
 /// Dropping a handle for a stream the peer has not finished is a cancel
 /// (§8.1): the peer is told to stop, which it cannot infer from a client that
 /// simply stops reading.

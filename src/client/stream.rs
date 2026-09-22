@@ -100,7 +100,18 @@ pub(crate) struct StreamState {
     no_more_input: Cell<bool>,
     /// Our half is done: the request is written, END_STREAM included.
     no_more_output: Cell<bool>,
-    failure: Cell<Option<Failure>>,
+    /// Why the peer's half ended short, if it did — what the reading side
+    /// reports.
+    ///
+    /// Never set once the peer's END_STREAM has arrived. A response that
+    /// ended is complete, whatever comes after it: §8.1 has a server stop an
+    /// upload with RST_STREAM(NO_ERROR) after a complete response, and
+    /// clients MUST NOT discard the response for it.
+    input_failure: Cell<Option<Failure>>,
+    /// Why our half cannot be written any more — what the writing side
+    /// reports. Set by the same failure, for the same reason, while the
+    /// request is still going: that is what stops the upload.
+    output_failure: Cell<Option<Failure>>,
     /// Received body bytes still holding flow-control credit — the peer's
     /// until the application reads them.
     unreleased: Cell<u32>,
@@ -131,7 +142,8 @@ impl StreamState {
             // END_STREAM already on the request head: the stream is born
             // half-closed(local).
             no_more_output: Cell::new(end_stream),
-            failure: Cell::new(None),
+            input_failure: Cell::new(None),
+            output_failure: Cell::new(None),
             unreleased: Cell::new(0),
             sent: Cell::new(0),
             recv_waker: RefCell::new(None),
@@ -244,11 +256,20 @@ impl StreamState {
     /// wakers fire: a reader waiting for a response it will never get and a
     /// writer parked on credit that will never come are the same casualty.
     ///
+    /// It fails only the halves still open. A half that already ended
+    /// cleanly keeps its ending: a response the peer finished is still
+    /// read to its end, trailers and all, and the failure is reported to
+    /// whoever is still writing.
+    ///
     /// The first failure is the one kept — a stream reset by the peer and
-    /// then caught by the connection closing was reset by the peer.
+    /// then caught by the connection closing was reset by the peer. It closes
+    /// both halves, so a later one finds none open to fail.
     pub(crate) fn fail(&self, failure: Failure) {
-        if self.failure.get().is_none() {
-            self.failure.set(Some(failure));
+        if !self.no_more_input.get() {
+            self.input_failure.set(Some(failure));
+        }
+        if !self.no_more_output.get() {
+            self.output_failure.set(Some(failure));
         }
         // Nothing more will arrive and nothing more may be written, which is
         // what stops a reader parking again on the next poll.
@@ -401,7 +422,7 @@ impl Stream {
     }
 
     async fn write_body(&self, data: &[u8], end_stream: bool) -> io::Result<()> {
-        if let Some(failure) = self.state.failure.get() {
+        if let Some(failure) = self.state.output_failure.get() {
             return Err(failure.error());
         }
         if self.state.no_more_output.get() {
@@ -419,7 +440,7 @@ impl Stream {
         // beside it rather than after it. `fail` wakes the send waker the
         // write registered, which is what brings us back here to see it.
         std::future::poll_fn(|cx| {
-            if let Some(failure) = self.state.failure.get() {
+            if let Some(failure) = self.state.output_failure.get() {
                 return Poll::Ready(Err(failure.error()));
             }
             writing.as_mut().poll(cx).map(Ok)
@@ -451,7 +472,7 @@ impl Stream {
             if let Some(response) = self.state.response.borrow_mut().take() {
                 return Poll::Ready(Ok(response));
             }
-            if let Some(failure) = self.state.failure.get() {
+            if let Some(failure) = self.state.input_failure.get() {
                 return Poll::Ready(Err(failure.error()));
             }
             if self.state.has_response() {
@@ -485,7 +506,7 @@ impl Stream {
             if let Some(chunk) = self.state.chunks.borrow_mut().pop_front() {
                 return Poll::Ready(Ok(Some(chunk)));
             }
-            if let Some(failure) = self.state.failure.get() {
+            if let Some(failure) = self.state.input_failure.get() {
                 return Poll::Ready(Err(failure.error()));
             }
             if self.state.no_more_input.get() {
@@ -526,7 +547,7 @@ impl Stream {
     /// output for the loop to send, with no window to wait on (§6.9 meters
     /// DATA and nothing else).
     pub fn send_trailers(&self, fields: &HeaderMap) -> io::Result<()> {
-        if let Some(failure) = self.state.failure.get() {
+        if let Some(failure) = self.state.output_failure.get() {
             return Err(failure.error());
         }
         if self.state.no_more_output.get() {
@@ -596,8 +617,12 @@ impl Stream {
     ///
     /// In that order, because [`StreamState::fail`] keeps the first failure it
     /// is given and the cancel brings one of its own. This way everything
-    /// waiting on the stream — and every later call on the handle — reports
-    /// the timeout rather than the reset that carried it out.
+    /// waiting on the stream reports the timeout rather than the reset that
+    /// carried it out.
+    ///
+    /// A half that had already ended keeps its ending, as it does for any
+    /// failure. Every later call on the handle still answers `TimedOut`:
+    /// [`within`](Self::within) says so before it looks at the stream.
     fn expire(&self) -> io::Error {
         self.state.fail(Failure::Expired);
         self.close();

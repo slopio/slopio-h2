@@ -41,6 +41,7 @@ struct HelloReply {
 const UNARY: &str = "/test.Greeter/SayHello";
 const STREAM: &str = "/test.Greeter/SayMany";
 const FAILS: &str = "/test.Greeter/Fail";
+const REJECTS: &str = "/test.Greeter/Reject";
 
 /// A message that exercises §9.1's percent-encoding across the wire: the
 /// server encodes it into `grpc-message`, the client decodes it back, and the
@@ -71,6 +72,14 @@ async fn route(call: &GrpcCall) -> Status {
             Status::ok()
         }
         Some(FAILS) => Status::not_found(AWKWARD),
+        // Judged on the first message of a client stream, before the rest has
+        // arrived: the status goes out, and the stream's token stops the
+        // upload with RST_STREAM(NO_ERROR) behind it (§8.1).
+        Some(REJECTS) => match call.message::<HelloRequest>().await {
+            Ok(Some(_)) => Status::invalid_argument("rejected on sight"),
+            Ok(None) => Status::invalid_argument("no request message"),
+            Err(status) => status,
+        },
         // §9.1: a path this server does not have. The HTTP exchange went
         // perfectly; the call did not happen.
         _ => Status::unimplemented("no such method"),
@@ -218,5 +227,71 @@ fn the_client_and_the_server_agree_over_a_real_socket() {
         missing.expect_err("there is no such method"),
         (Code::Unimplemented, "no such method".to_owned()),
         "a path the server does not have is a status, not a 404"
+    );
+}
+
+/// A server that answers a client-streaming call before the client is done —
+/// judging it on its first message — sends its status and then stops the
+/// upload with RST_STREAM(NO_ERROR). §8.1 says the client keeps the response.
+/// It used to take the reset for a failure of the whole stream and report
+/// UNAVAILABLE, which a caller retries, for a call the server had rejected on
+/// purpose.
+#[test]
+fn a_status_sent_before_the_upload_ends_is_the_one_reported() {
+    let port = pick_port();
+    let (done_tx, done_rx) = mpsc::channel::<(Code, String)>();
+
+    thread::spawn(move || {
+        main_thread_with::<ServerRing, _>(async move {
+            let settings = ServerSettings {
+                bind_port: port,
+                transport: ServerTransport::Plain,
+            };
+            let _ = Server::new(settings)
+                .run::<ServerRing, _>(service(route, not_grpc))
+                .await;
+        });
+    });
+
+    let client = thread::spawn(move || {
+        main_thread_with::<ClientRing, _>(async move {
+            let addr = format!("127.0.0.1:{port}").parse().unwrap();
+            let mut connected = None;
+            for _ in 0..50 {
+                match client::connect::<ClientRing>(addr).await {
+                    Ok(client) => {
+                        connected = Some(client);
+                        break;
+                    }
+                    Err(_) => Sleep::during(Duration::from_millis(20)).await,
+                }
+            }
+            let grpc = GrpcClient::new(connected.expect("the server came up"));
+
+            let call = grpc.call(REJECTS).expect("a call");
+            call.write_message(&HelloRequest {
+                name: "first of many".into(),
+            })
+            .await
+            .expect("the first message went out");
+            // Long enough for the status and the reset behind it to arrive
+            // while the upload is, as far as the client knows, still going.
+            Sleep::during(Duration::from_millis(200)).await;
+
+            done_tx
+                .send(flatten(call.status().await))
+                .expect("the test is listening");
+        });
+    });
+
+    let status = done_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the client reports");
+    client.join().expect("client thread");
+
+    assert_eq!(
+        status,
+        (Code::InvalidArgument, "rejected on sight".to_owned()),
+        "the server's own status, not the reset that followed it"
     );
 }
