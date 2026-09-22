@@ -1,16 +1,13 @@
-use std::mem::MaybeUninit;
-
 use super::prefix::PREFIX_LEN;
 use super::request::GrpcFormat;
 
 /// A gRPC message whose prefix has been read and whose bytes are arriving.
 pub struct Accumulating {
-    /// Allocated once, at the length the prefix announced: `bytes.len()` is
-    /// the expected length. Uninitialised, so nothing is written here before
-    /// the peer's own bytes.
-    bytes: Box<[MaybeUninit<u8>]>,
-    /// How many are written. Invariant: `bytes[..filled]` is initialised.
-    filled: usize,
+    /// What has arrived. Its capacity is not the announced length: see
+    /// [`FIRST_RESERVE`](Self::FIRST_RESERVE).
+    bytes: Vec<u8>,
+    /// The length the prefix announced.
+    expected: usize,
     /// What the message is compressed with, `None` when it is not: the
     /// prefix's Compressed-Flag and the request's `grpc-encoding`, which only
     /// mean something together.
@@ -21,19 +18,31 @@ pub struct Accumulating {
 }
 
 impl Accumulating {
+    /// What is reserved on the prefix alone, when the announced length is
+    /// more than this: one stream window, which is what the peer can send
+    /// before it needs anything of us.
+    ///
+    /// The announced length is a claim, and reserving it would let five
+    /// bytes of prefix cost us 4 MiB — on every stream at once, for nothing
+    /// sent. So a large message starts in a window's worth, and is moved once,
+    /// into exactly its announced size, the first time it outgrows that. One
+    /// copy of at most this much per large message, and nothing at all for a
+    /// message that fits, which is nearly every one.
+    pub const FIRST_RESERVE: usize = 64 * 1024;
+
     /// `expected` comes off the wire: bounding it is the caller's to have
     /// done.
     pub fn new(expected: usize, encoding: Option<GrpcEncoding>, format: GrpcFormat) -> Self {
         Self {
-            bytes: Box::new_uninit_slice(expected),
-            filled: 0,
+            bytes: Vec::with_capacity(expected.min(Self::FIRST_RESERVE)),
+            expected,
             encoding,
             format,
         }
     }
 
     pub fn missing(&self) -> usize {
-        self.bytes.len() - self.filled
+        self.expected - self.bytes.len()
     }
 
     /// Appends `payload`, all of it or none of it.
@@ -51,13 +60,13 @@ impl Accumulating {
                 pushed: payload.len(),
             });
         }
-        let dst = self.bytes[self.filled..self.filled + payload.len()].as_mut_ptr();
-        // SAFETY: checked above to fit in what is left of our own allocation,
-        // which `payload` cannot overlap.
-        unsafe {
-            std::ptr::copy_nonoverlapping(payload.as_ptr(), dst.cast::<u8>(), payload.len());
+        // Outgrown the first reservation: the rest of the message is on its
+        // way, so take room for all of it, once. Exactly, so that what is
+        // handed out at the end is the allocation it was built in.
+        if payload.len() > self.bytes.capacity() - self.bytes.len() {
+            self.bytes.reserve_exact(self.missing());
         }
-        self.filled += payload.len();
+        self.bytes.extend_from_slice(payload);
         Ok(())
     }
 
@@ -67,8 +76,8 @@ impl Accumulating {
         if self.missing() > 0 {
             return Err(self);
         }
-        // SAFETY: `filled == bytes.len()`, so every byte has been written.
-        let bytes = unsafe { self.bytes.assume_init() };
+        // Capacity is the announced length by now, so this does not move.
+        let bytes = self.bytes.into_boxed_slice();
         let format = self.format;
         Ok(match self.encoding {
             Some(encoding) => GrpcFrame::Compressed(CompressedGrpcFrame {
@@ -282,6 +291,36 @@ mod tests {
     fn an_empty_frame_finishes_at_once() {
         let frame = Accumulating::new(0, None, GrpcFormat::Proto).finish().ok().unwrap();
         assert!(data_of(frame).is_empty());
+    }
+
+    /// The announced length is a claim: what is reserved on it is one
+    /// window, and the rest only once the peer has actually sent that much.
+    #[test]
+    fn a_large_message_reserves_a_window_first_and_its_whole_size_once() {
+        const FIRST: usize = Accumulating::FIRST_RESERVE;
+        let expected = 3 * FIRST + 1;
+        let mut frame = Accumulating::new(expected, None, GrpcFormat::Proto);
+        assert_eq!(frame.bytes.capacity(), FIRST, "announced, not reserved");
+
+        frame.push(&[1; FIRST]).unwrap();
+        assert_eq!(frame.bytes.capacity(), FIRST, "fits: nothing moves");
+
+        frame.push(&[2]).unwrap();
+        assert_eq!(frame.bytes.capacity(), expected, "once, to exactly the announced length");
+
+        frame.push(&vec![3; expected - FIRST - 1]).unwrap();
+        assert_eq!(frame.bytes.capacity(), expected, "and never again");
+        assert_eq!(data_of(frame.finish().ok().unwrap()).len(), expected);
+    }
+
+    /// A message that fits in the first reservation is reserved exactly, as
+    /// it always was: nearly every message is one of these.
+    #[test]
+    fn a_small_message_is_reserved_exactly() {
+        let frame = Accumulating::new(100, None, GrpcFormat::Proto);
+        assert_eq!(frame.bytes.capacity(), 100);
+        let frame = Accumulating::new(Accumulating::FIRST_RESERVE, None, GrpcFormat::Proto);
+        assert_eq!(frame.bytes.capacity(), Accumulating::FIRST_RESERVE);
     }
 
     /// `grpc.health.v1.HealthCheckRequest`, the one every probe sends.
