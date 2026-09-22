@@ -325,7 +325,12 @@ impl<T: Transport> Connection<T> {
             .unwrap_or("the client closed the connection");
         self.protocol.fail(NO_ERROR, reason);
         match self.flush().await {
-            Ok(()) => Ended::Done(reason),
+            Ok(()) => {
+                // The GOAWAY has gone; on a transport with a goodbye of its
+                // own, this is where it goes. Nothing for plain TCP.
+                let _ = self.transport.shutdown().await;
+                Ended::Done(reason)
+            }
             Err(_) => Ended::Failed("the connection failed while sending"),
         }
     }

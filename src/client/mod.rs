@@ -60,6 +60,8 @@ use runtime::runtime::time::timeout;
 use crate::client::shared::ClientShared;
 use crate::shared::connection::settings::Settings;
 use crate::shared::transport::PlainMessages;
+#[cfg(feature = "tls")]
+use crate::shared::transport::{ALPN_H2, KtlsTransport};
 
 mod connection;
 mod shared;
@@ -324,6 +326,58 @@ pub async fn connect<U: BufRingSpec + 'static>(addr: SocketAddr) -> io::Result<C
     };
 
     Ok(connection.spawn())
+}
+
+/// Connects to `addr` over TLS, and leaves an HTTP/2 connection running on it.
+///
+/// [`connect`]'s three stages plus one: TCP, then the TLS handshake, then
+/// HTTP/2's own, all inside [`CONNECT_TIMEOUT`] — which is why the deadline
+/// is one bound over the whole establishment rather than one per stage. The
+/// handshake takes its own deadline because it has to; the outer one is what
+/// actually decides.
+///
+/// `server_name` is what the certificate is checked against, so it is the
+/// host, not the address: the two differ whenever the address came from
+/// somewhere other than the name.
+///
+/// §3.3 requires ALPN, and `config` is where `h2` is offered — build it with
+/// `alpn_protocols: Some(&[b"h2"])`. A server that agrees to something else,
+/// or to nothing, is refused here rather than spoken HTTP/2 at.
+#[cfg(feature = "tls")]
+pub async fn connect_tls<U: BufRingSpec + 'static>(
+    addr: SocketAddr,
+    server_name: popple_tls::ServerName<'static>,
+    config: popple_tls::ClientConfig,
+) -> io::Result<Client> {
+    if !popple_tls::ktls_available() {
+        return Err(io::Error::other(
+            "this kernel has no kTLS: `modprobe tls`, or build without the tls feature",
+        ));
+    }
+
+    let established = timeout(CONNECT_TIMEOUT, async move {
+        let socket = connect_tcp(addr).await?;
+        let ktls = popple_tls::handshake_client(socket, server_name, config, CONNECT_TIMEOUT)
+            .await
+            .map_err(|e| io::Error::other(format!("TLS handshake: {e}")))?;
+
+        let transport = KtlsTransport::<U, _>::new(ktls.into_messages::<U>());
+        if transport.alpn() != Some(ALPN_H2) {
+            return Err(io::Error::other(
+                "the server did not agree to h2 (§3.3: ALPN is not optional over TLS)",
+            ));
+        }
+        Connection::handshake(transport).await
+    })
+    .await;
+
+    match established {
+        Ok(connection) => Ok(connection?.spawn()),
+        Err(()) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "no usable connection within CONNECT_TIMEOUT",
+        )),
+    }
 }
 
 /// The two stages the deadline covers.

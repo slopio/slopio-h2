@@ -245,6 +245,7 @@ impl<T: Transport, H: Handler> Connection<T, H> {
                 // it needs the drain to carry it.
                 self.protocol.time_out();
                 let _ = self.drain().await;
+                let _ = self.transport.shutdown().await;
                 return;
             }
             match timeout(DEADLINE_TICK, self.recv()).await {
@@ -286,7 +287,10 @@ impl<T: Transport, H: Handler> Connection<T, H> {
                 return;
             }
         }
+        // The peer half-closed and whatever was owed has gone out. On a
+        // transport with a goodbye of its own, this is where it goes.
         let _ = self.drain().await;
+        let _ = self.transport.shutdown().await;
     }
 
     /// Sends what this turn produced, and keeps sending while the tasks it
