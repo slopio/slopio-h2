@@ -2,19 +2,20 @@ use std::cell::Cell;
 
 use crate::shared::connection::settings::Settings;
 
+/// §6.9.2's starting stream window, which is what a stream's receive side
+/// has when its owner announces no `SETTINGS_INITIAL_WINDOW_SIZE` of its own.
 pub const LOCAL_INITIAL_WINDOW_SIZE: u32 = 65_535;
-
-/// Credit a handler has consumed before a WINDOW_UPDATE goes out for it.
-/// Half the window: rare enough not to answer every DATA frame with a frame
-/// of our own, early enough that the peer never runs out of credit waiting
-/// for us.
-const RELEASE_THRESHOLD: u32 = LOCAL_INITIAL_WINDOW_SIZE / 2;
 
 pub struct StreamWindow {
     to_send: Cell<i32>,
     to_recv: Cell<i32>,
     /// Consumed by the handler and owed back to the peer, not yet announced.
     pending_release: Cell<u32>,
+    /// Credit consumed before a WINDOW_UPDATE goes out for it. Half the
+    /// window: rare enough not to answer every DATA frame with a frame of
+    /// our own, early enough that the peer never runs out of credit waiting
+    /// for us.
+    release_threshold: u32,
 }
 
 impl StreamWindow {
@@ -71,7 +72,7 @@ impl StreamWindow {
     #[must_use]
     pub fn release_recv(&self, len: u32) -> Option<u32> {
         let pending = self.pending_release.get() + len;
-        if pending < RELEASE_THRESHOLD {
+        if pending < self.release_threshold {
             self.pending_release.set(pending);
             return None;
         }
@@ -100,8 +101,9 @@ impl StreamWindow {
     /// peer sent past the credit we gave it.
     ///
     /// §6.9.2 carves out one exception we do not need: a receiver that has
-    /// just shrunk its window must tolerate an overrun in flight. We never
-    /// send SETTINGS_INITIAL_WINDOW_SIZE, so an overrun here is always real.
+    /// just shrunk its window must tolerate an overrun in flight. Ours only
+    /// ever grows, announced once before any stream opens, so an overrun
+    /// here is always real.
     pub fn recv(&self, padded_len: u32) -> Result<(), ()> {
         let debited = self
             .to_recv
@@ -114,14 +116,24 @@ impl StreamWindow {
     }
 }
 
-impl From<&Settings> for StreamWindow {
+impl StreamWindow {
     /// `to_send` is credited by the peer's SETTINGS_INITIAL_WINDOW_SIZE,
-    /// `to_recv` by ours.
-    fn from(peer: &Settings) -> Self {
+    /// `to_recv` by ours: `recv` is what this side announced as its own
+    /// SETTINGS_INITIAL_WINDOW_SIZE, and the ledger has to say the same as
+    /// the wire.
+    pub fn new(peer: &Settings, recv: u32) -> Self {
         Self {
             to_send: Cell::new(peer.initial_window_size as i32),
-            to_recv: Cell::new(LOCAL_INITIAL_WINDOW_SIZE as i32),
+            to_recv: Cell::new(recv as i32),
             pending_release: Cell::new(0),
+            release_threshold: recv / 2,
         }
+    }
+}
+
+impl From<&Settings> for StreamWindow {
+    /// For a side that announces no window of its own and so has §6.9.2's.
+    fn from(peer: &Settings) -> Self {
+        Self::new(peer, LOCAL_INITIAL_WINDOW_SIZE)
     }
 }

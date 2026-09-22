@@ -22,22 +22,36 @@ pub const MAX_CONCURRENT_STREAMS: u32 = 64;
 /// client, which starts from the same place.
 pub use crate::shared::connection::CONNECTION_INITIAL_WINDOW_SIZE;
 
+/// The receive window every stream of ours starts with: what this server
+/// announces as `SETTINGS_INITIAL_WINDOW_SIZE`, and so what a peer may send
+/// on a stream before it needs credit back.
+///
+/// This is the one knob of inbound flow control. It sets how much a peer
+/// sends per round trip — a message below it arrives in one — and, since
+/// credit goes back only for bytes a handler has taken, how much one stream
+/// can hold against a handler that stalls: this much, at most, and
+/// `MAX_CONCURRENT_STREAMS` times it for a connection. A megabyte is where
+/// hyper, Netty and grpc-go's tuning land too.
+pub const STREAM_RECV_WINDOW: u32 = 1024 * 1024;
+
 /// The connection receive window this server announces, once the handshake is
 /// done. Ours to choose, where the send side is the peer's to credit.
 ///
-/// Large on purpose, as servers usually have it: backpressure is the stream
-/// windows' job, and what they allow at once — every stream with a full
-/// window held unread — is a quarter of this. A connection window smaller
-/// than that sum is how streams accumulating together starve one another,
-/// each short of the bytes that would wake its handler. With this much room
-/// it never binds, and nothing has to manage it beyond the usual refill.
-pub const CONNECTION_RECV_WINDOW: u32 = 15 * 1024 * 1024;
+/// As large as §6.9.1 allows, so that it never binds: backpressure is the
+/// stream windows' job, and the connection window is only ever the thing a
+/// stream waits on by mistake. It costs nothing to be this large — what a
+/// peer can have in flight unconsumed is bounded by the stream windows, not
+/// by this — and the refill is one WINDOW_UPDATE per half of it consumed.
+pub const CONNECTION_RECV_WINDOW: u32 = i32::MAX as u32;
 
+/// The peer's spendable connection credit is this window less what we have
+/// consumed and not yet announced, which sits below half the window. For the
+/// connection never to be what a stream waits on, every stream's full window
+/// has to fit in the other half.
 const _: () = assert!(
-    MAX_CONCURRENT_STREAMS as u64
-        * crate::shared::connection::stream_window::LOCAL_INITIAL_WINDOW_SIZE as u64
-        <= CONNECTION_RECV_WINDOW as u64,
-    "every stream holding a full window at once must fit in the connection window"
+    MAX_CONCURRENT_STREAMS as u64 * STREAM_RECV_WINDOW as u64
+        <= (CONNECTION_RECV_WINDOW - CONNECTION_RECV_WINDOW / 2) as u64,
+    "every stream holding a full window at once must fit in the announced half of the connection window"
 );
 
 /// How long one gather-write may stall before the connection is closed.

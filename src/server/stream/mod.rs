@@ -213,7 +213,7 @@ impl StreamState {
 
         Ok(Self {
             created_at: runtime::runtime::now(),
-            window: StreamWindow::from(settings),
+            window: StreamWindow::new(settings, crate::server::connection::STREAM_RECV_WINDOW),
             #[cfg(feature = "grpc")]
             grpc,
             header,

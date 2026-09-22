@@ -80,17 +80,17 @@ fn on_stream_1(written: &[Frame]) -> Vec<&Frame> {
 /// A message larger than the stream's window flows through it: the bytes of
 /// a message being assembled are consumed as they land, so the credit goes
 /// back before the message is whole, and the peer is never short of window
-/// for the one it is sending. Here, a message of three windows, sent as the
-/// peer would: one window, wait for credit, the next.
+/// for the one it is sending. Here, a message of two windows and a bit, sent
+/// as the peer would: one window, wait for credit, the next.
 #[test]
 fn a_message_larger_than_the_window_is_credited_as_it_fills() {
-    const WINDOW: usize = 65_535;
+    const WINDOW: usize = crate::server::connection::STREAM_RECV_WINDOW as usize;
     let request = HealthCheckRequest {
-        service: "a".repeat(3 * WINDOW),
+        service: "a".repeat(2 * WINDOW + 1),
     }
     .encode_to_vec();
     let body = framed(&request);
-    assert!(body.len() > 3 * WINDOW);
+    assert!(body.len() > 2 * WINDOW);
 
     // Each round is what fits in the window the peer has at that point, sent
     // as frames under max_frame_size — one read event each, the fake ring's

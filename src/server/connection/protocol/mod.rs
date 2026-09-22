@@ -2,6 +2,7 @@ use std::rc::Rc;
 
 use crate::server::connection::{
     CONNECTION_INITIAL_WINDOW_SIZE, CONNECTION_RECV_WINDOW, MAX_CONCURRENT_STREAMS,
+    STREAM_RECV_WINDOW,
     shared_with_streams::{LiveStreams, StreamToken, retire_if_closed},
 };
 use crate::server::stream::StreamState;
@@ -831,8 +832,8 @@ impl<H: Handler> FrameHandler for Protocol<H> {
     fn on_preface(&mut self) {
         self.shared.write_frame(|out| {
             // Only what differs from the RFC defaults: an id we omit keeps
-            // its default on the peer's side, so the initial window, the
-            // frame size and the HPACK table have nothing to say.
+            // its default on the peer's side, so the frame size and the
+            // HPACK table have nothing to say.
             encode_settings(
                 out,
                 &[
@@ -843,6 +844,11 @@ impl<H: Handler> FrameHandler for Protocol<H> {
                     // The decoder drops fields past this; telling the peer
                     // lets it stay under instead of finding out by refusal.
                     Setting::MaxHeaderListSize(DECODE_MAX_HEADER_LIST_SIZE as u32),
+                    // §6.9.2: what every stream the peer opens may send
+                    // before it needs credit back. Every `StreamWindow` of
+                    // ours starts its ledger at the same number, and no
+                    // stream exists before this frame is out.
+                    Setting::InitialWindowSize(STREAM_RECV_WINDOW),
                 ],
             );
         });
