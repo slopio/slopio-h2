@@ -34,6 +34,18 @@ name = "tls_client"
 path = "examples/tls_client.rs"
 required-features = ["tls"]
 
+# The pair a load test is run with: a service to measure, and the thing that
+# measures it. Two processes, so they can be given a core each.
+[[example]]
+name = "helloworld_server"
+path = "examples/helloworld_server.rs"
+required-features = ["grpc"]
+
+[[example]]
+name = "grpc_load"
+path = "examples/grpc_load.rs"
+required-features = ["grpc"]
+
 [dependencies]
 bytes = "1"
 fnv = "1"
