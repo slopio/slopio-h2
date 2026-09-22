@@ -73,8 +73,59 @@ fn scripted(bytes: &[u8]) -> Vec<Scripted> {
     ]
 }
 
+/// What a gRPC stream is granted when it opens, so that one message may be
+/// larger than §6.9.2's starting window.
+fn opening_grant() -> u32 {
+    (crate::grpc::GrpcInput::MESSAGE_LIMIT + 5) as u32 - 65_535
+}
+
+/// The response, without that grant: it leads every gRPC stream and says
+/// nothing about what the handler did.
 fn on_stream_1(written: &[Frame]) -> Vec<&Frame> {
-    written.iter().filter(|f| f.stream_id == 1).collect()
+    let mut ours: Vec<&Frame> = written.iter().filter(|f| f.stream_id == 1).collect();
+    if let Some(first) = ours.first()
+        && first.kind == WINDOW_UPDATE
+        && u32::from_be_bytes(first.payload[..4].try_into().unwrap()) == opening_grant()
+    {
+        ours.remove(0);
+    }
+    ours
+}
+
+/// A gRPC stream is told up front that it may send a whole message, its unit
+/// of delivery not fitting in the 65535 every stream starts with.
+#[test]
+fn a_grpc_stream_is_granted_room_for_one_whole_message() {
+    let mut bytes = opening();
+    bytes.extend_from_slice(&frame(DATA, FLAG_END_STREAM, 1, &framed(&[])));
+
+    let written = run_connection_with(scripted(&bytes), |_, _| {}, service(answers_at_once, not_grpc));
+
+    let first = written
+        .iter()
+        .find(|f| f.stream_id == 1)
+        .expect("something on the stream");
+    assert_eq!(first.kind, WINDOW_UPDATE, "before anything else: {written:?}");
+    assert_eq!(
+        u32::from_be_bytes(first.payload[..4].try_into().unwrap()),
+        opening_grant()
+    );
+}
+
+/// An HTTP request asks for nothing of the sort: its body is drained as it
+/// arrives, so the starting window is all it ever needs.
+#[test]
+fn an_http_stream_is_granted_nothing() {
+    let mut bytes = PREFACE.to_vec();
+    bytes.extend_from_slice(&frame(SETTINGS, 0, 0, &[]));
+    bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, &grpc_block(b"text/plain")));
+    bytes.extend_from_slice(&frame(DATA, FLAG_END_STREAM, 1, b"hello"));
+
+    let written = run_connection_with(scripted(&bytes), |_, _| {}, service(answers_at_once, not_grpc));
+    assert!(
+        !written.iter().any(|f| f.kind == WINDOW_UPDATE && f.stream_id == 1),
+        "{written:?}"
+    );
 }
 
 /// Answers the probe the way a gRPC handler does: a head, a message, and the
@@ -138,9 +189,13 @@ fn a_unary_call_is_read_decoded_and_answered() {
     // END_STREAM came with it, and a peer that has finished sending has no
     // use for a window. A unary call is most calls, and this is the frame it
     // does not pay for.
-    assert!(
-        !written.iter().any(|f| f.kind == WINDOW_UPDATE && f.stream_id == 1),
-        "nothing left to credit: {written:?}"
+    assert_eq!(
+        written
+            .iter()
+            .filter(|f| f.kind == WINDOW_UPDATE && f.stream_id == 1)
+            .count(),
+        1,
+        "the opening grant and nothing after it: {written:?}"
     );
 
     assert_eq!(
@@ -426,6 +481,7 @@ fn a_peer_still_sending_is_credited_for_each_message_it_takes() {
         .iter()
         .filter(|f| f.kind == WINDOW_UPDATE && f.stream_id == 1)
         .map(|f| u32::from_be_bytes(f.payload[..4].try_into().unwrap()))
+        .skip(1)
         .collect();
     assert_eq!(
         credits,

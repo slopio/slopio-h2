@@ -1,0 +1,23 @@
+// `grpc.testing.TestService`, from grpc/grpc-proto, trimmed to the methods the
+// example beside it implements. The paths are what matter to a client, and
+// they are unchanged.
+syntax = "proto3";
+
+package grpc.testing;
+
+import "messages.proto";
+
+service TestService {
+  rpc EmptyCall(Empty) returns (Empty);
+  rpc UnaryCall(SimpleRequest) returns (SimpleResponse);
+  rpc CacheableUnaryCall(SimpleRequest) returns (SimpleResponse);
+  rpc StreamingOutputCall(StreamingOutputCallRequest)
+      returns (stream StreamingOutputCallResponse);
+  rpc StreamingInputCall(stream StreamingInputCallRequest)
+      returns (StreamingInputCallResponse);
+  rpc FullDuplexCall(stream StreamingOutputCallRequest)
+      returns (stream StreamingOutputCallResponse);
+  rpc HalfDuplexCall(stream StreamingOutputCallRequest)
+      returns (stream StreamingOutputCallResponse);
+  rpc UnimplementedCall(Empty) returns (Empty);
+}

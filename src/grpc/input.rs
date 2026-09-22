@@ -5,7 +5,7 @@ use http::HeaderMap;
 use super::frame::{Accumulating, GrpcFrame};
 use super::prefix::{PREFIX_LEN, Prefix, PrefixRead};
 use super::request::{AnnouncedEncoding, GrpcFormat};
-use crate::shared::connection::stream_window::LOCAL_INITIAL_WINDOW_SIZE;
+use crate::server::connection::CONNECTION_RECV_WINDOW;
 
 /// Why a gRPC request body stopped being one. Handed to the handler rather
 /// than turned into a RST_STREAM, because the answer to each of these is a
@@ -58,11 +58,29 @@ pub struct GrpcInput {
     declared: Option<u64>,
 }
 
+/// A message must be able to arrive at all: the connection window is what
+/// bounds everything held unread, so one that cannot hold a single message
+/// would deadlock the first large one.
+const _: () = assert!(
+    GrpcInput::MESSAGE_LIMIT + PREFIX_LEN <= CONNECTION_RECV_WINDOW as usize,
+    "a whole message must fit in the connection receive window"
+);
+
 impl GrpcInput {
-    /// Largest message held. A message is held whole and hands back no stream
-    /// credit while it fills, so it and its prefix have to fit in the stream's
-    /// receive window.
-    pub const MESSAGE_LIMIT: usize = LOCAL_INITIAL_WINDOW_SIZE as usize - PREFIX_LEN;
+    /// Largest message held, and gRPC's own default.
+    ///
+    /// A message is delivered whole, so nothing of it is consumed until all of
+    /// it has arrived, so no credit goes back while it fills: it has to fit in
+    /// its stream's receive window in one go. That window starts at §6.9.2's
+    /// 65535, which the interop suite's `large_unary` — 272 KB in, 314 KB out
+    /// — is far past, and so is most real traffic. So a gRPC stream is granted
+    /// the difference when it opens; see `StreamState::window_wanted`.
+    ///
+    /// What still bounds memory is the *connection* window, which a message
+    /// holds until the handler takes it, exactly as an HTTP body does. Raising
+    /// the stream's lets one message be large; it does not let the connection
+    /// hold more unread than it could before.
+    pub const MESSAGE_LIMIT: usize = 4 * 1024 * 1024;
 
     /// Most messages waiting to be taken.
     ///

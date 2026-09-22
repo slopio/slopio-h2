@@ -16,8 +16,7 @@ pub use frame::{
     MessageError, UncompressedGrpcFrame,
 };
 pub use encode::frame_message;
-pub use input::GrpcError;
-pub(crate) use input::GrpcInput;
+pub use input::{GrpcError, GrpcInput};
 pub use request::GrpcFormat;
 pub use call::{GrpcCall, service};
 pub use status::{Code, Status};

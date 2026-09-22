@@ -203,6 +203,14 @@ impl<H: Handler> Streams<H> {
         }
 
         let stream = Rc::new(StreamState::create(settings, headers).map_err(Rejected::Violation)?);
+
+        // §6.9.2 starts every stream at 65535, which suits a body drained as
+        // it arrives and not one delivered a whole unit at a time. The stream
+        // says what it needs; what that is, is its business.
+        if let Some(more) = stream.window_wanted() {
+            shared.write_frame(|out| encode_window_update(out, id, more));
+        }
+
         let token = StreamToken::new(
             id,
             Rc::clone(&stream),

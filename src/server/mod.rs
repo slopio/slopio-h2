@@ -5,7 +5,7 @@ use runtime_streams::StreamExt;
 use crate::server::connection::Connection;
 use crate::shared::transport::{PlainMessages, Transport};
 
-mod connection;
+pub(crate) mod connection;
 mod stream;
 
 pub use stream::Stream;

@@ -432,6 +432,29 @@ impl StreamState {
         self.no_more_output.set(true);
     }
 
+    /// Receive window this stream wants beyond §6.9.2's 65535, `None` for one
+    /// that is content with it.
+    ///
+    /// Asked once, when the stream opens, and answered by what its body is: an
+    /// HTTP body is drained as it arrives and never needs more, a gRPC one is
+    /// delivered a whole message at a time and cannot take a message larger
+    /// than the window in one go.
+    ///
+    /// Reported rather than acted on, the stream having no way to write a
+    /// frame. Whoever asks must write the WINDOW_UPDATE it is handed.
+    #[must_use]
+    pub fn window_wanted(&self) -> Option<u32> {
+        #[cfg(feature = "grpc")]
+        if matches!(*self.input.borrow(), Input::Grpc(_)) {
+            let wanted = (GrpcInput::MESSAGE_LIMIT + 5) as u32;
+            return wanted
+                .checked_sub(crate::shared::connection::stream_window::LOCAL_INITIAL_WINDOW_SIZE)
+                .filter(|more| *more > 0)
+                .inspect(|more| self.window.grant_recv(*more));
+        }
+        None
+    }
+
     /// Whether the peer's half is done: its END_STREAM came, or we stopped
     /// expecting one.
     pub fn input_ended(&self) -> bool {

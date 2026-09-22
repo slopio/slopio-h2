@@ -95,6 +95,17 @@ impl StreamWindow {
         Some(pending)
     }
 
+    /// Widens the receive window by `len`, for a stream whose unit of delivery
+    /// does not fit in what §6.9.2 starts it with.
+    ///
+    /// Not a release: nothing was consumed, and nothing was owed. This is
+    /// credit extended up front, so the caller must write the WINDOW_UPDATE
+    /// that carries it — the ledger would otherwise say less than the wire,
+    /// and the peer would spend credit we had not counted.
+    pub fn grant_recv(&self, len: u32) {
+        self.to_recv.set(self.to_recv.get() + len as i32);
+    }
+
     /// §6.9.1: a DATA frame debits the receive window by its *padded* length,
     /// pad-length byte and padding included. Dropping below zero means the
     /// peer sent past the credit we gave it.
