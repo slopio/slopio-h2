@@ -109,10 +109,13 @@ fn main() {
 
 /// Every call's outcome, kept as it happens and read once at the end.
 ///
-/// A `Vec` of durations rather than a histogram: a run of a few million
-/// calls costs a few tens of megabytes, which is nothing next to being able
-/// to compute any percentile afterwards rather than the ones a bucket layout
-/// decided in advance.
+/// A `Vec` of durations rather than a histogram: any percentile can be taken
+/// afterwards, rather than the ones a bucket layout decided in advance.
+///
+/// It costs 16 bytes a call, which at 650k calls/s is 10 MB a second — a
+/// minute-long run is a gigabyte, and the reason `DURATION` defaults to five.
+/// Sorted in place rather than copied, because copying it at the end is how
+/// a measurement doubles its own peak.
 #[derive(Default)]
 struct Outcomes {
     latencies: Vec<Duration>,
@@ -185,11 +188,11 @@ async fn run(settings: Settings) {
     for worker in workers {
         worker.await;
     }
-    report(&outcomes.borrow(), started.elapsed());
+    report(&mut outcomes.borrow_mut(), started.elapsed());
 }
 
-fn report(outcomes: &Outcomes, elapsed: Duration) {
-    let mut latencies = outcomes.latencies.clone();
+fn report(outcomes: &mut Outcomes, elapsed: Duration) {
+    let latencies = &mut outcomes.latencies;
     latencies.sort_unstable();
 
     let completed = latencies.len();
