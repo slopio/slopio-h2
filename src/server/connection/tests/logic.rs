@@ -12,6 +12,7 @@ use runtime_core::runtime::time::Sleep;
 use super::{
     DATA, FLAG_END_HEADERS, FLAG_END_STREAM, Frame, GET_BLOCK, GOAWAY, HEADERS, PING, PREFACE,
     RST_STREAM, SETTINGS, deliveries, frame, run_connection, run_connection_with,
+    run_connection_writes,
 };
 
 const FLAG_PADDED: u8 = 0x8;
@@ -69,6 +70,99 @@ fn a_slow_handler_is_not_a_starved_body() {
         .find(|f| f.kind == HEADERS)
         .expect("the slow handler's response went out");
     assert_eq!(status_of(head).as_deref(), Some("200"));
+}
+
+/// A handler that answers a second after its request, on a connection the
+/// peer has nothing more to say on. Its response has to leave when it is
+/// written: it used to wait for the peer's next chunk, and a peer waiting for
+/// a response sends none — here the PING at three seconds carried it, and
+/// without one it was the idle GOAWAY, two minutes on.
+#[test]
+fn a_late_response_leaves_without_waiting_for_the_peer() {
+    let mut open = preface();
+    open.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        GET_BLOCK,
+    ));
+
+    let second = Duration::from_secs(1);
+    let inbound: Vec<Scripted> = vec![
+        ReadEvent::Data(open).into(),
+        ReadEvent::Data(frame(PING, 0, 0, b"keepaliv")).after(second * 3),
+        ReadEvent::Eof.after(second * 4),
+    ];
+
+    let writes = run_connection_writes(
+        inbound,
+        |_, _| {},
+        |stream: crate::server::Stream| async move {
+            Sleep::during(Duration::from_secs(1)).await;
+            stream.write_headers_final(http::StatusCode::OK, &http::HeaderMap::new());
+        },
+    );
+
+    let response = writes
+        .iter()
+        .position(|write| write.iter().any(|f| f.kind == HEADERS && f.stream_id == 1))
+        .unwrap_or_else(|| panic!("the response went out: {writes:?}"));
+    let ack = writes
+        .iter()
+        .position(|write| write.iter().any(|f| f.kind == PING && f.flags & 0x1 != 0))
+        .unwrap_or_else(|| panic!("the PING was answered: {writes:?}"));
+    assert!(
+        response < ack,
+        "the response waited for the peer's next chunk to leave: {writes:?}"
+    );
+}
+
+/// The other side of flushing on a handler's output: it must not count as
+/// the peer being alive. A handler streaming a body to a peer that has gone
+/// quiet keeps waking the loop, and a deadline counted in ticks that such a
+/// wake restarts would never expire — the connection would last as long as
+/// the handler kept writing. Silence is measured from the peer's last chunk,
+/// so `ACTIVE_TICKS` still ends it.
+#[test]
+fn a_streaming_response_does_not_keep_a_silent_peer_alive() {
+    let mut open = preface();
+    open.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        GET_BLOCK,
+    ));
+
+    let inbound: Vec<Scripted> = vec![
+        ReadEvent::Data(open).into(),
+        ReadEvent::Eof.after(Duration::from_secs(1000)),
+    ];
+
+    let written = run_connection_with(
+        inbound,
+        |_, _| {},
+        |stream: crate::server::Stream| async move {
+            stream.write_headers(http::StatusCode::OK, &http::HeaderMap::new());
+            loop {
+                stream.write_data(b"tick").await;
+                Sleep::during(Duration::from_secs(2)).await;
+            }
+        },
+    );
+
+    let goaway = written
+        .iter()
+        .find(|f| f.kind == GOAWAY)
+        .unwrap_or_else(|| panic!("the silent peer was let go: {written:?}"));
+    assert_eq!(&goaway.payload[8..], b"idle too long");
+    // One DATA every two seconds for `ACTIVE_TICKS` of silence, give or take
+    // a tick — not the five hundred the EOF would have allowed.
+    let data = written.iter().filter(|f| f.kind == DATA).count() as u32;
+    let expected = super::super::ACTIVE_TICKS * 5 / 2;
+    assert!(
+        (expected - 3..=expected + 3).contains(&data),
+        "{data} DATA frames, expected about {expected}"
+    );
 }
 
 /// A small upload, complete, whose handler then thinks for a while. The body

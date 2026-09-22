@@ -193,6 +193,32 @@ pub(super) fn run_connection_with<H: crate::server::Handler>(
     script: impl FnOnce(&FakeRingHandle, i32),
     handler: H,
 ) -> Vec<Frame> {
+    frames(&run_writes(inbound, script, handler).concat())
+}
+
+/// As [`run_connection_with`], with the frames grouped by the write they
+/// left in — for the tests that are about *when* something was sent, which
+/// is the one thing the flat list cannot say.
+///
+/// Only for a peer that takes every write whole: a short write cuts a frame
+/// in two, and neither half parses on its own.
+pub(super) fn run_connection_writes<H: crate::server::Handler>(
+    inbound: Vec<Scripted>,
+    script: impl FnOnce(&FakeRingHandle, i32),
+    handler: H,
+) -> Vec<Vec<Frame>> {
+    run_writes(inbound, script, handler)
+        .iter()
+        .map(|write| frames(write))
+        .collect()
+}
+
+/// Runs one connection to completion and hands back every write it made.
+fn run_writes<H: crate::server::Handler>(
+    inbound: Vec<Scripted>,
+    script: impl FnOnce(&FakeRingHandle, i32),
+    handler: H,
+) -> Vec<Vec<u8>> {
     let (fake, handle) = FakeRing::builder().virtual_time().build();
     let socket = simulated_socket();
     let fd = socket.fd();
@@ -215,7 +241,7 @@ pub(super) fn run_connection_with<H: crate::server::Handler>(
         |run| run(),
     );
 
-    frames(&handle.writes(fd).concat())
+    handle.writes(fd)
 }
 
 /// §5.1: a handler that returns without answering would leave the peer waiting

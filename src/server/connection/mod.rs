@@ -1,5 +1,7 @@
 use std::io;
-use std::time::Duration;
+use std::pin::Pin;
+use std::task::Poll;
+use std::time::{Duration, SystemTime};
 
 use crate::server::Handler;
 use crate::server::connection::protocol::Protocol;
@@ -8,7 +10,6 @@ use crate::shared::{
     transport::{RecvError, Transport},
 };
 use runtime::runtime::time::timeout;
-use runtime_streams::StreamExt;
 
 mod protocol;
 pub(crate) mod shared_with_streams;
@@ -191,6 +192,21 @@ pub const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 /// in trouble, and dropping one connection is the lesser harm.
 pub const MAX_DRY_READS: u32 = 16;
 
+/// What one turn of the connection loop found to do.
+enum Event<B> {
+    /// A chunk off the transport, to be cut into frames.
+    Inbound(B),
+    /// Frames are queued that no chunk of the peer's produced: a handler
+    /// answered, or wrote more of a body, while the loop waited on the peer.
+    Flush,
+    /// The buffer ring was empty. Nothing to do but come back.
+    Retry,
+    /// The peer closed its side.
+    Closed,
+    /// The transport failed, which is a close with nobody to tell.
+    Failed,
+}
+
 /// One HTTP/2 connection: bytes come in through `transport`, `decoder` cuts
 /// them into frames, and each frame is dispatched into `protocol`.
 ///
@@ -226,21 +242,26 @@ impl<T: Transport, H: Handler> Connection<T, H> {
         }
     }
 
-    /// Drives the connection to completion: one chunk in, everything it
-    /// produced out, until the peer closes or a connection error is answered.
+    /// Drives the connection to completion, until the peer closes or a
+    /// connection error is answered.
     ///
-    /// Sequential on purpose — the simple version. Output written by a
-    /// stream task while we wait on `recv` only leaves with the next inbound
-    /// chunk; a select on "output ready" is what fixes that, later.
+    /// A turn is one of two things: a chunk in, with everything it produced
+    /// out; or output a handler wrote while the loop was waiting on the peer.
+    /// The second used to wait for the first — a response written a second
+    /// after its request left only with the peer's next chunk, and to a peer
+    /// with nothing more to say, that was the idle GOAWAY two minutes later.
     pub async fn run(mut self) {
-        // Ticks in a row with nothing from the peer. Any byte resets it, so
-        // this counts silence and not time.
-        let mut silent_ticks = 0;
+        // When the peer last sent anything. Silence is measured from here,
+        // not counted in ticks: the tick restarts every time a handler's
+        // output wakes the loop, so a count of them would stop counting while
+        // a response streams out — and a dead peer on the other end of it
+        // would hold the connection for as long as the handler kept writing.
+        let mut last_heard = runtime::runtime::now();
         // Dry reads in a row. Reset by anything that arrives, so this counts a
         // ring that will not refill, not one that was briefly empty.
         let mut dry_reads = 0;
         loop {
-            if self.wait_expired(silent_ticks) {
+            if self.wait_expired(last_heard) {
                 // §6.8: say so rather than vanishing. The GOAWAY is queued, so
                 // it needs the drain to carry it.
                 self.protocol.time_out();
@@ -248,24 +269,30 @@ impl<T: Transport, H: Handler> Connection<T, H> {
                 let _ = self.transport.shutdown().await;
                 return;
             }
-            match timeout(DEADLINE_TICK, self.recv()).await {
-                // Nothing arrived. Nothing is drained either: the loop's rule
-                // that output leaves with the next inbound chunk is not changed
-                // by a tick passing.
-                Err(()) => {
-                    silent_ticks += 1;
+            let chunk = match timeout(DEADLINE_TICK, self.next_event()).await {
+                // A tick with nothing to do: only the deadlines above had
+                // anything to decide.
+                Err(()) => continue,
+                Ok(Event::Inbound(chunk)) => chunk,
+                // Not the peer's doing, so it says nothing about the peer's
+                // silence, and the sweep that judges the peer waits for a
+                // chunk of its own.
+                Ok(Event::Flush) => {
+                    if self.drain().await.is_err() {
+                        return;
+                    }
                     continue;
                 }
                 // Half-close: the peer sends no more, but is still owed
                 // whatever is queued.
-                Ok(None) => break,
+                Ok(Event::Closed) => break,
                 // The ring was empty, not the connection. Yielding is the
                 // whole remedy: a buffer comes back when another connection on
                 // this worker recycles one, which happens when it is polled,
                 // which is what yielding lets happen. Bounded, because a ring
                 // that stays dry would otherwise spin — every retry re-arms the
                 // op and costs an SQE.
-                Ok(Some(Err(RecvError::Later))) => {
+                Ok(Event::Retry) => {
                     if dry_reads == MAX_DRY_READS {
                         return;
                     }
@@ -275,10 +302,28 @@ impl<T: Transport, H: Handler> Connection<T, H> {
                 }
                 // Transport failure: nowhere left to send a GOAWAY, so drop it
                 // as silently as the clean EOF above.
-                Ok(Some(Err(RecvError::Fatal(_)))) => return,
-                Ok(Some(Ok(()))) => {}
-            }
-            silent_ticks = 0;
+                Ok(Event::Failed) => return,
+            };
+            // The dispatch is not interrupted, and that is a decision rather
+            // than an oversight. Every frame in the chunk is handled before
+            // anything else runs, so a stream task cannot consume — and so
+            // cannot hand the peer its credit back — until the whole chunk is
+            // through. Feeding the decoder in slices with a `yield_now`
+            // between them is the obvious fix, costs nothing to write since
+            // the decoder already reassembles across calls, and loses: on
+            // 1 MiB uploads, one core, ingest by slice size — 5.42-5.48 GB/s
+            // for the whole chunk at once, 5.27-5.45 at 32 KiB, 4.83-5.12 at
+            // 16 KiB, 4.69-5.04 at 8 KiB. Monotonic, and the same shape as
+            // shrinking the ring buffer, which loses for the same reason: what
+            // a dispatch costs to enter is larger than what earlier credit
+            // buys.
+            //
+            // Earlier credit buys little because the loop is CPU-bound at
+            // these rates, not waiting on the peer. It would be worth
+            // something on a connection that is actually stalling for credit,
+            // which is not the shape a benchmark produces.
+            self.decoder.decode_with(chunk.as_ref(), &mut self.protocol);
+            last_heard = runtime::runtime::now();
             dry_reads = 0;
             self.sweep_if_due();
             // The drain carries the GOAWAY, if there was one. An invalid
@@ -302,9 +347,9 @@ impl<T: Transport, H: Handler> Connection<T, H> {
     /// gives it room again, so the loop has to come back for what it wrote
     /// next. A response larger than `OUTPUT_HIGH_WATER` therefore leaves in
     /// several sends before we read again, where it used to be buffered
-    /// whole and sent in one: the same starvation of `recv` as before, for
-    /// bounded memory. A select on "output ready" is what unties the two,
-    /// later.
+    /// whole and sent in one: the same starvation of reading as before, for
+    /// bounded memory. Reading while a large response drains is what would
+    /// untie the two.
     async fn drain(&mut self) -> io::Result<()> {
         loop {
             self.flush().await?;
@@ -334,13 +379,13 @@ impl<T: Transport, H: Handler> Connection<T, H> {
     ///
     /// Two clocks, because two different things are bounded. A half-sent frame
     /// gets a wall-clock budget from when it started, which more of the same
-    /// frame does not refill. Everything else gets a count of silent ticks,
-    /// which any byte resets — and that is right there, because a peer sending
-    /// real frames is a peer making progress.
+    /// frame does not refill. Everything else gets the silence since the
+    /// peer's last chunk, which any byte resets — and that is right there,
+    /// because a peer sending real frames is a peer making progress.
     #[inline]
-    fn wait_expired(&mut self, silent_ticks: u32) -> bool {
+    fn wait_expired(&mut self, last_heard: SystemTime) -> bool {
+        let now = runtime::runtime::now();
         if !self.decoder.preface_seen() || self.decoder.header_pending() {
-            let now = runtime::runtime::now();
             let since = *self.partial_since.get_or_insert(now);
             // Floors at zero on a clock that stepped backwards, as
             // `Stream::age` does, so an adjustment cannot close a connection.
@@ -351,7 +396,7 @@ impl<T: Transport, H: Handler> Connection<T, H> {
             true => ACTIVE_TICKS,
             false => IDLE_TICKS,
         };
-        silent_ticks >= allowed
+        now.duration_since(last_heard).unwrap_or_default() >= DEADLINE_TICK * allowed
     }
 
     /// Sweeps for starving streams, a few seconds apart at most.
@@ -410,36 +455,43 @@ impl<T: Transport, H: Handler> Connection<T, H> {
         }
     }
 
-    /// Takes one chunk off the transport and dispatches every frame in it.
+    /// Waits for whichever comes first: a chunk from the peer, or output to
+    /// send.
     ///
-    /// `None` is the peer closing its side — it may still be owed responses.
     /// Chunk boundaries mean nothing: a frame split across two chunks is
     /// reassembled by the decoder, which also keeps the header block a
     /// CONTINUATION is still completing.
     ///
-    /// The dispatch is not interrupted, and that is a decision rather than
-    /// an oversight. Every frame in the chunk is handled before anything
-    /// else runs, so a stream task cannot consume — and so cannot hand the
-    /// peer its credit back — until the whole chunk is through. Feeding the
-    /// decoder in slices with a `yield_now` between them is the obvious fix,
-    /// costs nothing to write since the decoder already reassembles across
-    /// calls, and loses: on 1 MiB uploads, one core, ingest by slice size —
-    /// 5.42-5.48 GB/s for the whole chunk at once, 5.27-5.45 at 32 KiB,
-    /// 4.83-5.12 at 16 KiB, 4.69-5.04 at 8 KiB. Monotonic, and the same
-    /// shape as shrinking the ring buffer, which loses for the same reason:
-    /// what a dispatch costs to enter is larger than what earlier credit
-    /// buys.
-    ///
-    /// Earlier credit buys little because the loop is CPU-bound at these
-    /// rates, not waiting on the peer. It would be worth something on a
-    /// connection that is actually stalling for credit, which is not the
-    /// shape a benchmark produces.
-    pub async fn recv(&mut self) -> Option<Result<(), RecvError>> {
-        let chunk = match self.transport.next().await? {
-            Ok(chunk) => chunk,
-            Err(e) => return Some(Err(e)),
-        };
-        self.decoder.decode_with(chunk.as_ref(), &mut self.protocol);
-        Some(Ok(()))
+    /// The output is checked before the transport is polled and again before
+    /// parking. No task can write between those two points — none runs while
+    /// this one is being polled — so the second check is belt and braces.
+    /// What does happen between polls is a handler writing from its own task,
+    /// and `write_frame` wakes the waker parked below for exactly that.
+    fn next_event(&mut self) -> impl Future<Output = Event<T::Buf>> + '_ {
+        let Self {
+            transport,
+            protocol,
+            ..
+        } = self;
+        let shared = protocol.shared();
+
+        std::future::poll_fn(move |cx| {
+            if !shared.output_is_empty() {
+                return Poll::Ready(Event::Flush);
+            }
+            match Pin::new(&mut *transport).poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Event::Inbound(chunk)),
+                Poll::Ready(Some(Err(RecvError::Later))) => Poll::Ready(Event::Retry),
+                Poll::Ready(Some(Err(RecvError::Fatal(_)))) => Poll::Ready(Event::Failed),
+                Poll::Ready(None) => Poll::Ready(Event::Closed),
+                Poll::Pending => {
+                    shared.park_flusher(cx.waker());
+                    match shared.output_is_empty() {
+                        true => Poll::Pending,
+                        false => Poll::Ready(Event::Flush),
+                    }
+                }
+            }
+        })
     }
 }

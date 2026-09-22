@@ -239,12 +239,12 @@ pub struct SharedConnection {
     output: UnsafeCell<Output>,
     /// Whoever flushes this output, parked because there was nothing to send.
     ///
-    /// A client's connection loop is a task of its own: the application writes
-    /// a request from *its* task and the loop has to be told, or the frame
-    /// sits in the chain until the peer happens to send something. A server's
-    /// loop registers nothing here — it flushes on the turn of its own loop,
-    /// having just decoded the frames that produced the output — so for that
-    /// end every wake below is a read of an empty cell.
+    /// The connection loop is a task of its own, and most of what it sends is
+    /// written from another: a client's application writes a request from
+    /// *its* task, a server's handler a response from its stream's. Either way
+    /// the loop has to be told, or the frame sits in the chain until the peer
+    /// happens to send something — which, having nothing more to say, it may
+    /// never do.
     flusher: RefCell<Option<Waker>>,
 }
 
