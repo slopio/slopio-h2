@@ -24,6 +24,17 @@ impl Encoder {
         }
     }
 
+    /// Lets `:path` values into the dynamic table.
+    ///
+    /// For a connection that sends a small set of paths over and over — a
+    /// gRPC client, where the path is the method name — this turns a literal
+    /// and its Huffman coding into one index byte per request. For one whose
+    /// paths are nearly all distinct it is the wrong trade, which is why it
+    /// is off until something that knows the workload says otherwise.
+    pub fn index_paths(&mut self, on: bool) {
+        self.table.index_paths(on);
+    }
+
     /// Queues a max size update.
     ///
     /// The next call to `encode` will include a dynamic size update frame.
@@ -689,6 +700,62 @@ mod test {
     #[ignore]
     fn test_evicted_overflow() {
         // Not sure what the best way to do this is.
+    }
+
+    use crate::shared::hpack::BytesStr;
+
+    /// The default: a `:path` stays a literal, however often it is sent. The
+    /// browser case, where indexing near-unique paths would evict the entries
+    /// that were worth keeping.
+    #[test]
+    fn a_path_is_not_indexed_by_default() {
+        let mut encoder = Encoder::new(4096, 4096);
+        let path = || vec![Header::Path(BytesStr::from("/helloworld.Greeter/SayHello"))];
+
+        let first = encode(&mut encoder, path());
+        let second = encode(&mut encoder, path());
+        assert_eq!(
+            first, second,
+            "the same literal, re-encoded and re-Huffman-coded every time"
+        );
+        assert!(second.len() > 20, "the whole string is on the wire: {second:?}");
+    }
+
+    /// Told that the paths repeat, the second one costs an index byte. What a
+    /// gRPC client gets, where the path is the method name.
+    #[test]
+    fn a_repeated_path_is_indexed_when_the_caller_says_they_repeat() {
+        let mut encoder = Encoder::new(4096, 4096);
+        encoder.index_paths(true);
+        let path = || vec![Header::Path(BytesStr::from("/helloworld.Greeter/SayHello"))];
+
+        let first = encode(&mut encoder, path());
+        let second = encode(&mut encoder, path());
+
+        // §6.2.1: the first goes out as a literal *with* incremental indexing,
+        // which is the instruction that puts it in both tables.
+        assert!(first.len() > 20, "the first still carries the string");
+        assert_eq!(
+            second.len(),
+            1,
+            "and the second is one index byte: {second:02x?}"
+        );
+        assert_eq!(second[0] & 0x80, 0x80, "§6.1: an indexed field");
+    }
+
+    /// The saving is only worth having if a *different* path still works —
+    /// the table holds both rather than one replacing the other.
+    #[test]
+    fn two_repeated_paths_are_both_kept() {
+        let mut encoder = Encoder::new(4096, 4096);
+        encoder.index_paths(true);
+        let one = || vec![Header::Path(BytesStr::from("/svc/One"))];
+        let two = || vec![Header::Path(BytesStr::from("/svc/Two"))];
+
+        encode(&mut encoder, one());
+        encode(&mut encoder, two());
+        assert_eq!(encode(&mut encoder, one()).len(), 1, "the first is still there");
+        assert_eq!(encode(&mut encoder, two()).len(), 1, "and so is the second");
     }
 
     fn encode(e: &mut Encoder, hdrs: Vec<Header<Option<HeaderName>>>) -> Vec<u8> {

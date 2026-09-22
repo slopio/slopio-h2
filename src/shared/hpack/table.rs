@@ -11,6 +11,12 @@ use std::{cmp, mem};
 /// HPACK encoder table
 #[derive(Debug)]
 pub struct Table {
+    /// Whether a `:path` may be kept in the dynamic table. Off by default,
+    /// which is the right answer for a connection whose paths are nearly all
+    /// distinct; see [`Header::skip_value_index`].
+    ///
+    /// [`Header::skip_value_index`]: super::Header::skip_value_index
+    index_paths: bool,
     mask: usize,
     indices: Vec<Option<Pos>>,
     slots: VecDeque<Slot>,
@@ -75,6 +81,7 @@ impl Table {
     pub fn new(max_size: usize, capacity: usize) -> Table {
         if capacity == 0 {
             Table {
+                index_paths: false,
                 mask: 0,
                 indices: vec![],
                 slots: VecDeque::new(),
@@ -86,6 +93,7 @@ impl Table {
             let capacity = cmp::max(to_raw_capacity(capacity).next_power_of_two(), 8);
 
             Table {
+                index_paths: false,
                 mask: capacity.wrapping_sub(1),
                 indices: vec![None; capacity],
                 slots: VecDeque::with_capacity(usable_capacity(capacity)),
@@ -130,13 +138,18 @@ impl Table {
         }
     }
 
+    /// Whether `:path` values may enter the dynamic table on this connection.
+    pub fn index_paths(&mut self, on: bool) {
+        self.index_paths = on;
+    }
+
     /// Index the header in the HPACK table.
     pub fn index(&mut self, header: Header) -> Index {
         // Check the static table
         let statik = index_static(&header);
 
         // Don't index certain headers. This logic is borrowed from nghttp2.
-        if header.skip_value_index() {
+        if header.skip_value_index(self.index_paths) {
             // Right now, if this is true, the header name is always in the
             // static table. At some point in the future, this might not be true
             // and this logic will need to be updated.

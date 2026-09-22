@@ -291,3 +291,76 @@ fn an_http_error_from_a_proxy_becomes_a_status() {
         status.message
     );
 }
+
+/// A gRPC connection asks for the same handful of paths for its whole life,
+/// so the second call to one should not spell it out again.
+///
+/// HPACK leaves `:path` out of its dynamic table by default — right for a
+/// browser, whose paths are nearly all distinct, and wrong here. `GrpcClient`
+/// turns that off, and this is where the difference is visible: on the wire.
+#[test]
+fn the_second_call_to_a_path_does_not_spell_it_out_again() {
+    let reply = HelloReply {
+        message: "hi".into(),
+    };
+    // The same exchange twice, on the two stream ids a client opens first.
+    // Separately in time, and not as one chunk: the second stream does not
+    // exist until the first call has been answered, and a response on a
+    // stream this client never opened is a connection error (§5.1) — which
+    // is the client being right and the script being wrong.
+    let exchange = |id: u32| {
+        let mut block = STATUS_200.to_vec();
+        block.extend_from_slice(&literal("content-type", "application/grpc+proto"));
+        let mut bytes = frame(HEADERS, FLAG_END_HEADERS, id, &block);
+        bytes.extend_from_slice(&frame(DATA, 0, id, &framed(&reply)));
+        bytes.extend_from_slice(&frame(
+            HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            id,
+            &literal("grpc-status", "0"),
+        ));
+        bytes
+    };
+
+    let (_, written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(exchange(1)).after(Duration::from_millis(20)),
+            ReadEvent::Data(exchange(3)).after(Duration::from_millis(60)),
+            ReadEvent::Eof.after(Duration::from_millis(500)),
+        ],
+        |client| async move {
+            let grpc = GrpcClient::new(client);
+            for _ in 0..2 {
+                grpc.unary::<_, HelloReply>(PATH, &HelloRequest::default())
+                    .await
+                    .expect("both calls succeeded");
+            }
+            settle().await;
+        },
+    );
+
+    let heads: Vec<super::Frame> = super::frames(&written)
+        .into_iter()
+        .filter(|f| f.kind == HEADERS && (f.stream_id == 1 || f.stream_id == 3))
+        .collect();
+    assert_eq!(heads.len(), 2, "two calls, two request heads");
+
+    // The path is 28 characters; the first head carries it, Huffman-coded.
+    assert!(
+        heads[0].payload.len() > 20,
+        "the first spells everything out: {} bytes",
+        heads[0].payload.len()
+    );
+    assert!(
+        heads[1].payload.len() <= 6,
+        "the second is indices and nothing else: {} bytes, {:02x?}",
+        heads[1].payload.len(),
+        heads[1].payload
+    );
+
+    // And it still decodes to the same request, which is the point of doing
+    // it this way rather than sending less and meaning less.
+    let decoded = super::decode_block(&heads[0].payload);
+    assert_eq!(decoded.get(":path").map(String::as_str), Some(PATH));
+}

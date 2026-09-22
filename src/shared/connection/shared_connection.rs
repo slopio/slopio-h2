@@ -530,4 +530,17 @@ impl SharedConnection {
     pub fn set_max_frame_size(&self, max_frame_size: u32) {
         self.max_frame_size.set(max_frame_size);
     }
+
+    /// Lets `:path` values into the HPACK dynamic table, for a connection
+    /// whose paths repeat. See [`Encoder::index_paths`].
+    ///
+    /// Nothing about the wire changes for the peer: a value entering the
+    /// table is an ordinary literal-with-incremental-indexing, which every
+    /// decoder must already handle. What changes is that the second request
+    /// to the same path costs an index byte instead of the whole string.
+    pub fn index_request_paths(&self, on: bool) {
+        // SAFETY: the reference dies with the expression, and setting a flag
+        // cannot re-enter.
+        unsafe { (*self.encoder.get()).index_paths(on) };
+    }
 }

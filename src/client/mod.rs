@@ -283,6 +283,22 @@ impl Client {
     pub fn live_streams(&self) -> usize {
         self.shared.streams.len()
     }
+
+    /// Says that this connection will ask for the same handful of paths over
+    /// and over, so that HPACK may keep them.
+    ///
+    /// A fact about the workload, which only the caller has: the encoder
+    /// leaves `:path` out of its dynamic table by default because a browser's
+    /// paths are nearly all distinct, and indexing those would evict the
+    /// entries worth keeping. Where they *do* repeat, the second request to a
+    /// path costs one byte instead of the string and its Huffman coding — on
+    /// a 28-character gRPC method name, 23 bytes and most of the encode.
+    ///
+    /// Safe to call at any time and on any connection; it changes nothing the
+    /// peer has to understand, only how much of it we send.
+    pub fn index_request_paths(&self, repeated: bool) {
+        self.shared.core.index_request_paths(repeated);
+    }
 }
 
 impl Drop for Client {

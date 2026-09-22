@@ -187,7 +187,20 @@ impl Header {
         }
     }
 
-    pub fn skip_value_index(&self) -> bool {
+    /// Whether this header's *value* should be kept out of the dynamic table.
+    ///
+    /// `index_paths` is the caller's answer to one question the encoder cannot
+    /// answer for itself: does this connection send the same `:path` over and
+    /// over? A browser does not — its paths carry query strings and are very
+    /// nearly unique, so indexing them evicts the entries that would have been
+    /// reused, and nghttp2's rule (which the rest of this list is borrowed
+    /// from) is to leave them out.
+    ///
+    /// A gRPC client is the opposite case: the path *is* the method name, a
+    /// handful of values repeated for the life of the connection. Left out,
+    /// each call re-Huffman-encodes the same 28 characters and sends 23 bytes
+    /// that one index byte would have carried.
+    pub fn skip_value_index(&self, index_paths: bool) -> bool {
         use http::header;
 
         match *self {
@@ -203,7 +216,7 @@ impl Header {
                     | header::COOKIE
                     | header::SET_COOKIE
             ),
-            Header::Path(..) => true,
+            Header::Path(..) => !index_paths,
             _ => false,
         }
     }

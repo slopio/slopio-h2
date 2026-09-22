@@ -49,6 +49,12 @@ pub struct Client {
 
 impl Client {
     pub fn new(inner: client::Client) -> Self {
+        // A gRPC connection asks for a handful of paths — the methods of one
+        // service — for its whole life, which is the case HPACK's dynamic
+        // table exists for and the one its default policy assumes away. Set
+        // here rather than left to the caller: it is not a preference, it is
+        // what gRPC *is*.
+        inner.index_request_paths(true);
         Self { inner }
     }
 
