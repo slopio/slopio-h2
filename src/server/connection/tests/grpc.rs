@@ -15,6 +15,7 @@ use super::{
     DATA, FLAG_END_HEADERS, FLAG_END_STREAM, Frame, GOAWAY, HEADERS, PREFACE, RST_STREAM, SETTINGS,
     WINDOW_UPDATE, decode_block, frame, run_connection_with,
 };
+use crate::grpc::{GrpcCall, Status, service};
 use crate::server::Stream;
 
 /// `grpc.health.v1.HealthCheckRequest`: what every Kubernetes gRPC probe
@@ -171,6 +172,207 @@ fn a_unary_call_is_read_decoded_and_answered() {
             .iter()
             .any(|f| f.kind == GOAWAY || f.kind == RST_STREAM),
         "nothing went wrong: {written:?}"
+    );
+}
+
+/// Named rather than closures: a closure's returned future does not carry the
+/// higher-ranked lifetime `AsyncFn(&GrpcCall)` asks for, and an `async fn`
+/// does.
+async fn waits_forever(call: &GrpcCall) -> Status {
+    assert_eq!(call.timeout(), Some(Duration::from_millis(100)));
+    let _: Option<HealthCheckRequest> = call.message().await.expect("no body error");
+    unreachable!("the deadline is what ends this call")
+}
+
+async fn answers_at_once(call: &GrpcCall) -> Status {
+    let request: HealthCheckRequest = call.message().await.expect("no error").expect("a message");
+    assert_eq!(request.service, "", "all defaults, and no bytes for them");
+    call.write_message(&HealthCheckResponse { status: SERVING })
+        .await;
+    Status::ok()
+}
+
+async fn not_grpc(stream: Stream) {
+    stream.write_headers_final(http::StatusCode::NOT_FOUND, &http::HeaderMap::new())
+}
+
+/// What a handler puts in the head and in the trailers goes out, reserved
+/// names included: gRPC's metadata is the service's to choose, and a service
+/// answering `+json` has to be able to say so.
+async fn echoes_its_metadata(call: &GrpcCall) -> Status {
+    let mut head = http::HeaderMap::new();
+    // Overrides the layer's only default.
+    head.insert(
+        "content-type",
+        http::HeaderValue::from_static("application/grpc+json"),
+    );
+    head.insert(
+        "x-grpc-test-echo-initial",
+        http::HeaderValue::from_static("bonjour"),
+    );
+    call.set_headers(&head);
+
+    let mut trailers = http::HeaderMap::new();
+    trailers.insert(
+        "x-grpc-test-echo-trailing-bin",
+        http::HeaderValue::from_static("YWJjMTIz"),
+    );
+    // Written before the returned status, which wins: `finish` must not say
+    // something other than what the handler returned.
+    trailers.insert("grpc-status", http::HeaderValue::from_static("7"));
+    call.set_trailers(&trailers);
+
+    call.write_message(&HealthCheckResponse { status: SERVING })
+        .await;
+    Status::not_found("unknown service")
+}
+
+#[test]
+fn a_handler_chooses_its_own_metadata_reserved_names_included() {
+    let mut bytes = opening();
+    bytes.extend_from_slice(&frame(DATA, FLAG_END_STREAM, 1, &framed(&[])));
+
+    let written = run_connection_with(scripted(&bytes), |_, _| {}, service(echoes_its_metadata, not_grpc));
+    let ours = on_stream_1(&written);
+    assert_eq!(
+        ours.iter().map(|f| f.kind).collect::<Vec<_>>(),
+        [HEADERS, DATA, HEADERS],
+        "{written:?}"
+    );
+
+    let head = decode_block(&ours[0].payload);
+    assert_eq!(
+        head.get("content-type").map(String::as_str),
+        Some("application/grpc+json"),
+        "the handler's, not the layer's default"
+    );
+    assert_eq!(
+        head.get("x-grpc-test-echo-initial").map(String::as_str),
+        Some("bonjour")
+    );
+
+    let trailers = decode_block(&ours[2].payload);
+    assert_eq!(
+        trailers.get("x-grpc-test-echo-trailing-bin").map(String::as_str),
+        Some("YWJjMTIz")
+    );
+    assert_eq!(
+        trailers.get("grpc-status").map(String::as_str),
+        Some("5"),
+        "the returned Status, not the `7` the map asked for"
+    );
+    assert_eq!(
+        trailers.get("grpc-message").map(String::as_str),
+        Some("unknown service")
+    );
+}
+
+/// A call that fails before it writes anything is one frame, so the head's
+/// fields have to travel in it.
+async fn fails_with_metadata(call: &GrpcCall) -> Status {
+    let mut head = http::HeaderMap::new();
+    head.insert("x-request-id", http::HeaderValue::from_static("abc123"));
+    call.set_headers(&head);
+    Status::unimplemented("no such method")
+}
+
+#[test]
+fn a_trailers_only_response_carries_the_heads_fields_too() {
+    let mut bytes = opening();
+    bytes.extend_from_slice(&frame(DATA, FLAG_END_STREAM, 1, &framed(&[])));
+
+    let written = run_connection_with(scripted(&bytes), |_, _| {}, service(fails_with_metadata, not_grpc));
+    let ours = on_stream_1(&written);
+    assert_eq!(ours.iter().map(|f| f.kind).collect::<Vec<_>>(), [HEADERS]);
+    assert_eq!(ours[0].flags & FLAG_END_STREAM, FLAG_END_STREAM);
+
+    let fields = decode_block(&ours[0].payload);
+    assert_eq!(fields.get("x-request-id").map(String::as_str), Some("abc123"));
+    assert_eq!(fields.get("grpc-status").map(String::as_str), Some("12"));
+    assert_eq!(
+        fields.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+}
+
+/// The layer's own job: a call that outlives its `grpc-timeout` is cut off
+/// and answered, rather than left running for a client that has given up.
+///
+/// Nothing is ever sent on the body, so the handler waits on a message that
+/// never comes. Virtual time, so the 100ms is exact and costs nothing.
+#[test]
+fn a_call_past_its_deadline_is_answered_deadline_exceeded() {
+    let mut block = grpc_block(b"application/grpc");
+    // `grpc-timeout: 100m`, a literal with a name of its own.
+    block.extend_from_slice(&[0x00, 12]);
+    block.extend_from_slice(b"grpc-timeout");
+    block.push(4);
+    block.extend_from_slice(b"100m");
+
+    let mut bytes = PREFACE.to_vec();
+    bytes.extend_from_slice(&frame(SETTINGS, 0, 0, &[]));
+    bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, &block));
+
+    let written = run_connection_with(
+        vec![
+            ReadEvent::Data(bytes).into(),
+            ReadEvent::Eof.after(Duration::from_secs(5)),
+        ],
+        |_, _| {},
+        service(waits_forever, not_grpc),
+    );
+
+    let ours = on_stream_1(&written);
+    let kinds: Vec<u8> = ours.iter().map(|f| f.kind).collect();
+    assert_eq!(
+        kinds,
+        [HEADERS, RST_STREAM],
+        "Trailers-Only, and the body we will not read: {written:?}"
+    );
+
+    let head = ours[0];
+    assert_eq!(head.flags & FLAG_END_STREAM, FLAG_END_STREAM);
+    let fields = decode_block(&head.payload);
+    assert_eq!(fields.get(":status").map(String::as_str), Some("200"));
+    assert_eq!(fields.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        fields.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+}
+
+/// And a call that answers in time keeps its own status: the deadline is
+/// armed on every call, so it has to lose the race on the ordinary ones.
+#[test]
+fn a_call_inside_its_deadline_keeps_its_own_status() {
+    let mut block = grpc_block(b"application/grpc");
+    block.extend_from_slice(&[0x00, 12]);
+    block.extend_from_slice(b"grpc-timeout");
+    block.push(3);
+    block.extend_from_slice(b"30S");
+
+    let mut bytes = PREFACE.to_vec();
+    bytes.extend_from_slice(&frame(SETTINGS, 0, 0, &[]));
+    bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, &block));
+    bytes.extend_from_slice(&frame(DATA, FLAG_END_STREAM, 1, &framed(&[])));
+
+    let written = run_connection_with(
+        scripted(&bytes),
+        |_, _| {},
+        service(answers_at_once, not_grpc),
+    );
+
+    let ours = on_stream_1(&written);
+    assert_eq!(
+        ours.iter().map(|f| f.kind).collect::<Vec<_>>(),
+        [HEADERS, DATA, HEADERS],
+        "head, message, trailers: {written:?}"
+    );
+    assert_eq!(
+        decode_block(&ours[2].payload)
+            .get("grpc-status")
+            .map(String::as_str),
+        Some("0")
     );
 }
 

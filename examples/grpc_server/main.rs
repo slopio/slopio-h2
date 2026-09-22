@@ -1,10 +1,9 @@
-//! A gRPC service, answered by hand — no code generation, no stubs.
+//! Two gRPC services, answered by hand — no code generation, no stubs.
 //!
-//! Two services on 8080, as gRPC over h2c: `grpc.health.v1.Health`, which
-//! every gRPC deployment already has and Kubernetes probes, and a
-//! bidirectional `popple.echo.v1.Echo` to talk to both ways at once. Their
-//! `.proto` files are beside this one, under `proto/`, and are what a client
-//! needs to call them.
+//! `grpc.health.v1.Health`, which every gRPC deployment already has and
+//! Kubernetes probes, and a bidirectional `popple.echo.v1.Echo` to talk both
+//! ways at once. Cleartext on 8080, as gRPC over h2c. Their `.proto` files sit
+//! beside this one, under `proto/`, and are what a client needs to call them.
 //!
 //!     cargo run --example grpc_server
 //!
@@ -18,16 +17,19 @@
 //!         -proto examples/grpc_server/proto/echo.proto -d @ \
 //!         localhost:8080 popple.echo.v1.Echo/Chat
 //!
-//! What the library does is read the request as messages and write the
-//! response as one: `stream.message()`, `frame.decode()`,
-//! `stream.write_message()`. What is left here — the routing on `:path`, the
-//! `grpc-status` in the trailers — is what gRPC asks of a service and what
-//! generated code would otherwise write for you.
+//! [`grpc::service`] is what makes these handlers handlers: it owns the call,
+//! reads the request's messages, writes the response's, and turns the [`Status`]
+//! each one returns into the trailers — or into a Trailers-Only response, when
+//! the call failed before it produced anything. The deadline in `grpc-timeout`
+//! is its business too, so a handler is never left running for a client that
+//! has given up.
+//!
+//! What is left here is the service: routing on `:path`, and what to answer.
 
-use http::{HeaderMap, HeaderValue, StatusCode};
-use popple_h2::grpc::MessageError;
+use http::{HeaderMap, StatusCode};
+use popple_h2::grpc::{GrpcCall, Status, service};
 use popple_h2::server::{Server, ServerSettings, ServerTransport, Stream};
-use runtime::main_thread_with;
+use runtime::{main_thread_with, thread_per_core_with};
 
 runtime::define_buf_ring!(
     MyBufRing,
@@ -73,13 +75,6 @@ struct EchoResponse {
 const SERVING: i32 = 1;
 const NOT_SERVING: i32 = 2;
 
-/// §9.1's codes, the few this service can answer with.
-const OK: &str = "0";
-const INVALID_ARGUMENT: &str = "3";
-const NOT_FOUND: &str = "5";
-const UNIMPLEMENTED: &str = "12";
-const INTERNAL: &str = "13";
-
 /// What this server says it is: everything but `down` is up.
 fn status_of(service: &str) -> Option<i32> {
     match service {
@@ -97,77 +92,70 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(8080);
 
-    println!("gRPC health service on :{port} (h2c)");
-    main_thread_with::<MyBufRing, _>(async move {
-        let settings = ServerSettings {
-            bind_port: port,
-            transport: ServerTransport::Plain,
-        };
-        if let Err(e) = Server::new(settings).run::<MyBufRing, _>(route).await {
-            eprintln!("server error: {e}");
-        }
-    });
-}
+    // As the other examples: one worker per core of the affinity mask.
+    let per_core = std::env::var("PER_CORE").is_ok_and(|v| v != "0");
 
-async fn route(stream: Stream) {
-    // Anything that is not gRPC gets an HTTP answer: the two share a port and
-    // a connection, and `is_grpc` is read from the request's `content-type`.
-    if !stream.is_grpc() {
-        return stream.write_headers_final(StatusCode::NOT_FOUND, &HeaderMap::new());
-    }
-
-    // §9.1: the path is `/package.Service/Method`, and an unknown one is
-    // UNIMPLEMENTED — which a gRPC client wants as a `grpc-status` and not as
-    // a 404, the HTTP exchange having gone perfectly well.
-    match stream.path() {
-        Some("/grpc.health.v1.Health/Check") => check(stream).await,
-        Some("/popple.echo.v1.Echo/Chat") => chat(stream).await,
-        Some("/grpc.health.v1.Health/Watch") => {
-            fail(stream, UNIMPLEMENTED, "Watch is not implemented")
-        }
-        _ => fail(stream, UNIMPLEMENTED, "no such method"),
+    println!("gRPC health and echo services on :{port} (h2c), per_core={per_core}");
+    if per_core {
+        thread_per_core_with::<MyBufRing, _>(move |_| Box::pin(serve(port)));
+    } else {
+        main_thread_with::<MyBufRing, _>(serve(port));
     }
 }
 
-async fn check(stream: Stream) {
-    let request: HealthCheckRequest = match stream.message().await {
-        Some(Ok(frame)) => match frame.decode() {
-            Ok(request) => request,
-            // Each of these is a `grpc-status` the handler is the one to know.
-            Err(MessageError::Decode(e)) => {
-                return fail(stream, INVALID_ARGUMENT, &format!("{e}"));
-            }
-            Err(e) => return fail(stream, INTERNAL, &format!("{e:?}")),
-        },
-        // The peer half-closed without a request: for a unary call that is
-        // one message short, however well-formed the stream was.
-        None => return fail(stream, INVALID_ARGUMENT, "no request message"),
-        Some(Err(e)) => return fail(stream, INTERNAL, &format!("{e:?}")),
+async fn serve(port: u16) {
+    let settings = ServerSettings {
+        bind_port: port,
+        transport: ServerTransport::Plain,
+    };
+    if let Err(e) = Server::new(settings)
+        .run::<MyBufRing, _>(service(route, plain_http))
+        .await
+    {
+        eprintln!("server error: {e}");
+    }
+}
+
+/// §9.1: the path is `/package.Service/Method`, and one this server does not
+/// have is UNIMPLEMENTED — which a client wants as a `grpc-status` and not as
+/// a 404, the HTTP exchange having gone perfectly well.
+async fn route(call: &GrpcCall) -> Status {
+    match call.path() {
+        Some("/grpc.health.v1.Health/Check") => check(call).await,
+        Some("/popple.echo.v1.Echo/Chat") => chat(call).await,
+        Some("/grpc.health.v1.Health/Watch") => Status::unimplemented("Watch is not implemented"),
+        _ => Status::unimplemented("no such method"),
+    }
+}
+
+/// A unary call: one message in, one out. Every way the request can fail to be
+/// one is already a `Status`, so `?` answers them.
+async fn check(call: &GrpcCall) -> Status {
+    let Some(request) = (match call.message::<HealthCheckRequest>().await {
+        Ok(request) => request,
+        Err(status) => return status,
+    }) else {
+        return Status::invalid_argument("no request message");
     };
 
     let Some(status) = status_of(&request.service) else {
-        return fail(stream, NOT_FOUND, "unknown service");
+        return Status::not_found("unknown service");
     };
 
-    stream.write_headers(StatusCode::OK, &grpc_headers());
-    stream.write_message(&HealthCheckResponse { status }).await;
-    stream.write_trailers(&trailers(OK, None));
+    call.write_message(&HealthCheckResponse { status }).await;
+    Status::ok()
 }
 
 /// A stream in both directions: one answer per message, as each arrives.
-///
-/// The head goes out before the first message, which is what a streaming
-/// response does — from here on an error is a `grpc-status` in the trailers,
-/// Trailers-Only being no longer available.
-async fn chat(stream: Stream) {
-    stream.write_headers(StatusCode::OK, &grpc_headers());
-
+async fn chat(call: &GrpcCall) -> Status {
     let started = std::time::Instant::now();
     let mut answered = 0;
-    while let Some(message) = stream.message().await {
-        let request: EchoRequest = match message.map(|frame| frame.decode()) {
-            Ok(Ok(request)) => request,
-            _ => return stream.write_trailers(&trailers(INVALID_ARGUMENT, Some("bad message"))),
+
+    loop {
+        let request: EchoRequest = match call.message().await {
+            Ok(Some(request)) => request,
+            Ok(None) => break,
+            Err(status) => return status,
         };
         eprintln!(
             "  [{:>6.0}ms] #{} in: {:?}",
@@ -176,44 +164,23 @@ async fn chat(stream: Stream) {
             request.text
         );
 
-        stream
-            .write_message(&EchoResponse {
-                text: request.text.to_uppercase(),
-                index: request.index,
-            })
-            .await;
+        call.write_message(&EchoResponse {
+            text: request.text.to_uppercase(),
+            index: request.index,
+        })
+        .await;
         answered += 1;
     }
 
-    eprintln!("  [{:>6.0}ms] {answered} answered, closing", started.elapsed().as_secs_f64() * 1000.0);
-    stream.write_trailers(&trailers(OK, None));
+    eprintln!(
+        "  [{:>6.0}ms] {answered} answered, closing",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    Status::ok()
 }
 
-/// A call that fails before it produces anything: §9.1's Trailers-Only, one
-/// HEADERS frame carrying the status and ending the stream.
-fn fail(stream: Stream, code: &str, message: &str) {
-    let mut fields = grpc_headers();
-    for (name, value) in trailers(code, Some(message)).drain() {
-        fields.insert(name.expect("a name per value"), value);
-    }
-    stream.write_headers_final(StatusCode::OK, &fields);
-}
-
-fn grpc_headers() -> HeaderMap {
-    let mut fields = HeaderMap::new();
-    fields.insert("content-type", HeaderValue::from_static("application/grpc"));
-    fields
-}
-
-fn trailers(code: &str, message: Option<&str>) -> HeaderMap {
-    let mut fields = HeaderMap::new();
-    fields.insert("grpc-status", HeaderValue::from_str(code).expect("ASCII"));
-    if let Some(message) = message {
-        // §9.1: percent-encoded, which for the ASCII this service produces is
-        // the string itself.
-        if let Ok(value) = HeaderValue::from_str(message) {
-            fields.insert("grpc-message", value);
-        }
-    }
-    fields
+/// Everything on this port that is not gRPC. One connection carries both, and
+/// the layer tells them apart by the request's `content-type`.
+async fn plain_http(stream: Stream) {
+    stream.write_headers_final(StatusCode::NOT_FOUND, &HeaderMap::new());
 }
