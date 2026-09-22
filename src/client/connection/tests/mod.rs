@@ -1226,6 +1226,45 @@ fn a_peer_that_answers_keeps_the_connection() {
     assert!(!closed, "the answer kept it alive");
 }
 
+/// A peer that has gone quiet is asked even while we keep talking. The
+/// keepalive used to count silence in ticks that only passed when the loop had
+/// nothing at all to do — and a request written every few seconds is
+/// something, so a client that kept sending to a dead peer never probed it
+/// and was left to TCP, minutes later.
+#[test]
+fn our_own_requests_do_not_keep_a_silent_peer_from_being_probed() {
+    let probe_due = DEADLINE_TICK * crate::client::ACTIVE_PING_TICKS;
+    let give_up = probe_due + DEADLINE_TICK * crate::client::PING_TIMEOUT_TICKS;
+
+    let (closed, written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Eof.after(give_up * 10),
+        ],
+        move |client| async move {
+            // A request every three seconds — under a tick apart, every one
+            // of them — for twice as long as the peer is given to answer.
+            for _ in 0..(give_up * 2).as_secs() / 3 {
+                let request = http::Request::get("http://example.test/").body(()).unwrap();
+                let Ok(stream) = client.send_request(&request, true) else {
+                    break;
+                };
+                wait(Duration::from_secs(3)).await;
+                drop(stream);
+            }
+            client.is_closed()
+        },
+    );
+
+    assert!(
+        frames(&written)
+            .iter()
+            .any(|f| f.kind == PING && f.flags & FLAG_ACK == 0),
+        "the silent peer was asked"
+    );
+    assert!(closed, "and given up on when it did not answer");
+}
+
 /// An idle connection is probed on the longer budget. A client holding
 /// connections for reuse that probed each of them as often as one with a
 /// request outstanding is the shape a gRPC server answers with GOAWAY

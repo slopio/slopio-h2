@@ -223,37 +223,41 @@ impl<T: Transport> Connection<T> {
     /// answered with a GOAWAY. Either way the streams still in flight are
     /// told the same thing, which is what they report to whoever was waiting.
     pub async fn run(mut self) -> io::Result<()> {
+        // The handshake that just finished was the peer talking: silence
+        // starts here, not when the connection was first put together.
+        self.protocol.keepalive.heard(runtime::runtime::now());
         let ended = loop {
             if finished(&self.protocol.shared) {
                 break self.farewell().await;
             }
 
-            // The tick is the keepalive's clock and nothing else's: it fires
-            // only when neither the peer nor the application has given this
-            // loop anything to do, and `DEADLINE_TICK` is the one duration the
-            // runtime serves outside its timewheel, so arming and cancelling
-            // it on every turn is what it is for. Dropping the wait is safe:
-            // `MultiRecv` queues its completions in a buffer it owns, so the
-            // read stays armed and nothing is lost between one poll and the
-            // next.
-            let event = match timeout(DEADLINE_TICK, self.next_event()).await {
-                Ok(event) => event,
-                Err(()) => match self.probe() {
-                    Ok(()) => continue,
-                    Err(reason) => {
-                        // §6.8: say so rather than vanishing. The peer is very
-                        // likely not listening, which is why the flush is
-                        // allowed to fail.
-                        self.protocol.fail(NO_ERROR, reason);
-                        let _ = self.flush().await;
-                        break Ended::Failed(reason);
-                    }
-                },
+            // Asked on every turn, whatever woke it: the keepalive measures
+            // the peer's silence on the clock, so how often it is asked does
+            // not change the answer. It used to be asked only when a whole
+            // tick passed with nothing to do — and our own writes are
+            // something, so an application sending every few seconds kept
+            // the question from ever being asked of a peer that had gone.
+            if let Err(reason) = self.probe() {
+                // §6.8: say so rather than vanishing. The peer is very likely
+                // not listening, which is why the flush is allowed to fail.
+                self.protocol.fail(NO_ERROR, reason);
+                let _ = self.flush().await;
+                break Ended::Failed(reason);
+            }
+
+            // The tick is what brings the loop back to ask when nothing else
+            // does. `DEADLINE_TICK` is the one duration the runtime serves
+            // outside its timewheel, so arming and cancelling it on every
+            // turn is what it is for. Dropping the wait is safe: `MultiRecv`
+            // queues its completions in a buffer it owns, so the read stays
+            // armed and nothing is lost between one poll and the next.
+            let Ok(event) = timeout(DEADLINE_TICK, self.next_event()).await else {
+                continue;
             };
             match event {
                 Event::Inbound(chunk) => {
                     // Whatever it says, it came from a peer that is alive.
-                    self.protocol.keepalive.heard();
+                    self.protocol.keepalive.heard(runtime::runtime::now());
                     self.decoder.decode_with(chunk.as_ref(), &mut self.protocol);
                 }
                 Event::Flush => {
@@ -289,9 +293,8 @@ impl<T: Transport> Connection<T> {
         ended.into_result()
     }
 
-    /// One tick with nothing from the peer, and what the keepalive makes of
-    /// it: a PING queued, nothing, or `Err` with the reason this connection is
-    /// over.
+    /// What the keepalive makes of the peer's silence so far: a PING queued,
+    /// nothing, or `Err` with the reason this connection is over.
     ///
     /// Nothing is flushed here. `write_frame` wakes the flusher, so the next
     /// turn of the loop finds the output non-empty and sends it — the same
@@ -299,7 +302,11 @@ impl<T: Transport> Connection<T> {
     /// that has to remember to send.
     fn probe(&mut self) -> Result<(), &'static str> {
         let in_flight = self.protocol.shared.streams.len() > 0;
-        match self.protocol.keepalive.tick(in_flight) {
+        match self
+            .protocol
+            .keepalive
+            .due(runtime::runtime::now(), in_flight)
+        {
             Due::Nothing => Ok(()),
             Due::Ping(opaque) => {
                 self.protocol

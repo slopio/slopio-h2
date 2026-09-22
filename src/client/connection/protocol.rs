@@ -66,7 +66,7 @@ impl Protocol {
         Self {
             shared,
             handshake: Handshake::default(),
-            keepalive: Keepalive::default(),
+            keepalive: Keepalive::new(runtime::runtime::now()),
             closing: false,
             failure: None,
         }
