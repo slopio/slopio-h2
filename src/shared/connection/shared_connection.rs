@@ -196,6 +196,10 @@ pub struct SharedConnection {
     /// Bounded: what is in flight is a round trip's worth, and an id that
     /// falls off the front is one the peer has long since heard about.
     reset_by_us: RefCell<VecDeque<STREAM_ID>>,
+    /// Streams that finished the way they were meant to. Only the server
+    /// reads it, for the defence that has to tell an impatient peer from
+    /// Rapid Reset; see [`Self::note_completed`].
+    completed: Cell<u32>,
     /// Shared because a stream has to read it before writing: §6.9.1 debits a
     /// DATA frame against this window as well as its stream's, so neither side
     /// alone says whether a write can go out.
@@ -264,6 +268,7 @@ impl SharedConnection {
             // is there for.
             encoder: UnsafeCell::new(Encoder::new(header_table_size as usize, 0)),
             max_frame_size: Cell::new(max_frame_size),
+            completed: Cell::new(0),
             reset_by_us: RefCell::new(VecDeque::new()),
             // §6.9.2: both halves start at 65535 and SETTINGS never moves
             // them. The gap up to `recv_window` is announced by a
@@ -437,6 +442,24 @@ impl SharedConnection {
                 }
             }
         })
+    }
+
+    /// Records a stream that finished the way it was meant to: both halves
+    /// closed, nobody having reset anything.
+    ///
+    /// Counted because the defence against Rapid Reset (CVE-2023-44487) has
+    /// to tell a client that cancels *instead of* working from one that
+    /// cancels *while* working, and the only difference between them is how
+    /// much finished. Reported from here rather than from the connection
+    /// loop because the last half to close is usually the stream's own task,
+    /// which has this and not the loop.
+    pub fn note_completed(&self) {
+        self.completed.set(self.completed.get().saturating_add(1));
+    }
+
+    /// How many streams have finished normally on this connection.
+    pub fn completed_streams(&self) -> u32 {
+        self.completed.get()
     }
 
     /// Records a stream as reset by this end with the peer's half still open.

@@ -43,6 +43,12 @@ pub fn retire_if_closed(map: &LiveStreams, shared: &SharedConnection, id: STREAM
         return;
     };
     stream.note_retired();
+    // Both halves closed with nobody resetting anything, which is the only
+    // path a stream reaches this by: a reset one is taken out where the
+    // RST_STREAM is handled, and never arrives here. So this is the place
+    // that knows a stream finished, which is what the fault budget spends
+    // itself against.
+    shared.note_completed();
     // Body bytes no handler consumed still hold credit. `_handle` drops
     // here, outside the map, which for a task retiring itself is that task
     // detaching its own handle — sound because the scheduler holds a

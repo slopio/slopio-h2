@@ -7,14 +7,13 @@
 //! — while it may well be part way through writing a response into a stream
 //! that no longer exists.
 //!
-//! Two things are under test, and the second is a limit rather than a
-//! success. Rapid Reset (CVE-2023-44487) is open-and-cancel in a loop, and
-//! the defence against it counts resets: past `FAULT_LIMIT` — a hundred, for
-//! the life of a connection — the server sends GOAWAY ENHANCE_YOUR_CALM. A
-//! client that legitimately cancels a hundred calls on one long-lived
-//! connection meets the same wall, which the constant's own comment says out
-//! loud. This pins that behaviour so that a change to it is a decision and
-//! not a surprise.
+//! Rapid Reset (CVE-2023-44487) is the same frame in a loop, so the server
+//! counts resets — but against the streams it has *finished*, not against a
+//! lifetime ceiling. The attack is cancelling instead of working; cancelling
+//! while working is Tuesday. So all three shapes are here: cancelling among
+//! calls that complete, cancelling far past the flat limit while paying for
+//! every one of them, and cancelling and nothing else, which is the attack
+//! and still ends in GOAWAY ENHANCE_YOUR_CALM.
 //!
 //! Random, but seeded: a failure here reproduces. `SEED` overrides it.
 
@@ -60,7 +59,8 @@ const CANCELLATIONS: usize = 60;
 
 /// Whatever `FAULT_LIMIT` is over in `server::connection::protocol` — not
 /// reachable from an integration test, so it is named here and checked
-/// loosely.
+/// loosely. It is how far resets may run ahead of completed streams, not a
+/// lifetime total.
 const FAULT_LIMIT: usize = 100;
 
 async fn route(call: &GrpcCall) -> Status {
@@ -278,15 +278,12 @@ fn cancelling_calls_at_random_leaves_the_connection_working() {
     );
 }
 
-/// The other side of the same coin: past a hundred resets the server stops
-/// believing in this client, whatever its reasons were.
+/// The attack itself: open, cancel, repeat, and never finish anything.
 ///
-/// Rapid Reset is open-and-cancel in a loop, and counting resets is what
-/// catches it. The cost is that a long-lived connection which legitimately
-/// cancels a hundred calls meets the same GOAWAY — the count is for the life
-/// of the connection, not a rate. This asserts the behaviour as it is; a rate
-/// would let an honest client keep going, and is what the constant's comment
-/// says it wants to become.
+/// Nothing is completed here, so nothing pays for the resets and the budget
+/// never grows — the connection ends at `FAULT_LIMIT`, measured at 104. This
+/// is the case the defence exists for, and the one that must not be softened
+/// by letting honest clients through.
 #[test]
 fn a_hundred_cancellations_end_the_connection() {
     let port = pick_port();
@@ -345,5 +342,75 @@ fn a_hundred_cancellations_end_the_connection() {
     assert!(
         cancelled >= FAULT_LIMIT,
         "and not before a hundred of them: {cancelled}"
+    );
+}
+
+/// The other half of the same rule: a client that finishes work earns the
+/// room to cancel.
+///
+/// Rapid Reset is cancelling *instead of* finishing — the attack exists to
+/// make a server do a request's work without paying for a response. So the
+/// budget is spent against completed streams rather than against a flat
+/// ceiling, and this is the honest client the flat ceiling used to close on:
+/// one that cancels three hundred times, and answers for every one of them
+/// with a call it saw through.
+#[test]
+fn a_client_that_finishes_its_work_may_keep_cancelling() {
+    let port = pick_port();
+    serve(port);
+    let (tx, rx) = mpsc::channel::<(usize, bool, bool)>();
+
+    thread::spawn(move || {
+        main_thread_with::<ClientRing, _>(async move {
+            let grpc = GrpcClient::new(connect(port).await);
+            let mut cancelled = 0;
+            let mut failed = false;
+
+            // Three times what `FAULT_LIMIT` allows on its own.
+            while cancelled < FAULT_LIMIT * 3 {
+                // One call seen through to its status...
+                if grpc
+                    .unary::<_, Reply>(UNARY, &Request::default())
+                    .await
+                    .is_err()
+                {
+                    failed = true;
+                    break;
+                }
+                // ...and one abandoned.
+                match grpc.call(STREAM) {
+                    Ok(call) => {
+                        let _ = call.write_message_final(&Request::default()).await;
+                        cancelled += 1;
+                        drop(call);
+                    }
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+
+            let still_usable = grpc
+                .unary::<_, Reply>(UNARY, &Request::default())
+                .await
+                .is_ok();
+            tx.send((cancelled, failed, still_usable)).unwrap();
+        });
+    });
+
+    let (cancelled, failed, still_usable) = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the client reports");
+
+    assert!(!failed, "nothing refused it: {cancelled} cancellations in");
+    assert_eq!(
+        cancelled,
+        FAULT_LIMIT * 3,
+        "it cancelled three times the flat limit"
+    );
+    assert!(
+        still_usable,
+        "and the connection answers afterwards, having finished as much as it abandoned"
     );
 }

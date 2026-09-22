@@ -24,12 +24,28 @@ use crate::shared::codec::{
 };
 use crate::shared::connection::{STREAM_ID, SharedConnection, settings::Settings};
 
-/// Stream errors — ours to report or the peer's to send — a connection may
-/// accumulate before it is closed as abusive. One counter for both: a
-/// malformed request and a CANCEL are different faults, but a peer that
-/// piles up either is the same problem, and Rapid Reset (CVE-2023-44487)
-/// is exactly the second kind. A lifetime cap, so a long-lived client that
-/// legitimately cancels a lot will hit it; a rate is the refinement.
+/// How far a connection's stream errors — ours to report or the peer's to
+/// send — may run *ahead of the streams it has finished* before it is closed
+/// as abusive.
+///
+/// One counter for both kinds: a malformed request and a CANCEL are different
+/// faults, but a peer that piles up either is the same problem, and Rapid
+/// Reset (CVE-2023-44487) is exactly the second kind.
+///
+/// Measured against completed streams rather than as a lifetime ceiling,
+/// because the ceiling could not tell the attack from its most ordinary
+/// neighbour. Cancelling is what a deadline, a user navigating away, or the
+/// loser of two hedged calls looks like, and a gRPC connection that lives for
+/// hours does it constantly — a hundred over a lifetime is nothing, and the
+/// connection died for it.
+///
+/// What Rapid Reset actually is, is cancelling *instead of* finishing: the
+/// attack's whole point is to make the server do the work of a request
+/// without paying for a response. So a stream that ran to its end earns the
+/// room to cancel one more. An honest peer finishes far more than it
+/// abandons and never approaches this; an attacker that tried to buy budget
+/// would have to complete a real request for every extra reset, which is the
+/// work it was trying not to do.
 pub(super) const FAULT_LIMIT: u32 = 100;
 
 /// Control frames a peer may send in a row without making any progress on a
@@ -518,7 +534,11 @@ impl<H: Handler> Protocol<H> {
 
     fn count_fault(&mut self, reason: &'static str) {
         self.faults += 1;
-        if self.faults > FAULT_LIMIT {
+        // Against what this connection has *finished*, not against a flat
+        // ceiling. A stream that ran to its end is the work Rapid Reset
+        // exists to avoid doing, so a peer that does it has earned the room
+        // to cancel one more.
+        if self.faults > FAULT_LIMIT.saturating_add(self.shared.completed_streams()) {
             self.fail_connection(ENHANCE_YOUR_CALM, reason);
         }
     }
