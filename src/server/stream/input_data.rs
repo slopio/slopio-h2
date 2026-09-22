@@ -1,5 +1,3 @@
-use crate::server::connection::{CONNECTION_RECV_WINDOW, MAX_CONCURRENT_STREAMS};
-
 /// Where a request body's bytes land. What separates the variants is the
 /// contract with the stream task, not the storage: `Capped` is delivered
 /// whole and once, the other two are drained as they fill.
@@ -30,26 +28,18 @@ pub struct BodyOverflow {
     pub pushed: usize,
 }
 
-const _: () = assert!(
-    InputData::ONESHOT_LIMIT * MAX_CONCURRENT_STREAMS as usize <= CONNECTION_RECV_WINDOW as usize,
-    "streams accumulating at once must fit in the connection receive window"
-);
-
 impl InputData {
-    /// Largest body handed to the task in one piece. Two bounds constrain it,
-    /// and this value is the smaller:
+    /// Largest body handed to the task in one piece.
     ///
-    /// - a body held whole must fit in its stream's receive window, since
-    ///   nothing is consumed until it is complete and accumulation can
-    ///   therefore issue no mid-body WINDOW_UPDATE;
-    /// - `limit * MAX_CONCURRENT_STREAMS` must fit in the connection window,
-    ///   or streams accumulating at once drain it between them and all
-    ///   deadlock, each holding an incomplete body no handler will ever be
-    ///   woken for.
-    ///
-    /// This form's, and no other's: both bounds come from handing back no
-    /// credit before the end, which is this contract and not a property of
-    /// bodies. An input that credits differently has its own limit to argue.
+    /// A bound on memory and nothing else: this much is buffered per stream
+    /// before the handler sees any of it, and `MAX_CONCURRENT_STREAMS` times
+    /// it per connection. It has nothing to say to flow control — the bytes
+    /// are credited back as they land, being in the buffer already — so a
+    /// body cut short holds no window, and no window has to be sized for
+    /// this. It used to: when a held body kept its credit until the stream
+    /// retired, this had to fit in the stream window and, times the streams,
+    /// in the connection window, or bodies arriving together deadlocked
+    /// each other. Neither is true any more.
     pub const ONESHOT_LIMIT: usize = 16384;
 
     /// What a drained buffer starts with. The same number as

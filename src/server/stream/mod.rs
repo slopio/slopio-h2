@@ -533,11 +533,11 @@ impl StreamState {
     /// The whole body, once it is whole.
     ///
     /// Resolves at END_STREAM and not before — nothing is handed over in
-    /// pieces, so no credit is handed back in pieces either, and the peer
-    /// gets no WINDOW_UPDATE until the stream retires. That is what bounds
-    /// this form: `InputData::ONESHOT_LIMIT` is small enough that every stream
-    /// accumulating at once still fits in the connection window, which is
-    /// the static assertion in `input_data`.
+    /// pieces. The credit is another matter: each frame's bytes are credited
+    /// back as they land, since they are in the buffer and nothing about
+    /// them waits on the peer, so a body left unfinished holds no window,
+    /// only its stream's slot, until the starvation sweep takes that too.
+    /// What bounds this form is `InputData::ONESHOT_LIMIT`, on memory alone.
     ///
     /// `None` when the request carried no body, or when it is large enough
     /// that it has to be drained instead — [`Stream::body_is_oneshot`] is
@@ -629,12 +629,17 @@ impl StreamState {
     /// `Ok(n)` is how much of the payload was consumed on the spot and owes
     /// the peer its credit back now — on the connection, and on the stream
     /// unless `end_stream` made that pointless. The caller writes the frames,
-    /// this half cannot. An HTTP body answers zero: its bytes wait for the
-    /// handler's `consume`. A gRPC body answers the whole payload as long as
-    /// no whole message is waiting for the handler — the bytes went into a
-    /// message being assembled, which is what consuming them is — and zero
-    /// once one is, so that a handler that has fallen behind is a peer that
-    /// waits. What is held goes back through [`release_held`].
+    /// this half cannot.
+    ///
+    /// What counts as consumed is what was copied somewhere the transport is
+    /// done with. A body held whole for [`Stream::body`] answers the whole
+    /// payload: the bytes are in the buffer that will be handed over, and
+    /// nothing about them waits on the peer. A gRPC body answers the same as
+    /// long as no whole message is waiting for the handler, and zero once one
+    /// is, so that a handler that has fallen behind is a peer that waits;
+    /// what is held goes back through [`release_held`]. A drained body
+    /// answers zero: its bytes wait for the handler's `consume`, which is
+    /// the one contract where the handler's pace is the peer's.
     ///
     /// [`release_held`]: Self::release_held
     pub fn recv_data(&self, payload: &[u8], end_stream: bool) -> Result<u32, StreamViolation> {
@@ -672,9 +677,15 @@ impl StreamState {
                 input
                     .push(at, payload)
                     .map_err(|_| StreamViolation::ContentLengthMismatch)?;
-                // A body held whole is worth waking for only once; a drained
-                // one has something to take on every frame.
-                (end_stream || input.wakes_per_frame(), 0)
+                // A body held whole is worth waking for only once, and its
+                // bytes are consumed as they land; a drained one has
+                // something to take on every frame, and holds it until the
+                // handler does.
+                if input.wakes_per_frame() {
+                    (true, 0)
+                } else {
+                    (end_stream, payload.len() as u32)
+                }
             }
             #[cfg(feature = "grpc")]
             Input::Grpc(input) => {
