@@ -1,6 +1,6 @@
 use crate::shared::codec::ext::Protocol;
 
-use super::{DecoderError, NeedMore};
+use super::DecoderError;
 
 use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
@@ -62,44 +62,37 @@ impl Header<Option<HeaderName>> {
 }
 
 impl Header {
-    pub fn new(name: Bytes, value: Bytes) -> Result<Header, DecoderError> {
+    /// A field as HTTP sees it, or `InvalidField` for one it refuses.
+    ///
+    /// Borrows rather than takes, because a refused field is not dropped:
+    /// the decoder still owes the dynamic table an entry for it.
+    pub fn new(name: &[u8], value: &Bytes) -> Result<Header, DecoderError> {
         if name.is_empty() {
-            return Err(DecoderError::NeedMore(NeedMore::UnexpectedEndOfStream));
+            return Err(DecoderError::InvalidField);
         }
         if name[0] == b':' {
             match &name[1..] {
-                b"authority" => {
-                    let value = BytesStr::try_from(value)?;
-                    Ok(Header::Authority(value))
-                }
+                b"authority" => Ok(Header::Authority(pseudo_value(value)?)),
                 b"method" => {
-                    let method = Method::from_bytes(&value)?;
+                    let method = Method::from_bytes(value)?;
                     Ok(Header::Method(method))
                 }
-                b"scheme" => {
-                    let value = BytesStr::try_from(value)?;
-                    Ok(Header::Scheme(value))
-                }
-                b"path" => {
-                    let value = BytesStr::try_from(value)?;
-                    Ok(Header::Path(value))
-                }
-                b"protocol" => {
-                    let value = Protocol::try_from(value)?;
-                    Ok(Header::Protocol(value))
-                }
+                b"scheme" => Ok(Header::Scheme(pseudo_value(value)?)),
+                b"path" => Ok(Header::Path(pseudo_value(value)?)),
+                b"protocol" => Ok(Header::Protocol(Protocol::new(pseudo_value(value)?))),
                 b"status" => {
-                    let status = StatusCode::from_bytes(&value)?;
+                    let status = StatusCode::from_bytes(value)?;
                     Ok(Header::Status(status))
                 }
-                _ => Err(DecoderError::InvalidPseudoheader),
+                _ => Err(DecoderError::InvalidField),
             }
         } else {
             // HTTP/2 requires lower case header names
-            let name = HeaderName::from_lowercase(&name)?;
-            let value = HeaderValue::from_bytes(&value)?;
-
-            Ok(Header::Field { name, value })
+            let name = HeaderName::from_lowercase(name)?;
+            Ok(Header::Field {
+                name,
+                value: field_value(value)?,
+            })
         }
     }
 
@@ -241,24 +234,19 @@ impl From<Header> for Header<Option<HeaderName>> {
 }
 
 impl<'a> Name<'a> {
-    pub fn into_entry(self, value: Bytes) -> Result<Header, DecoderError> {
+    /// As [`Header::new`], for a name the table already holds.
+    pub fn into_entry(self, value: &Bytes) -> Result<Header, DecoderError> {
         match self {
             Name::Field(name) => Ok(Header::Field {
                 name: name.clone(),
-                value: HeaderValue::from_bytes(&value)?,
+                value: field_value(value)?,
             }),
-            Name::Authority => Ok(Header::Authority(BytesStr::try_from(value)?)),
-            Name::Method => Ok(Header::Method(Method::from_bytes(&value)?)),
-            Name::Scheme => Ok(Header::Scheme(BytesStr::try_from(value)?)),
-            Name::Path => Ok(Header::Path(BytesStr::try_from(value)?)),
-            Name::Protocol => Ok(Header::Protocol(Protocol::try_from(value)?)),
-            Name::Status => {
-                match StatusCode::from_bytes(&value) {
-                    Ok(status) => Ok(Header::Status(status)),
-                    // TODO: better error handling
-                    Err(_) => Err(DecoderError::InvalidStatusCode),
-                }
-            }
+            Name::Authority => Ok(Header::Authority(pseudo_value(value)?)),
+            Name::Method => Ok(Header::Method(Method::from_bytes(value)?)),
+            Name::Scheme => Ok(Header::Scheme(pseudo_value(value)?)),
+            Name::Path => Ok(Header::Path(pseudo_value(value)?)),
+            Name::Protocol => Ok(Header::Protocol(Protocol::new(pseudo_value(value)?))),
+            Name::Status => Ok(Header::Status(StatusCode::from_bytes(value)?)),
         }
     }
 
@@ -273,6 +261,32 @@ impl<'a> Name<'a> {
             Name::Status => b":status",
         }
     }
+}
+
+/// §8.2.1: a field value is malformed with NUL, CR or LF anywhere, or
+/// whitespace at either end. `HeaderValue` refuses the first three and every
+/// other control character; the ends are ours to check.
+fn field_value(value: &[u8]) -> Result<HeaderValue, DecoderError> {
+    if value
+        .first()
+        .into_iter()
+        .chain(value.last())
+        .any(|&b| b == b' ' || b == b'\t')
+    {
+        return Err(DecoderError::InvalidField);
+    }
+    Ok(HeaderValue::from_bytes(value)?)
+}
+
+/// `:authority`, `:scheme`, `:path` and `:protocol` are URI components or a
+/// token, and none of those grammars has room for a control character, a
+/// space or DEL. Refusing them here is what keeps a `:path` of
+/// `/a\r\nX: y` from reaching a handler that relays it to HTTP/1.1.
+fn pseudo_value(value: &Bytes) -> Result<BytesStr, DecoderError> {
+    if value.iter().any(|&b| b <= b' ' || b == 0x7f) {
+        return Err(DecoderError::InvalidField);
+    }
+    Ok(BytesStr::try_from(value.clone())?)
 }
 
 // ===== impl BytesStr =====

@@ -12,7 +12,7 @@ mod table;
 
 use crate::shared::hpack;
 
-pub use self::decoder::{Decoder, DecoderError, NeedMore};
+pub use self::decoder::{Decoder, DecoderError};
 pub use self::encoder::Encoder;
 pub use self::header::{BytesStr, Header};
 

@@ -109,9 +109,11 @@ pub enum DecoderError {
     InvalidIntegerPrefix,
     InvalidTableIndex,
     InvalidHuffmanCode,
-    InvalidUtf8,
-    InvalidStatusCode,
-    InvalidPseudoheader,
+    /// A field HTTP refuses (§8.2.1, §8.3): its name or its value. Unlike
+    /// every other error here it is not a decompression failure — the block
+    /// was decoded to its end regardless and the table is in sync — so it is
+    /// the message that is malformed, not the connection.
+    InvalidField,
     InvalidMaxDynamicSize,
     IntegerOverflow,
     NeedMore(NeedMore),
@@ -217,9 +219,55 @@ enum Representation {
 
 #[derive(Debug)]
 struct Table {
-    entries: VecDeque<Header>,
+    entries: VecDeque<Entry>,
     size: usize,
     max_size: usize,
+}
+
+/// What a dynamic-table slot holds. HPACK indexes what the peer sent, not
+/// what HTTP accepts: a field we refuse still takes its place in the table,
+/// or every index the peer uses after it points one entry off.
+#[derive(Debug, Clone)]
+enum Entry {
+    Field(Header),
+    /// Kept raw, for its size and for its name: the peer may reuse the name
+    /// with a value that is fine.
+    Invalid {
+        name: Bytes,
+        value: Bytes,
+    },
+}
+
+impl Entry {
+    fn new(name: Bytes, value: Bytes) -> Entry {
+        match Header::new(&name, &value) {
+            Ok(header) => Entry::Field(header),
+            Err(_) => Entry::Invalid { name, value },
+        }
+    }
+
+    /// The field under this entry's name with another value, as a literal
+    /// with an indexed name makes.
+    fn with_value(&self, value: Bytes) -> Entry {
+        match self {
+            Entry::Field(header) => match header.name().into_entry(&value) {
+                Ok(header) => Entry::Field(header),
+                Err(_) => Entry::Invalid {
+                    name: Bytes::copy_from_slice(header.name().as_slice()),
+                    value,
+                },
+            },
+            Entry::Invalid { name, .. } => Entry::new(name.clone(), value),
+        }
+    }
+
+    /// §4.1: name, value and 32 octets, whether we accepted it or not.
+    fn len(&self) -> usize {
+        match self {
+            Entry::Field(header) => header.len(),
+            Entry::Invalid { name, value } => 32 + name.len() + value.len(),
+        }
+    }
 }
 
 struct StringMarker {
@@ -275,6 +323,13 @@ impl Decoder {
         // the thread-local here and goes back when `huff` drops.
         let mut huff = Lent::take();
         let mut can_resize = true;
+        // A refused field does not stop the decode: what follows it still
+        // has to reach the table. It is reported once the block is done.
+        let mut invalid = false;
+        let mut emit = |entry: Entry| match entry {
+            Entry::Field(header) => f(header),
+            Entry::Invalid { .. } => invalid = true,
+        };
 
         while let Some(ty) = peek_u8(src) {
             // At this point we are always at the beginning of the next block
@@ -285,7 +340,7 @@ impl Decoder {
                     can_resize = false;
                     let entry = self.decode_indexed(src)?;
                     consume(src);
-                    f(entry);
+                    emit(entry);
                 }
                 LiteralWithIndexing => {
                     can_resize = false;
@@ -295,13 +350,13 @@ impl Decoder {
                     self.table.insert(entry.clone());
                     consume(src);
 
-                    f(entry);
+                    emit(entry);
                 }
                 LiteralWithoutIndexing => {
                     can_resize = false;
                     let entry = self.decode_literal(src, false, &mut huff.0)?;
                     consume(src);
-                    f(entry);
+                    emit(entry);
                 }
                 LiteralNeverIndexed => {
                     can_resize = false;
@@ -310,7 +365,7 @@ impl Decoder {
 
                     // TODO: Track that this should never be indexed
 
-                    f(entry);
+                    emit(entry);
                 }
                 SizeUpdate => {
                     if !can_resize {
@@ -324,6 +379,9 @@ impl Decoder {
             }
         }
 
+        if invalid {
+            return Err(DecoderError::InvalidField);
+        }
         Ok(())
     }
 
@@ -339,7 +397,7 @@ impl Decoder {
         Ok(())
     }
 
-    fn decode_indexed(&self, buf: &mut Cursor<&mut BytesMut>) -> Result<Header, DecoderError> {
+    fn decode_indexed(&self, buf: &mut Cursor<&mut BytesMut>) -> Result<Entry, DecoderError> {
         let index = decode_int(buf, 7)?;
         self.table.get(index)
     }
@@ -349,7 +407,7 @@ impl Decoder {
         buf: &mut Cursor<&mut BytesMut>,
         index: bool,
         huff: &mut BytesMut,
-    ) -> Result<Header, DecoderError> {
+    ) -> Result<Entry, DecoderError> {
         let prefix = if index { 6 } else { 4 };
 
         // Extract the table index for the name, or 0 if not indexed
@@ -364,12 +422,12 @@ impl Decoder {
             // Read the name as a literal
             let name = name_marker.consume(buf);
             let value = value_marker.consume(buf);
-            Header::new(name, value)
+            Ok(Entry::new(name, value))
         } else {
             let e = self.table.get(table_idx)?;
             let value = self.decode_string(buf, huff)?;
 
-            e.name().into_entry(value)
+            Ok(e.with_value(value))
         }
     }
 
@@ -583,13 +641,13 @@ impl Table {
     ///
     /// This is according to the [HPACK spec, section 2.3.3.]
     /// (http://http2.github.io/http2-spec/compression.html#index.address.space)
-    pub fn get(&self, index: usize) -> Result<Header, DecoderError> {
+    fn get(&self, index: usize) -> Result<Entry, DecoderError> {
         if index == 0 {
             return Err(DecoderError::InvalidTableIndex);
         }
 
         if index <= 61 {
-            return Ok(get_static(index));
+            return Ok(Entry::Field(get_static(index)));
         }
 
         // Convert the index for lookup in the entries structure.
@@ -599,7 +657,7 @@ impl Table {
         }
     }
 
-    fn insert(&mut self, entry: Header) {
+    fn insert(&mut self, entry: Entry) {
         let len = entry.len();
 
         self.reserve(len);
@@ -650,39 +708,37 @@ impl Table {
 }
 
 // ===== impl DecoderError =====
+//
+// Every way HTTP refuses a name or a value is the same error: the answer —
+// the stream is malformed — does not depend on which rule it broke.
 
 impl From<Utf8Error> for DecoderError {
     fn from(_: Utf8Error) -> DecoderError {
-        // TODO: Better error?
-        DecoderError::InvalidUtf8
+        DecoderError::InvalidField
     }
 }
 
 impl From<header::InvalidHeaderValue> for DecoderError {
     fn from(_: header::InvalidHeaderValue) -> DecoderError {
-        // TODO: Better error?
-        DecoderError::InvalidUtf8
+        DecoderError::InvalidField
     }
 }
 
 impl From<header::InvalidHeaderName> for DecoderError {
     fn from(_: header::InvalidHeaderName) -> DecoderError {
-        // TODO: Better error
-        DecoderError::InvalidUtf8
+        DecoderError::InvalidField
     }
 }
 
 impl From<method::InvalidMethod> for DecoderError {
     fn from(_: method::InvalidMethod) -> DecoderError {
-        // TODO: Better error
-        DecoderError::InvalidUtf8
+        DecoderError::InvalidField
     }
 }
 
 impl From<status::InvalidStatusCode> for DecoderError {
     fn from(_: status::InvalidStatusCode) -> DecoderError {
-        // TODO: Better error
-        DecoderError::InvalidUtf8
+        DecoderError::InvalidField
     }
 }
 
@@ -1123,5 +1179,97 @@ mod test {
             }
             _ => panic!(),
         }
+    }
+
+    /// Decodes one block, returning what it emitted and how it ended.
+    fn decode_block(de: &mut Decoder, block: &[u8]) -> (Vec<Header>, Result<(), DecoderError>) {
+        let mut buf = BytesMut::from(block);
+        let mut fields = vec![];
+        let res = de.decode(&mut Cursor::new(&mut buf), |h| fields.push(h));
+        (fields, res)
+    }
+
+    /// A literal with incremental indexing, new name, neither string
+    /// huffman-coded.
+    fn indexed_literal(name: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut block = vec![0x40, name.len() as u8];
+        block.extend_from_slice(name);
+        block.push(value.len() as u8);
+        block.extend_from_slice(value);
+        block
+    }
+
+    /// A field we refuse still takes its slot in the dynamic table, or the
+    /// peer's indexes and ours part ways and every later block on the
+    /// connection decodes to the wrong fields.
+    #[test]
+    fn a_refused_field_still_takes_its_place_in_the_table() {
+        let mut de = Decoder::new(4096);
+
+        let mut block = indexed_literal(b"x-bad", b"a\rb");
+        block.extend(indexed_literal(b"x-good", b"ok"));
+        let (fields, res) = decode_block(&mut de, &block);
+        assert_eq!(res, Err(DecoderError::InvalidField));
+        assert_eq!(fields.len(), 1, "the good field after it was still decoded");
+        assert_eq!(de.table.size(), (32 + 5 + 3) + (32 + 6 + 2));
+
+        // 62 is the newest entry, 63 the one before it.
+        let (fields, res) = decode_block(&mut de, &[0x80 | 62]);
+        assert_eq!(res, Ok(()));
+        assert!(matches!(&fields[..], [Header::Field { name, .. }] if name == "x-good"));
+
+        let (_, res) = decode_block(&mut de, &[0x80 | 63]);
+        assert_eq!(res, Err(DecoderError::InvalidField));
+
+        // The refused entry's name, with a value that is fine: a field like
+        // any other. Name index 63 overflows the 4-bit prefix: 15, then 48.
+        let (fields, res) = decode_block(&mut de, &[0x0f, 48, 4, b'f', b'i', b'n', b'e']);
+        assert_eq!(res, Ok(()));
+        assert!(
+            matches!(&fields[..], [Header::Field { name, value }] if name == "x-bad" && value == "fine")
+        );
+    }
+
+    /// §8.2.1 and the URI grammar, one refusal each: what the decoder turns
+    /// into `InvalidField` rather than into a field.
+    #[test]
+    fn fields_http_refuses_are_invalid_fields() {
+        let refused: [&[u8]; 8] = [
+            // `:path` with CR LF, name index 4, literal without indexing.
+            &[
+                0x04, 9, b'/', b'a', b'\r', b'\n', b'X', b':', b' ', b'y', b'\0',
+            ],
+            // `:authority` with a space, name index 1.
+            &[0x01, 3, b'a', b' ', b'b'],
+            // An uppercase name.
+            &[0x00, 3, b'X', b'-', b'a', 1, b'y'],
+            // An unknown pseudo-header.
+            &[0x00, 4, b':', b'f', b'o', b'o', 1, b'y'],
+            // A value with NUL.
+            &[0x00, 1, b'x', 3, b'a', 0, b'b'],
+            // A value with whitespace at either end.
+            &[0x00, 1, b'x', 2, b' ', b'y'],
+            &[0x00, 1, b'x', 2, b'y', b'\t'],
+            // An empty name.
+            &[0x00, 0, 1, b'y'],
+        ];
+        for block in refused {
+            let (fields, res) = decode_block(&mut Decoder::new(4096), block);
+            assert_eq!(res, Err(DecoderError::InvalidField), "{block:02x?}");
+            assert!(fields.is_empty(), "{block:02x?}: {fields:?}");
+        }
+    }
+
+    /// What is wrong with the encoding, not with the field, is still a
+    /// decompression failure: there is no telling where the next field
+    /// starts.
+    #[test]
+    fn a_bad_encoding_is_not_an_invalid_field() {
+        // `:path`, huffman-coded, as a lone EOS.
+        let (_, res) = decode_block(
+            &mut Decoder::new(4096),
+            &[0x04, 0x84, 0xff, 0xff, 0xff, 0xff],
+        );
+        assert_eq!(res, Err(DecoderError::InvalidHuffmanCode));
     }
 }

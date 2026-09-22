@@ -29,7 +29,7 @@ use super::{
     run_connection, run_connection_timed,
 };
 use crate::shared::codec::types::{
-    COMPRESSION_ERROR, ENHANCE_YOUR_CALM, NO_ERROR, REFUSED_STREAM, STREAM_CLOSED,
+    ENHANCE_YOUR_CALM, NO_ERROR, PROTOCOL_ERROR, REFUSED_STREAM, STREAM_CLOSED,
 };
 
 /// The GOAWAY a connection was closed with, if it was.
@@ -329,11 +329,11 @@ fn a_peer_that_keeps_asking_past_the_stream_limit_is_closed() {
 /// CVE-2019-9516, the 0-length headers leak — a header block whose fields have
 /// empty names and empty values, three bytes each to send.
 ///
-/// It never reaches a size cap: §8.2.1 has no empty field names, so `Header`
-/// refuses the first one and the block fails to decode. §4.3 makes an HPACK
-/// failure a *connection* error, which is the right answer — the dynamic table
-/// is shared by every stream, so a block that did not decode leaves the peer
-/// and us with different tables and nothing after it can be trusted.
+/// It never reaches a size cap: HTTP has no empty field names, so every one of
+/// them is refused and none is kept. HPACK has nothing against an empty
+/// string, though, so the block decodes to its end and the tables agree: the
+/// request is malformed (§8.1.1), which is its stream's problem and a fault
+/// against the budget, not the connection's.
 #[test]
 fn zero_length_headers_leak() {
     let mut block = GET_BLOCK.to_vec();
@@ -350,10 +350,23 @@ fn zero_length_headers_leak() {
         &block,
     ));
 
-    let written = run_connection(deliveries(&bytes), |_, _| {});
+    let mut inbound = deliveries(&bytes);
+    inbound.push(ReadEvent::Eof);
+    let written = run_connection(inbound, |_, _| {});
 
-    let (code, _) = goaway(&written).expect("an undecodable block closes the connection");
-    assert_eq!(code, COMPRESSION_ERROR);
+    let reset = written
+        .iter()
+        .find(|f| f.kind == RST_STREAM && f.stream_id == 1)
+        .unwrap_or_else(|| panic!("the malformed request was reset: {written:?}"));
+    assert_eq!(
+        u32::from_be_bytes(reset.payload[..4].try_into().unwrap()),
+        PROTOCOL_ERROR
+    );
+    assert!(
+        !written.iter().any(|f| f.kind == HEADERS),
+        "and never reached the handler: {written:?}"
+    );
+    assert_eq!(goaway(&written), None);
 }
 
 /// The other half of CVE-2019-9516: fields that are legal, tiny, and many.

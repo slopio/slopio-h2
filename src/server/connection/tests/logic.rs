@@ -234,6 +234,46 @@ fn a_peer_with_no_hpack_table_is_not_sent_indexed_fields() {
     }
 }
 
+/// §8.2.1: a field HTTP refuses makes its request malformed, and nothing
+/// more — the other streams share the HPACK table, not the fault. Refused
+/// fields are still indexed, which is what the second request checks: it
+/// names an entry that sits *behind* the refused one, and finds it only if
+/// the refused one took its slot.
+#[test]
+fn a_refused_field_resets_its_stream_and_nothing_else() {
+    let mut first = GET_BLOCK.to_vec();
+    // `x-ok: 1`, then `x-bad: a\r\nb`, both literals with incremental
+    // indexing: x-bad is entry 62, x-ok entry 63.
+    first.extend_from_slice(&[0x40, 4, b'x', b'-', b'o', b'k', 1, b'1']);
+    first.extend_from_slice(&[0x40, 5, b'x', b'-', b'b', b'a', b'd', 4, b'a', b'\r', b'\n', b'b']);
+    let mut second = GET_BLOCK.to_vec();
+    second.push(0x80 | 63);
+
+    let mut bytes = preface();
+    bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, &first));
+    bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 3, &second));
+
+    let written = run_connection(vec![ReadEvent::Data(bytes), ReadEvent::Eof], |_, _| {});
+
+    let reset = written
+        .iter()
+        .find(|f| f.kind == RST_STREAM && f.stream_id == 1)
+        .unwrap_or_else(|| panic!("the malformed request was reset: {written:?}"));
+    assert_eq!(
+        u32::from_be_bytes(reset.payload[..4].try_into().unwrap()),
+        crate::shared::codec::types::PROTOCOL_ERROR
+    );
+    assert!(
+        !written.iter().any(|f| f.kind == GOAWAY),
+        "one bad field is not the connection's fault: {:?}",
+        written.iter().find(|f| f.kind == GOAWAY)
+    );
+    assert!(
+        written.iter().any(|f| f.kind == HEADERS && f.stream_id == 3),
+        "and the next request, indexing past it, was served: {written:?}"
+    );
+}
+
 /// §5.4.2 / §5.1: a request whose header block is malformed is a *stream*
 /// error, and the stream it was opening is closed by the reset — not idle. A
 /// client that sent `HEADERS, DATA` back to back had the DATA on the wire

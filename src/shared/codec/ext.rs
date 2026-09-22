@@ -1,6 +1,5 @@
 //! Extensions specific to the HTTP/2 protocol.
 
-use bytes::Bytes;
 use std::fmt;
 
 use crate::shared::hpack::BytesStr;
@@ -27,10 +26,8 @@ impl Protocol {
         self.value.as_str()
     }
 
-    pub(crate) fn try_from(bytes: Bytes) -> Result<Self, std::str::Utf8Error> {
-        Ok(Self {
-            value: BytesStr::try_from(bytes)?,
-        })
+    pub(crate) fn new(value: BytesStr) -> Self {
+        Self { value }
     }
 }
 

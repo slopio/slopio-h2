@@ -278,8 +278,13 @@ impl HeaderBlock {
             }
         });
 
-        if let Err(e) = res {
-            return Err(e.into());
+        match res {
+            // §8.2.1: a field HTTP refuses makes the message malformed, which
+            // §8.1.1 makes a stream error. The decoder ran the block to its
+            // end first, so the table the other streams need is intact.
+            Err(hpack::DecoderError::InvalidField) => malformed = true,
+            Err(e) => return Err(e.into()),
+            Ok(()) => {}
         }
 
         if malformed {
