@@ -29,6 +29,11 @@ name = "interop_server"
 path = "examples/interop_server/main.rs"
 required-features = ["grpc"]
 
+[[example]]
+name = "tls_client"
+path = "examples/tls_client.rs"
+required-features = ["tls"]
+
 [dependencies]
 bytes = "1"
 fnv = "1"
