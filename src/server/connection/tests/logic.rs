@@ -368,6 +368,90 @@ fn a_refused_field_resets_its_stream_and_nothing_else() {
     );
 }
 
+/// §5.1: whoever sends RST_STREAM ignores what the peer had in flight — and a
+/// request refused before it was ever opened is reset all the same. Its body
+/// and its trailers were on the wire before our reset could reach the peer,
+/// and they used to land on a stream nothing remembered: the trailers read as
+/// HEADERS on a closed stream, and the connection went for them.
+#[test]
+fn trailers_behind_a_malformed_request_do_not_end_the_connection() {
+    let mut bytes = preface();
+    // `:method GET` twice: decodes fine, and is malformed (§8.3).
+    bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, &[0x82, 0x82, 0x86, 0x84]));
+    bytes.extend_from_slice(&frame(DATA, 0, 1, b"already on the wire"));
+    // `x: y`, as a literal without indexing.
+    bytes.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &[0x00, 1, b'x', 1, b'y'],
+    ));
+    bytes.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        3,
+        GET_BLOCK,
+    ));
+
+    let written = run_connection(vec![ReadEvent::Data(bytes), ReadEvent::Eof], |_, _| {});
+
+    assert!(
+        !written.iter().any(|f| f.kind == GOAWAY),
+        "what was in flight behind the refusal is a race: {:?}",
+        written.iter().find(|f| f.kind == GOAWAY)
+    );
+    assert_eq!(
+        written
+            .iter()
+            .filter(|f| f.kind == RST_STREAM && f.stream_id == 1)
+            .count(),
+        1,
+        "one reset, and the frames behind it ignored: {written:?}"
+    );
+    assert!(
+        written.iter().any(|f| f.kind == HEADERS && f.stream_id == 3),
+        "and the next request was served: {written:?}"
+    );
+}
+
+/// The same race behind the other refusal: the request one past
+/// `MAX_CONCURRENT_STREAMS`, whose trailers were already sent.
+#[test]
+fn trailers_behind_a_refused_stream_do_not_end_the_connection() {
+    let mut bytes = preface();
+    let limit = super::super::MAX_CONCURRENT_STREAMS;
+    // Every slot held: bodies still coming, so none of them finishes.
+    for i in 0..limit {
+        bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 2 * i + 1, GET_BLOCK));
+    }
+    let refused = 2 * limit + 1;
+    bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, refused, GET_BLOCK));
+    bytes.extend_from_slice(&frame(DATA, 0, refused, b"already on the wire"));
+    bytes.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        refused,
+        &[0x00, 1, b'x', 1, b'y'],
+    ));
+
+    let written = run_connection(vec![ReadEvent::Data(bytes), ReadEvent::Eof], |_, _| {});
+
+    let resets: Vec<_> = written
+        .iter()
+        .filter(|f| f.kind == RST_STREAM && f.stream_id == refused)
+        .collect();
+    assert_eq!(resets.len(), 1, "refused once: {written:?}");
+    assert_eq!(
+        u32::from_be_bytes(resets[0].payload[..4].try_into().unwrap()),
+        crate::shared::codec::types::REFUSED_STREAM
+    );
+    assert!(
+        !written.iter().any(|f| f.kind == GOAWAY),
+        "and what followed it ignored: {:?}",
+        written.iter().find(|f| f.kind == GOAWAY)
+    );
+}
+
 /// §5.4.2 / §5.1: a request whose header block is malformed is a *stream*
 /// error, and the stream it was opening is closed by the reset — not idle. A
 /// client that sent `HEADERS, DATA` back to back had the DATA on the wire
