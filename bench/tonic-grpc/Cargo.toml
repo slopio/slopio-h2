@@ -1,0 +1,28 @@
+[package]
+name = "tonic-grpc-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+prost = "0.14"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tonic = "0.14"
+tonic-prost = "0.14"
+
+# As `bench/tokio-h2`: popple-h2 gets mimalloc from `runtime` whether it asks
+# or not, so comparing memory against a glibc-malloc build would measure the
+# two allocators as much as the two servers.
+mimalloc = { version = "0.1.48", features = [
+    "local_dynamic_tls",
+    "v3",
+], optional = true }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[features]
+mimalloc-global = ["dep:mimalloc"]
+
+# No `[profile.release]`: popple-h2 has none either, so both sides are built by
+# the same default release profile.

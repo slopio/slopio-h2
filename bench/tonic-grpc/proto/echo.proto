@@ -1,0 +1,20 @@
+// A bidirectional stream, for the example beside it. What the gRPC interop
+// suite calls `ping_pong`: the client sends a message, waits for its answer,
+// sends the next.
+syntax = "proto3";
+
+package popple.echo.v1;
+
+message EchoRequest {
+  string text = 1;
+  int32 index = 2;
+}
+
+message EchoResponse {
+  string text = 1;
+  int32 index = 2;
+}
+
+service Echo {
+  rpc Chat(stream EchoRequest) returns (stream EchoResponse);
+}
