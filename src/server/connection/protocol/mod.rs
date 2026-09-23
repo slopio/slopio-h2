@@ -83,15 +83,23 @@ pub struct Protocol<H: Handler> {
     peer_settings: Settings,
     shared: Rc<SharedConnection>,
     streams: Streams<H>,
-    /// §3.4: the client's SETTINGS must be the first frame after its preface.
-    expect_settings: bool,
-    /// §3.4: an invalid preface is met with silence, not a GOAWAY.
-    preface_seen: bool,
+    greeting: Greeting,
     phase: Phase,
     faults: u32,
     control_frames: u32,
     odd_frames: u32,
     pings_sent: u64,
+}
+
+/// §3.4. Apart from `Phase`: the peer can close its half before its preface,
+/// and must still get no GOAWAY.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Greeting {
+    /// An invalid preface is met with silence, not a GOAWAY.
+    AwaitingPreface,
+    /// The client's SETTINGS must be the first frame after its preface.
+    AwaitingSettings,
+    Greeted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -309,8 +317,7 @@ impl<H: Handler> Protocol<H> {
                 goaway_stream_id: None,
                 streams: Rc::new(LiveStreams::new()),
             },
-            expect_settings: false,
-            preface_seen: false,
+            greeting: Greeting::AwaitingPreface,
             phase: Phase::Open,
             faults: 0,
             control_frames: 0,
@@ -392,7 +399,7 @@ impl<H: Handler> Protocol<H> {
 
         // §3.4: an invalid client preface is answered with nothing at all. It is
         // the only error that can reach us before `on_preface`.
-        if !self.preface_seen {
+        if self.greeting == Greeting::AwaitingPreface {
             return;
         }
 
@@ -721,9 +728,10 @@ impl<H: Handler> FrameHandler for Protocol<H> {
             kind == FrameKind::Data && self.streams.streams.get(stream_id.into()).is_some();
         self.count_frame(kind, length, flags, stream_live);
 
-        if !std::mem::take(&mut self.expect_settings) {
+        if self.greeting != Greeting::AwaitingSettings {
             return;
         }
+        self.greeting = Greeting::Greeted;
         // §6.5: ACK is 0x1.
         if kind != FrameKind::Settings || flags & 0x1 != 0 {
             self.fail_connection(PROTOCOL_ERROR, "client preface not followed by SETTINGS");
@@ -755,8 +763,6 @@ impl<H: Handler> FrameHandler for Protocol<H> {
             .write_frame(|out| encode_window_update(out, StreamId::ZERO, gap));
         self.shared.window.announce_recv(gap);
 
-        // §3.4: the client's SETTINGS has to be the next frame in.
-        self.expect_settings = true;
-        self.preface_seen = true;
+        self.greeting = Greeting::AwaitingSettings;
     }
 }

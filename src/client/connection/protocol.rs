@@ -16,20 +16,13 @@ use crate::shared::codec::{
 };
 use crate::shared::connection::STREAM_ID;
 
-/// §6.5.3: two independent facts; the peer can acknowledge ours before
-/// sending its own.
-#[derive(Default)]
-pub(super) struct Handshake {
-    /// §3.4: the first frame must be the peer's SETTINGS.
-    pub(super) first_frame_seen: bool,
-    pub(super) peer_settings_seen: bool,
-    pub(super) ours_acknowledged: bool,
-}
-
-impl Handshake {
-    pub(super) fn is_complete(&self) -> bool {
-        self.peer_settings_seen && self.ours_acknowledged
-    }
+/// §6.5.3: the peer's SETTINGS applied and ours acknowledged. In that order,
+/// since §3.4 makes the peer's SETTINGS its first frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Handshake {
+    AwaitingSettings,
+    AwaitingAck,
+    Complete,
 }
 
 pub(super) struct Protocol {
@@ -47,7 +40,7 @@ impl Protocol {
     pub(super) fn new(shared: Rc<ClientShared>) -> Self {
         Self {
             shared,
-            handshake: Handshake::default(),
+            handshake: Handshake::AwaitingSettings,
             keepalive: Keepalive::new(runtime::runtime::now()),
             closing: false,
             failure: None,
@@ -135,7 +128,7 @@ impl Protocol {
 impl FrameHandler for Protocol {
     /// §3.4: the server's first frame must be a non-ACK SETTINGS.
     fn on_frame(&mut self, kind: FrameKind, _stream_id: StreamId, _length: u32, flags: u8) {
-        if std::mem::replace(&mut self.handshake.first_frame_seen, true) {
+        if self.handshake != Handshake::AwaitingSettings {
             return;
         }
         // §6.5: ACK is 0x1.
@@ -149,7 +142,9 @@ impl FrameHandler for Protocol {
             return;
         }
         if ack {
-            self.handshake.ours_acknowledged = true;
+            if self.handshake == Handshake::AwaitingAck {
+                self.handshake = Handshake::Complete;
+            }
             return;
         }
 
@@ -174,7 +169,9 @@ impl FrameHandler for Protocol {
             return self.fail(FLOW_CONTROL_ERROR, "stream send window exceeds 2^31-1");
         }
 
-        self.handshake.peer_settings_seen = true;
+        if self.handshake == Handshake::AwaitingSettings {
+            self.handshake = Handshake::AwaitingAck;
+        }
         // §6.5.3: the ACK must follow applying the values.
         self.write_frame(encode_settings_ack);
     }

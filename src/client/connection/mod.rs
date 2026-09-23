@@ -23,7 +23,7 @@ mod protocol;
 mod tests;
 
 use keepalive::Due;
-use protocol::Protocol;
+use protocol::{Handshake, Protocol};
 
 enum Event<B> {
     Inbound(B),
@@ -106,7 +106,7 @@ impl<T: Transport> Connection<T> {
 
         conn.flush().await?;
 
-        while !conn.protocol.handshake.is_complete() {
+        while conn.protocol.handshake != Handshake::Complete {
             match conn.recv().await {
                 None => return Err(handshake_failed(&conn, "peer closed during the handshake")),
                 Some(Err(RecvError::Fatal(e))) => return Err(e),
