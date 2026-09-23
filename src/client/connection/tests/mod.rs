@@ -249,18 +249,29 @@ fn the_connection_window_is_opened_during_the_handshake() {
     );
 }
 
-/// §6.5.3 makes the exchange two-way and the halves independent: a server may
-/// acknowledge ours before sending its own, and a client that treated either
-/// as "established" would run on limits it had not been told.
+/// §6.5.3 makes the exchange two-way: the server's SETTINGS and its
+/// acknowledgement of ours are two facts, and a client that treated either
+/// as "established" would run on limits that were not yet in force.
 #[test]
-fn an_acknowledgement_alone_does_not_establish_the_connection() {
-    let mut inbound = vec![ReadEvent::Data(frame(SETTINGS, FLAG_ACK, 0, &[]))];
-    // The peer's own SETTINGS never arrive; it closes instead.
+fn the_servers_settings_alone_do_not_establish_the_connection() {
+    let mut inbound = vec![ReadEvent::Data(frame(SETTINGS, 0, 0, &[]))];
+    // Ours are never acknowledged; the peer closes instead.
     inbound.push(ReadEvent::Eof);
 
     let (result, _) = handshake(inbound);
     let err = result.expect_err("half an exchange is not a handshake");
     assert!(err.to_string().contains("closed"), "said why: {err}");
+}
+
+/// §3.4: the server's preface is a SETTINGS frame, and it MUST be the first
+/// frame the server sends — an acknowledgement of ours is not its own. A
+/// server that starts with anything else is refused, and says what was
+/// wrong rather than only that the handshake failed.
+#[test]
+fn a_server_that_does_not_open_with_its_settings_is_refused() {
+    let (result, _) = handshake(vec![ReadEvent::Data(frame(SETTINGS, FLAG_ACK, 0, &[]))]);
+    let err = result.expect_err("an ACK is not a server preface");
+    assert!(err.to_string().contains("SETTINGS"), "said why: {err}");
 }
 
 /// A server may refuse before it says anything else, and the reason it gives
@@ -279,11 +290,14 @@ fn a_goaway_during_the_handshake_is_reported_as_the_peers_reason() {
 }
 
 /// §6.7: a PING before the handshake finishes is still a PING. Answering it
-/// is what keeps a server that probes early from timing us out.
+/// is what keeps a server that probes early from timing us out. After its
+/// SETTINGS, which §3.4 makes the first thing it sends, and before it has
+/// acknowledged ours.
 #[test]
 fn a_ping_during_the_handshake_is_answered() {
-    let mut bytes = frame(PING, 0, 0, b"probe!!!");
-    bytes.extend_from_slice(&server_opening());
+    let mut bytes = frame(SETTINGS, 0, 0, &[]);
+    bytes.extend_from_slice(&frame(PING, 0, 0, b"probe!!!"));
+    bytes.extend_from_slice(&frame(SETTINGS, FLAG_ACK, 0, &[]));
 
     let (result, written) = handshake(vec![ReadEvent::Data(bytes)]);
     assert!(
@@ -572,6 +586,483 @@ fn reading_the_body_credits_the_peer() {
     assert!(
         (crate::client::STREAM_RECV_WINDOW as usize / 2..=body).contains(&credited),
         "the accumulated credit, announced once it was worth a frame: {credited}"
+    );
+}
+
+/// §6.9.1: padding is charged to the stream's window like the payload it
+/// pads, and no read will ever release it — the application never sees it.
+/// So it goes back on arrival. It used to go back to the connection only, and
+/// the stream's window shrank by every frame's padding for good: a long
+/// padded response stalled once about a window's worth of padding had come.
+///
+/// Here the padding alone passes the release threshold while the payload
+/// read stays far below it, so a stream WINDOW_UPDATE can only be the
+/// padding's.
+#[test]
+fn padding_is_credited_back_on_the_stream() {
+    const FLAG_PADDED: u8 = 0x8;
+    const PADDING: usize = 255;
+    // One byte of payload a frame; the padding carries the window.
+    let frames_needed = (crate::client::STREAM_RECV_WINDOW as usize / 2).div_ceil(PADDING + 1);
+
+    let mut padded = vec![PADDING as u8, b'x'];
+    padded.resize(2 + PADDING, 0);
+    let mut response = frame(HEADERS, FLAG_END_HEADERS, 1, STATUS_200);
+    for _ in 0..frames_needed {
+        response.extend_from_slice(&frame(DATA, FLAG_PADDED, 1, &padded));
+    }
+
+    let mut inbound = vec![ReadEvent::Data(server_opening()).after(Duration::from_millis(1))];
+    inbound.extend(split(response, Duration::from_millis(10)));
+    inbound.push(ReadEvent::Eof.after(Duration::from_millis(500)));
+
+    let (read, written) = with_client(inbound, move |client| async move {
+        let request = http::Request::get("http://example.test/padded")
+            .body(())
+            .unwrap();
+        let stream = client.send_request(&request, true).expect("a stream");
+        let _ = stream.response().await.expect("a response");
+        let mut total = 0;
+        while total < frames_needed {
+            total += stream
+                .read()
+                .await
+                .expect("a body")
+                .expect("more body")
+                .len();
+        }
+        settle().await;
+        total
+    });
+
+    assert_eq!(
+        read, frames_needed,
+        "one byte a frame reached the application"
+    );
+    assert!(
+        frames(&written)
+            .iter()
+            .any(|f| f.kind == WINDOW_UPDATE && f.stream_id == 1),
+        "the stream was credited for the padding it will never read"
+    );
+}
+
+/// A response head: `:status` from the static table, then `content-length`.
+fn head_with_length(status: u8, length: &str) -> Vec<u8> {
+    let mut block = vec![status];
+    block.extend_from_slice(&literal("content-length", length));
+    block
+}
+
+/// §8.1.1: a response whose DATA does not add up to its `content-length` is
+/// malformed. It used to be handed over as complete — short or long — and an
+/// application reading to `Ok(None)` took a truncated body for a whole one.
+///
+/// Stream 1 is short of its promise and stream 3 goes past it; both are
+/// reset, and each read says why rather than "stream cancelled". Stream 5
+/// keeps its promise and is read to its end.
+#[test]
+fn a_body_that_breaks_its_content_length_is_refused() {
+    let mut answers = Vec::new();
+    for (id, body) in [
+        (1, &b"short"[..]),
+        (3, &b"too long"[..]),
+        (5, &b"exact"[..]),
+    ] {
+        let declared = match id {
+            1 => "10",
+            3 => "3",
+            _ => "5",
+        };
+        answers.extend_from_slice(&frame(
+            HEADERS,
+            FLAG_END_HEADERS,
+            id,
+            &head_with_length(STATUS_200[0], declared),
+        ));
+        answers.extend_from_slice(&frame(DATA, FLAG_END_STREAM, id, body));
+    }
+
+    let (outcomes, written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(answers).after(Duration::from_millis(10)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let mut outcomes = Vec::new();
+            let streams: Vec<_> = (0..3)
+                .map(|_| {
+                    let request = http::Request::get("http://example.test/").body(()).unwrap();
+                    client.send_request(&request, true).expect("a stream")
+                })
+                .collect();
+            settle().await;
+            for stream in &streams {
+                let mut body = Vec::new();
+                let ended = loop {
+                    match stream.read().await {
+                        Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                        Ok(None) => break Ok(body),
+                        Err(e) => break Err(e.to_string()),
+                    }
+                };
+                outcomes.push(ended);
+            }
+            // The resets are written; the loop is what sends them.
+            settle().await;
+            outcomes
+        },
+    );
+
+    for (outcome, id) in outcomes[..2].iter().zip([1, 3]) {
+        let refused = outcome.as_ref().expect_err("the body broke its length");
+        assert!(
+            refused.contains("content-length"),
+            "stream {id} says why: {refused}"
+        );
+    }
+    assert_eq!(
+        outcomes[2].as_deref(),
+        Ok(&b"exact"[..]),
+        "a kept promise is kept"
+    );
+
+    let resets: Vec<u32> = frames(&written)
+        .iter()
+        .filter(|f| f.kind == RST_STREAM)
+        .map(|f| f.stream_id)
+        .collect();
+    assert_eq!(
+        resets,
+        [1, 3],
+        "§8.1.1: a stream error, on the two that broke it"
+    );
+}
+
+/// What `content-length` does not promise: the body of a HEAD's response,
+/// which is the length the GET would have had (RFC 9110 §9.3.2), or of a 304,
+/// which is the length of the representation it did not send (§15.4.5). Both
+/// end on their HEADERS, and both are complete.
+#[test]
+fn a_bodiless_response_is_not_held_to_its_content_length() {
+    const STATUS_304: u8 = 0x8b;
+    let mut answers = frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &head_with_length(STATUS_200[0], "1000"),
+    );
+    answers.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        3,
+        &head_with_length(STATUS_304, "1000"),
+    ));
+
+    let (outcomes, _) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(answers).after(Duration::from_millis(10)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let head = http::Request::head("http://example.test/")
+                .body(())
+                .unwrap();
+            let conditional = http::Request::get("http://example.test/")
+                .header("if-none-match", "\"v1\"")
+                .body(())
+                .unwrap();
+            let streams = [
+                client.send_request(&head, true).expect("a stream"),
+                client.send_request(&conditional, true).expect("a stream"),
+            ];
+            settle().await;
+            let mut outcomes = Vec::new();
+            for stream in &streams {
+                let status = stream.response().await.map(|r| r.status().as_u16());
+                let end = stream.read().await.map(|chunk| chunk.is_none());
+                outcomes.push((
+                    status.map_err(|e| e.to_string()),
+                    end.map_err(|e| e.to_string()),
+                ));
+            }
+            outcomes
+        },
+    );
+
+    assert_eq!(
+        outcomes[0],
+        (Ok(200), Ok(true)),
+        "the HEAD's response, whole"
+    );
+    assert_eq!(outcomes[1], (Ok(304), Ok(true)), "the 304, whole");
+}
+
+/// §6.5.2: push is the server's to offer and the client's to accept. A server
+/// announcing SETTINGS_ENABLE_PUSH=1 does not know which end it is, and the
+/// connection is refused.
+#[test]
+fn a_server_that_enables_push_is_refused() {
+    // Id 0x2, value 1.
+    let mut bytes = frame(SETTINGS, 0, 0, &[0x00, 0x02, 0x00, 0x00, 0x00, 0x01]);
+    bytes.extend_from_slice(&frame(SETTINGS, FLAG_ACK, 0, &[]));
+
+    let (result, written) = handshake(vec![ReadEvent::Data(bytes)]);
+    let err = result.expect_err("a server cannot enable push");
+    assert!(err.to_string().contains("ENABLE_PUSH"), "said why: {err}");
+    assert!(
+        frames(&written).iter().any(|f| f.kind == GOAWAY),
+        "and told the peer"
+    );
+}
+
+/// §8.1: a response is a head, then its body. DATA before any head is the body
+/// of nothing: the stream is reset and the reader told the response was
+/// malformed, where the bytes used to be taken as body.
+#[test]
+fn data_before_the_response_head_is_refused() {
+    let answer = frame(DATA, FLAG_END_STREAM, 1, b"headless");
+
+    let (outcome, written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(answer).after(Duration::from_millis(10)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let request = http::Request::get("http://example.test/").body(()).unwrap();
+            let stream = client.send_request(&request, true).expect("a stream");
+            let outcome = stream
+                .response()
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            settle().await;
+            outcome
+        },
+    );
+
+    let refused = outcome.expect_err("no response came");
+    assert!(
+        refused.contains("malformed response"),
+        "said why: {refused}"
+    );
+    assert!(
+        frames(&written)
+            .iter()
+            .any(|f| f.kind == RST_STREAM && f.stream_id == 1),
+        "the stream was reset"
+    );
+}
+
+/// §5.1: a peer whose half of the stream has closed sends nothing more on it.
+/// A second trailer section used to be taken — replacing the first — while
+/// our upload kept the stream open.
+#[test]
+fn headers_after_the_peers_end_stream_are_refused() {
+    let mut answer = frame(HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, STATUS_200);
+    answer.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &literal("x-late", "1"),
+    ));
+
+    let (_, written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(answer).after(Duration::from_millis(10)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let request = http::Request::post("http://example.test/")
+                .body(())
+                .unwrap();
+            // The upload stays open, so the stream is still live when the
+            // late trailers arrive.
+            let stream = client.send_request(&request, false).expect("a stream");
+            settle().await;
+            settle().await;
+            drop(stream);
+        },
+    );
+
+    let reset = frames(&written)
+        .into_iter()
+        .find(|f| f.kind == RST_STREAM && f.stream_id == 1)
+        .expect("the stream was reset");
+    assert_eq!(
+        u32::from_be_bytes(reset.payload[..4].try_into().unwrap()),
+        crate::shared::codec::types::STREAM_CLOSED
+    );
+}
+
+/// §5.1: the even ids are the server's, opened only by a push we refused, so
+/// every one of them is idle. A frame on one used to pass for a late frame on
+/// a retired stream of ours whenever the id was low enough.
+#[test]
+fn a_frame_on_a_server_initiated_id_ends_the_connection() {
+    let answer = frame(WINDOW_UPDATE, 0, 2, &1u32.to_be_bytes());
+
+    let (failure, written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(answer).after(Duration::from_millis(10)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            // Streams 1 and 3 opened, so 2 is below the next id.
+            let request = http::Request::get("http://example.test/").body(()).unwrap();
+            let one = client.send_request(&request, true).expect("a stream");
+            let three = client.send_request(&request, true).expect("a stream");
+            let failure = one.response().await.map(|_| ()).map_err(|e| e.to_string());
+            drop((one, three));
+            failure
+        },
+    );
+
+    assert!(
+        failure.is_err(),
+        "the connection went, and the stream with it"
+    );
+    let goaway = frames(&written)
+        .into_iter()
+        .find(|f| f.kind == GOAWAY)
+        .expect("§5.4.1: said with a GOAWAY");
+    assert_eq!(
+        u32::from_be_bytes(goaway.payload[4..8].try_into().unwrap()),
+        crate::shared::codec::types::PROTOCOL_ERROR
+    );
+}
+
+/// §8.2.2: an HTTP/2 request MUST NOT carry the fields that describe an
+/// HTTP/1.1 connection, and a conforming server resets one that does. They are
+/// hop-by-hop, so they are dropped on the way out — `TE: trailers` excepted,
+/// which is the one value §8.2.2 allows.
+#[test]
+fn connection_specific_fields_do_not_go_out() {
+    let (_, written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let request = http::Request::get("http://example.test/")
+                .header("connection", "keep-alive")
+                .header("keep-alive", "timeout=5")
+                .header("proxy-connection", "keep-alive")
+                .header("transfer-encoding", "chunked")
+                .header("upgrade", "h2c")
+                .header("te", "gzip")
+                .header("x-kept", "yes")
+                .body(())
+                .unwrap();
+            let stream = client.send_request(&request, true).expect("a stream");
+            settle().await;
+            drop(stream);
+
+            let request = http::Request::get("http://example.test/")
+                .header("te", "trailers")
+                .body(())
+                .unwrap();
+            let stream = client.send_request(&request, true).expect("a stream");
+            settle().await;
+            drop(stream);
+        },
+    );
+
+    // One decoder for the connection: the second head indexes the first.
+    let mut decoder = crate::shared::hpack::Decoder::new(4096);
+    let heads: Vec<_> = frames(&written)
+        .into_iter()
+        .filter(|f| f.kind == HEADERS)
+        .map(|f| decode_block_with(&mut decoder, &f.payload))
+        .collect();
+    for name in [
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+        "upgrade",
+        "te",
+    ] {
+        assert!(
+            !heads[0].contains_key(name),
+            "{name} was dropped: {:?}",
+            heads[0]
+        );
+    }
+    assert_eq!(heads[0].get("x-kept").map(String::as_str), Some("yes"));
+    assert_eq!(
+        heads[1].get("te").map(String::as_str),
+        Some("trailers"),
+        "the one TE value an HTTP/2 request may carry"
+    );
+}
+
+/// §5.1.1: stream ids run out at 2^31-1, and a connection that has used its
+/// last one can take no more requests. `is_closed` says so from that moment —
+/// it used to answer "open" while every request made on it failed.
+#[test]
+fn a_connection_out_of_stream_ids_says_it_is_closed() {
+    let (states, _) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            client.shared.skip_to_stream_id((1 << 31) - 1);
+            let before = client.is_closed();
+            let request = http::Request::get("http://example.test/").body(()).unwrap();
+            let last = client.send_request(&request, true).expect("the last id");
+            let after = client.is_closed();
+            let refused = client.send_request(&request, true).is_err();
+            drop(last);
+            (before, after, refused)
+        },
+    );
+
+    assert_eq!(states, (false, true, true));
+}
+
+/// A connection error ends the connection, and nothing after it in the same
+/// read is acted on. The decoder stops only for errors it finds itself, so a
+/// response behind a bad SETTINGS used to reach the application after the
+/// connection had already failed.
+#[test]
+fn nothing_is_delivered_after_a_connection_error() {
+    // §6.5.2: an initial window past 2^31-1 is a FLOW_CONTROL_ERROR.
+    let mut bytes = frame(SETTINGS, 0, 0, &[0x00, 0x04, 0x80, 0x00, 0x00, 0x00]);
+    bytes.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        STATUS_200,
+    ));
+
+    let (outcome, _) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(bytes).after(Duration::from_millis(10)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let request = http::Request::get("http://example.test/").body(()).unwrap();
+            let stream = client.send_request(&request, true).expect("a stream");
+            settle().await;
+            stream
+                .response()
+                .await
+                .map(|r| r.status().as_u16())
+                .map_err(|e| e.to_string())
+        },
+    );
+
+    assert!(
+        outcome.is_err(),
+        "the response behind the error was not delivered: {outcome:?}"
     );
 }
 
@@ -1005,13 +1496,23 @@ fn frames(bytes: &[u8]) -> Vec<Frame> {
 
 /// The fields of an encoded block, by name.
 fn decode_block(payload: &[u8]) -> std::collections::HashMap<String, String> {
-    use crate::shared::hpack::{Decoder, Header};
+    decode_block_with(&mut crate::shared::hpack::Decoder::new(4096), payload)
+}
+
+/// As [`decode_block`], with a decoder that outlives the block — for a
+/// connection's second head and after, which may index what the first put
+/// in the table.
+fn decode_block_with(
+    decoder: &mut crate::shared::hpack::Decoder,
+    payload: &[u8],
+) -> std::collections::HashMap<String, String> {
+    use crate::shared::hpack::Header;
     use bytes::BytesMut;
 
     let mut buf = BytesMut::from(payload);
     let mut cursor = std::io::Cursor::new(&mut buf);
     let mut out = std::collections::HashMap::new();
-    Decoder::new(4096)
+    decoder
         .decode(&mut cursor, |header| {
             let (name, value) = match header {
                 Header::Field { name, value } => (

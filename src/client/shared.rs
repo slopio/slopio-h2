@@ -15,6 +15,7 @@ use http::HeaderName;
 
 use crate::client::stream::{Failure, Stream, StreamState};
 use crate::shared::codec::frames::{encode::encode_rst_stream, stream_id::StreamId};
+use crate::shared::codec::types::StreamViolation;
 use crate::shared::connection::stream_map::StreamMap;
 use crate::shared::connection::{STREAM_ID, SharedConnection, settings::Settings};
 use crate::shared::hpack::{BytesStr, Header};
@@ -117,12 +118,24 @@ impl ClientShared {
     /// on a client connection, is every id the peer could invent. An id it
     /// *did* open and has since retired is not idle, and a frame arriving
     /// late on one of those is tolerated rather than fatal.
+    ///
+    /// The even ids are the server's, opened only by a push, and we refused
+    /// push in our SETTINGS: every one of them is idle, however low. They
+    /// used to pass for retired streams of ours whenever they were below the
+    /// next id we would use.
     pub(crate) fn is_idle(&self, id: STREAM_ID) -> bool {
-        id >= self.next_stream_id.get()
+        id.is_multiple_of(2) || id >= self.next_stream_id.get()
     }
 
     pub(crate) fn is_closing(&self) -> bool {
         self.closing.get()
+    }
+
+    /// Jumps the next stream id, for a test that needs a connection near
+    /// the end of its ids without opening a billion streams to get there.
+    #[cfg(test)]
+    pub(crate) fn skip_to_stream_id(&self, id: STREAM_ID) {
+        self.next_stream_id.set(id);
     }
 
     /// No more streams may be opened. The live ones are left alone: a GOAWAY
@@ -165,9 +178,18 @@ impl ClientShared {
         // Odd to odd. The peer is the only one who opens the even ones, and
         // it has told us it will not (§8.2, and we asked for no push).
         self.next_stream_id.set(raw.saturating_add(2));
+        // §5.1.1: that was the last id this connection has. It can finish
+        // what it carries and take nothing more, which is what `closing`
+        // says — to `Client::is_closed`, and to a pool deciding where the
+        // next request goes. It used to go on answering "open" and failing
+        // every request made on it.
+        if raw.saturating_add(2) > MAX_STREAM_ID {
+            self.stop_opening();
+        }
         let id = StreamId::from(raw);
 
-        let state = Rc::new(StreamState::new(id, &settings, end_stream));
+        let head = request.method() == http::Method::HEAD;
+        let state = Rc::new(StreamState::new(id, &settings, end_stream, head));
         self.streams.insert(raw, Rc::clone(&state), ());
 
         self.core
@@ -199,6 +221,19 @@ impl ClientShared {
         self.core
             .write_frame(|out| encode_rst_stream(out, id, error_code));
         state.fail(Failure::Gone("stream cancelled"));
+    }
+
+    /// The peer broke the rules on this stream (§5.4.2): it is reset with
+    /// the violation's code, and whoever was waiting on it is told what the
+    /// violation was. It used to be told "stream cancelled", the same as a
+    /// cancel of our own, which sent a caller looking in the wrong place.
+    pub(crate) fn reject_stream(&self, id: StreamId, violation: StreamViolation) {
+        let Some(state) = self.remove_stream(id.into()) else {
+            return;
+        };
+        self.core
+            .write_frame(|out| encode_rst_stream(out, id, violation.code()));
+        state.fail(Failure::Gone(violation.message()));
     }
 
     /// Theirs: §6.4, and nothing is written back — the stream just goes.
@@ -278,12 +313,34 @@ fn request_headers(
     let authority = uri
         .authority()
         .map(|a| Header::Authority(BytesStr::from(a.as_str())));
-    let fields = request.headers().iter().map(|(name, value)| Header::Field {
-        name: Some(name.clone()),
-        value: value.clone(),
-    });
+    let fields = request
+        .headers()
+        .iter()
+        .filter(|(name, value)| !is_connection_specific(name, value))
+        .map(|(name, value)| Header::Field {
+            name: Some(name.clone()),
+            value: value.clone(),
+        });
 
     pseudo.into_iter().chain(authority).map(reify).chain(fields)
+}
+
+/// §8.2.2: fields that describe an HTTP/1.1 connection, which an HTTP/2
+/// message MUST NOT carry — a conforming server treats the request as
+/// malformed and resets it. `TE` is the exception that may stay, with
+/// `trailers` as its only value.
+///
+/// Dropped rather than refused: they are hop-by-hop, so they were never the
+/// request's to begin with, and an application relaying headers from an
+/// HTTP/1.1 request would otherwise have every such request fail.
+fn is_connection_specific(name: &HeaderName, value: &http::HeaderValue) -> bool {
+    use http::header;
+    matches!(
+        *name,
+        header::CONNECTION | header::TRANSFER_ENCODING | header::UPGRADE
+    ) || name == "keep-alive"
+        || name == "proxy-connection"
+        || (*name == header::TE && value != "trailers")
 }
 
 /// The encoder takes header names as `Option`, which is how it says "the same

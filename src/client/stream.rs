@@ -24,8 +24,10 @@ use runtime::runtime::time::timeout;
 
 use crate::client::STREAM_RECV_WINDOW;
 use crate::client::shared::ClientShared;
-use crate::shared::codec::frames::{encode::encode_window_update, stream_id::StreamId};
-use crate::shared::codec::types::CANCEL;
+use crate::shared::codec::frames::{
+    encode::encode_window_update, headers::content_length, stream_id::StreamId,
+};
+use crate::shared::codec::types::{CANCEL, StreamViolation};
 use crate::shared::connection::{
     DEADLINE_TICK, SendSide, settings::Settings, stream_window::StreamWindow,
 };
@@ -95,6 +97,16 @@ pub(crate) struct StreamState {
     chunks: RefCell<VecDeque<Vec<u8>>>,
     /// §8.1: the trailers, if the response had any.
     trailers: RefCell<Option<HeaderMap>>,
+    /// The request was a HEAD, whose response declares the length the GET
+    /// would have had and carries no body (RFC 9110 §9.3.2) — so its
+    /// `content-length` is not a promise about this stream.
+    head_request: bool,
+    /// §8.1.1: what the response's `content-length` promised, if it made a
+    /// promise this stream has to keep.
+    declared_len: Cell<Option<u64>>,
+    /// Body bytes received so far, padding excluded — what the promise is
+    /// held to.
+    received_len: Cell<u64>,
     /// The peer's half is done: its END_STREAM arrived, on the response head,
     /// a DATA frame or the trailers.
     no_more_input: Cell<bool>,
@@ -130,7 +142,12 @@ pub(crate) struct StreamState {
 
 impl StreamState {
     /// `settings` are the peer's: they credit the send window.
-    pub(crate) fn new(id: StreamId, settings: &Settings, end_stream: bool) -> Self {
+    pub(crate) fn new(
+        id: StreamId,
+        settings: &Settings,
+        end_stream: bool,
+        head_request: bool,
+    ) -> Self {
         Self {
             id,
             window: StreamWindow::new(settings, STREAM_RECV_WINDOW),
@@ -138,6 +155,9 @@ impl StreamState {
             response_seen: Cell::new(false),
             chunks: RefCell::new(VecDeque::new()),
             trailers: RefCell::new(None),
+            head_request,
+            declared_len: Cell::new(None),
+            received_len: Cell::new(0),
             no_more_input: Cell::new(false),
             // END_STREAM already on the request head: the stream is born
             // half-closed(local).
@@ -167,22 +187,41 @@ impl StreamState {
         self.no_more_output.set(true);
     }
 
-    /// §8.1.2.4: the response head. `Err` is a head that is not one — no
-    /// `:status`, or a pseudo-header that belongs to a request.
+    /// §8.1.2.4: the response head. `Err` is a head that is not one — an
+    /// informational response with END_STREAM, or a `content-length` that is
+    /// not a length or that the head already breaks.
     ///
     /// §8.1 lets any number of informational responses precede the final one;
     /// they are dropped here rather than delivered, so `response()` resolves
     /// on the response the application asked about. Nothing is lost that this
     /// client can currently act on: it never sends `expect: 100-continue`.
+    ///
+    /// Judged before it is stored, so a head that fails is never handed to
+    /// the application as a response.
     pub(crate) fn recv_response(
         &self,
         response: http::Response<()>,
         end_stream: bool,
-    ) -> Result<(), ()> {
+    ) -> Result<(), StreamViolation> {
         if response.status().is_informational() {
             // §8.1: an informational response cannot end the message.
-            return if end_stream { Err(()) } else { Ok(()) };
+            return match end_stream {
+                true => Err(StreamViolation::MalformedResponse),
+                false => Ok(()),
+            };
         }
+
+        // §8.1.1: a declared length the DATA does not add up to makes the
+        // response malformed. Not for a HEAD's response or a 304 (RFC 9110
+        // §8.6): both declare the length of a body they do not carry.
+        let declared =
+            content_length(response.headers()).map_err(|()| StreamViolation::MalformedResponse)?;
+        let bodiless = self.head_request || response.status() == http::StatusCode::NOT_MODIFIED;
+        let declared = declared.filter(|_| !bodiless);
+        if end_stream && declared.is_some_and(|len| len != 0) {
+            return Err(StreamViolation::ContentLengthMismatch);
+        }
+        self.declared_len.set(declared);
 
         *self.response.borrow_mut() = Some(response);
         self.response_seen.set(true);
@@ -196,10 +235,19 @@ impl StreamState {
     /// §8.1: the trailers — a second HEADERS, after the body, carrying
     /// END_STREAM and no pseudo-header. Ends the peer's half exactly as a
     /// final DATA frame does.
-    pub(crate) fn recv_trailers(&self, fields: HeaderMap) {
+    pub(crate) fn recv_trailers(&self, fields: HeaderMap) -> Result<(), StreamViolation> {
+        // §8.1.1: the body is over, so it has to be the length it said.
+        if self
+            .declared_len
+            .get()
+            .is_some_and(|len| len != self.received_len.get())
+        {
+            return Err(StreamViolation::ContentLengthMismatch);
+        }
         *self.trailers.borrow_mut() = Some(fields);
         self.no_more_input.set(true);
         self.wake_recv();
+        Ok(())
     }
 
     /// Whether a HEADERS frame on this stream is the response or its
@@ -208,13 +256,41 @@ impl StreamState {
         self.response_seen.get()
     }
 
+    /// The peer's half is done: its END_STREAM arrived, or the stream failed.
+    pub(crate) fn input_ended(&self) -> bool {
+        self.no_more_input.get()
+    }
+
     /// One DATA payload, already stripped of its padding. The bytes are
     /// copied out of the decoder's buffer, which is owed back to the ring the
     /// moment this returns.
-    pub(crate) fn recv_data(&self, payload: &[u8], end_stream: bool) -> Result<(), ()> {
+    ///
+    /// Judged before anything is kept: a payload that breaks the declared
+    /// length is not delivered, and what came before it already was.
+    pub(crate) fn recv_data(
+        &self,
+        payload: &[u8],
+        end_stream: bool,
+    ) -> Result<(), StreamViolation> {
         if self.no_more_input.get() {
-            return Err(());
+            // §5.1: the peer's half was already closed by its END_STREAM.
+            return Err(StreamViolation::DataAfterEndStream);
         }
+        // §8.1: a response is a head, then its body. DATA with no head in
+        // front of it — or behind only an informational one — is not a body
+        // of anything.
+        if !self.response_seen.get() {
+            return Err(StreamViolation::MalformedResponse);
+        }
+        // §8.1.1: past the declared length is malformed at once; short of it
+        // only once the body ends.
+        let received = self.received_len.get() + payload.len() as u64;
+        if let Some(len) = self.declared_len.get()
+            && (received > len || (end_stream && received != len))
+        {
+            return Err(StreamViolation::ContentLengthMismatch);
+        }
+        self.received_len.set(received);
         if !payload.is_empty() {
             self.chunks.borrow_mut().push_back(payload.to_vec());
             // Bounded by the receive window, so it cannot outgrow a u32.
@@ -232,6 +308,14 @@ impl StreamState {
     /// overrun here is a connection error, not a stream one.
     pub(crate) fn recv_window(&self, padded_len: u32) -> Result<(), ()> {
         self.window.recv(padded_len)
+    }
+
+    /// Hands receive credit back on this stream, answering with the
+    /// WINDOW_UPDATE increment once enough has piled up to be worth one.
+    /// For bytes that never reach the application — padding — and so will
+    /// never be released by a read.
+    pub(crate) fn release_recv(&self, len: u32) -> Option<u32> {
+        self.window.release_recv(len)
     }
 
     /// §6.9.1: a WINDOW_UPDATE on this stream. The writer may be waiting on

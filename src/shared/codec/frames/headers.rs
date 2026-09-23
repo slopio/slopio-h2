@@ -324,3 +324,37 @@ impl HeaderBlock {
 fn decoded_header_size(name: usize, value: usize) -> usize {
     name + value + 32
 }
+
+/// The declared body length, or `None` when the message declared none.
+/// Shared by both ends: a request's for the server, a response's for the
+/// client, and the same §8.1.1 check on either.
+///
+/// RFC 9110 §8.6 gives `content-length` the grammar `1*DIGIT` with no upper
+/// bound, and requires recipients to anticipate numerals too large to convert
+/// — hence the checked accumulation rather than a parse that could wrap. A
+/// repeated field is legal only if every value agrees.
+pub fn content_length(fields: &HeaderMap) -> Result<Option<u64>, ()> {
+    let mut declared: Option<u64> = None;
+
+    for value in fields.get_all(header::CONTENT_LENGTH) {
+        let digits = value.as_bytes();
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return Err(());
+        }
+
+        let mut len: u64 = 0;
+        for digit in digits {
+            len = len
+                .checked_mul(10)
+                .and_then(|n| n.checked_add((digit - b'0') as u64))
+                .ok_or(())?;
+        }
+
+        if declared.is_some_and(|first| first != len) {
+            return Err(());
+        }
+        declared = Some(len);
+    }
+
+    Ok(declared)
+}

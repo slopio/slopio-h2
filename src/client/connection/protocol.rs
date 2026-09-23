@@ -12,12 +12,15 @@ use crate::client::connection::keepalive::Keepalive;
 use crate::client::shared::ClientShared;
 use crate::shared::codec::{
     frames::{
-        FrameHandler, SettingsIter,
-        encode::{encode_goaway, encode_ping, encode_settings_ack},
+        FrameHandler, FrameKind, SettingsIter,
+        encode::{encode_goaway, encode_ping, encode_settings_ack, encode_window_update},
         headers::Headers,
         stream_id::StreamId,
     },
-    types::{DecodeError, ENHANCE_YOUR_CALM, FLOW_CONTROL_ERROR, PROTOCOL_ERROR, StreamViolation},
+    types::{
+        DecodeError, ENHANCE_YOUR_CALM, FLOW_CONTROL_ERROR, PROTOCOL_ERROR, Setting,
+        StreamViolation,
+    },
 };
 use crate::shared::connection::STREAM_ID;
 
@@ -29,6 +32,8 @@ use crate::shared::connection::STREAM_ID;
 /// not one — the peer can acknowledge ours before sending its own.
 #[derive(Default)]
 pub(super) struct Handshake {
+    /// The peer has sent a frame, which §3.4 requires to be its SETTINGS.
+    pub(super) first_frame_seen: bool,
     /// The peer sent its SETTINGS. Its limits are known from here.
     pub(super) peer_settings_seen: bool,
     /// The peer acknowledged ours. Our limits are in force from here.
@@ -101,7 +106,7 @@ impl Protocol {
     /// §5.4.2: the peer broke the rules on one stream. The stream goes, with
     /// a RST_STREAM carrying the violation's code, and the connection lives.
     fn fail_stream(&mut self, stream_id: StreamId, violation: StreamViolation) {
-        self.shared.reset_stream(stream_id, violation.code());
+        self.shared.reject_stream(stream_id, violation);
     }
 
     /// Whether `id` is one this client never opened — §5.1's idle state, and
@@ -132,12 +137,20 @@ impl Protocol {
         }
 
         if state.has_response() {
+            // §5.1: a peer whose half is already closed sends nothing more on
+            // it. A second trailer section used to be taken, and to replace
+            // the first.
+            if state.input_ended() {
+                return self.fail_stream(id, StreamViolation::DataAfterEndStream);
+            }
             // §8.1: trailers end the message, so they carry END_STREAM;
             // §8.3: no pseudo-header may appear in them.
             if !headers.is_end_stream() || has_pseudo(&headers) {
                 return self.fail_stream(id, StreamViolation::MalformedTrailers);
             }
-            state.recv_trailers((*headers).into_fields());
+            if let Err(violation) = state.recv_trailers((*headers).into_fields()) {
+                return self.fail_stream(id, violation);
+            }
             self.shared.retire_if_closed(raw);
             return;
         }
@@ -146,8 +159,8 @@ impl Protocol {
         let Some(response) = into_response(headers) else {
             return self.fail_stream(id, StreamViolation::MalformedResponse);
         };
-        if state.recv_response(response, end_stream).is_err() {
-            return self.fail_stream(id, StreamViolation::MalformedResponse);
+        if let Err(violation) = state.recv_response(response, end_stream) {
+            return self.fail_stream(id, violation);
         }
         if end_stream {
             self.shared.retire_if_closed(raw);
@@ -156,8 +169,24 @@ impl Protocol {
 }
 
 impl FrameHandler for Protocol {
+    /// §3.4: the server's preface is a SETTINGS frame, and it is the first
+    /// thing the server sends — not an acknowledgement of ours, which is not
+    /// its own, and not anything else. Checked once, on the first frame.
+    fn on_frame(&mut self, kind: FrameKind, _stream_id: StreamId, _length: u32, flags: u8) {
+        if std::mem::replace(&mut self.handshake.first_frame_seen, true) {
+            return;
+        }
+        // §6.5: ACK is 0x1.
+        if kind != FrameKind::Settings || flags & 0x1 != 0 {
+            self.fail(PROTOCOL_ERROR, "server preface is not a SETTINGS frame");
+        }
+    }
+
     /// §6.5: the peer's limits, or its acknowledgement of ours.
     fn on_settings(&mut self, ack: bool, settings: SettingsIter<'_>) {
+        if self.closing {
+            return;
+        }
         if ack {
             self.handshake.ours_acknowledged = true;
             return;
@@ -170,6 +199,12 @@ impl FrameHandler for Protocol {
         let mut peer = self.shared.peer_settings();
         let initial_window_before = peer.initial_window_size;
         for setting in settings {
+            // §6.5.2: push is the server's to offer and ours to accept, never
+            // the other way round. A server announcing 1 is a peer that does
+            // not know which end it is.
+            if matches!(setting, Setting::EnablePush(1)) {
+                return self.fail(PROTOCOL_ERROR, "SETTINGS_ENABLE_PUSH from a server");
+            }
             if let Err(invalid) = peer.apply(setting) {
                 return self.fail(invalid.code, invalid.message);
             }
@@ -191,6 +226,9 @@ impl FrameHandler for Protocol {
     /// §6.7: a probe is echoed with ACK set, and an ACK is the answer to a
     /// probe of ours — the keepalive's, since it sends the only ones.
     fn on_ping(&mut self, ack: bool, opaque: [u8; 8]) {
+        if self.closing {
+            return;
+        }
         match ack {
             true => self.keepalive.acknowledged(opaque),
             false => self.write_frame(|out| encode_ping(out, opaque, true)),
@@ -203,6 +241,9 @@ impl FrameHandler for Protocol {
     /// than when the socket eventually closes. What is at or below it is
     /// still being answered, so the connection stays open for it.
     fn on_goaway(&mut self, last_stream_id: StreamId, _error_code: u32, _debug_data: &[u8]) {
+        if self.closing {
+            return;
+        }
         self.failure.get_or_insert("peer sent GOAWAY");
         self.shared.stop_opening();
         self.shared.fail_unprocessed(last_stream_id.into());
@@ -210,6 +251,9 @@ impl FrameHandler for Protocol {
 
     /// §6.9: credit, on stream 0 or on one of ours.
     fn on_window_update(&mut self, stream_id: StreamId, increment: u32) {
+        if self.closing {
+            return;
+        }
         if stream_id.is_zero() {
             if self.shared.core.window.credit_send(increment).is_err() {
                 return self.fail(FLOW_CONTROL_ERROR, "connection send window exceeds 2^31-1");
@@ -233,6 +277,9 @@ impl FrameHandler for Protocol {
 
     /// A response, or the trailers after one.
     fn on_headers(&mut self, headers: Box<Headers>) {
+        if self.closing {
+            return;
+        }
         let id = headers.stream_id();
 
         // §5.1.1 and §8.2: the even ids are the peer's, and it opens one by
@@ -253,6 +300,9 @@ impl FrameHandler for Protocol {
     /// §6.9.1: `padded_len` is what flow control accounts for, pad-length
     /// byte and padding included; `payload` is what the application gets.
     fn on_data(&mut self, stream_id: StreamId, payload: &[u8], padded_len: usize, end: bool) {
+        if self.closing {
+            return;
+        }
         // Bounded by max_frame_size, itself below 2^24.
         let padded_len = padded_len as u32;
 
@@ -286,14 +336,28 @@ impl FrameHandler for Protocol {
         // drop, all of it is. Either way it goes back now — release only what
         // the application reads and the window shrinks by the padding for
         // good, until the connection stalls with nothing to show for it.
+        let padding = padded_len - payload.len() as u32;
         self.shared.core.release_stream_credit(match received {
-            Ok(()) => padded_len - payload.len() as u32,
-            Err(()) => padded_len,
+            Ok(()) => padding,
+            Err(_) => padded_len,
         });
 
+        // The stream's window was debited the same padding, and no read will
+        // ever give it back: it used to shrink for good, a padded frame at a
+        // time, until a long response stalled with its window gone. Not worth
+        // a frame on a stream the peer has just finished.
+        if received.is_ok()
+            && !end
+            && padding > 0
+            && let Some(increment) = state.release_recv(padding)
+        {
+            self.shared
+                .core
+                .write_frame(|out| encode_window_update(out, stream_id, increment));
+        }
+
         match received {
-            // §5.1: the peer's half was already closed by its END_STREAM.
-            Err(()) => self.fail_stream(stream_id, StreamViolation::DataAfterEndStream),
+            Err(violation) => self.fail_stream(stream_id, violation),
             Ok(()) if end => self.shared.retire_if_closed(raw),
             Ok(()) => {}
         }
@@ -302,6 +366,9 @@ impl FrameHandler for Protocol {
     /// §6.4: the peer gives up on a stream. Nothing is written back — the
     /// stream just goes, and whoever was waiting on it is told why.
     fn on_rst_stream(&mut self, stream_id: StreamId, error_code: u32) {
+        if self.closing {
+            return;
+        }
         if self.is_idle(stream_id.into()) {
             // §5.1: an idle stream cannot be reset, there is nothing to
             // reset.
@@ -310,13 +377,24 @@ impl FrameHandler for Protocol {
         self.shared.peer_reset(stream_id, error_code);
     }
 
+    /// Every frame after a connection error is ignored, here and in each
+    /// handler above: the error was answered with a GOAWAY and the loop
+    /// stops reading at the end of the chunk, but the decoder only stops on
+    /// errors of its own finding — so the rest of the chunk used to be
+    /// dispatched, and a response could reach the application after the
+    /// connection had already failed.
     fn on_error(&mut self, err: DecodeError) {
+        if self.closing {
+            return;
+        }
         match err {
             DecodeError::Connection { code, message } => self.fail(code, message),
             // The frame is already discarded; the stream is told why.
             DecodeError::Stream {
-                stream_id, code, ..
-            } => self.shared.reset_stream(stream_id, code),
+                stream_id,
+                violation,
+                ..
+            } => self.fail_stream(stream_id, violation),
         }
     }
 }
