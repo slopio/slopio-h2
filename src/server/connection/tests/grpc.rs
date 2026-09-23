@@ -1,11 +1,3 @@
-//! A gRPC call through the whole connection: detected at its HEADERS, read as
-//! length-prefixed messages, decoded, and answered with trailers.
-//!
-//! The pieces have their own tests in `src/grpc`. What is here is the seam —
-//! that a `content-type` reaches the detector, that DATA payloads reach the
-//! message reader, that taking a message credits the peer, and that a handler
-//! can answer the way gRPC expects.
-
 use std::time::Duration;
 
 use prost::Message as _;
@@ -18,15 +10,13 @@ use super::{
 use crate::grpc::{GrpcCall, Status, service};
 use crate::server::Stream;
 
-/// `grpc.health.v1.HealthCheckRequest`: what every Kubernetes gRPC probe
-/// sends. An empty `service` means the whole server — and encodes to nothing.
+/// `grpc.health.v1.HealthCheckRequest`. An empty `service` encodes to nothing.
 #[derive(Clone, PartialEq, prost::Message)]
 struct HealthCheckRequest {
     #[prost(string, tag = "1")]
     service: String,
 }
 
-/// Its answer. `status` is an enumeration, which is an `int32` on the wire.
 #[derive(Clone, PartialEq, prost::Message)]
 struct HealthCheckResponse {
     #[prost(int32, tag = "1")]
@@ -35,8 +25,6 @@ struct HealthCheckResponse {
 
 const SERVING: i32 = 1;
 
-/// One length-prefixed message, as the peer would put it on the wire — the
-/// request side of what `grpc::frame_message` does for a response.
 fn framed(message: &[u8]) -> Vec<u8> {
     let mut out = vec![0];
     out.extend_from_slice(&(message.len() as u32).to_be_bytes());
@@ -64,8 +52,8 @@ fn opening() -> Vec<u8> {
     bytes
 }
 
-/// The call, then the peer going away — otherwise the connection sits idle
-/// until the timeout GOAWAYs it, which is not what these are about.
+/// Then the peer going away — otherwise the connection sits idle until the
+/// timeout GOAWAYs it.
 fn scripted(bytes: &[u8]) -> Vec<Scripted> {
     vec![
         ReadEvent::Data(bytes.to_vec()).into(),
@@ -77,11 +65,8 @@ fn on_stream_1(written: &[Frame]) -> Vec<&Frame> {
     written.iter().filter(|f| f.stream_id == 1).collect()
 }
 
-/// A message larger than the stream's window flows through it: the bytes of
-/// a message being assembled are consumed as they land, so the credit goes
-/// back before the message is whole, and the peer is never short of window
-/// for the one it is sending. Here, a message of two windows and a bit, sent
-/// as the peer would: one window, wait for credit, the next.
+/// The bytes of a message being assembled are consumed as they land, so the
+/// credit goes back before the message is whole.
 #[test]
 fn a_message_larger_than_the_window_is_credited_as_it_fills() {
     const WINDOW: usize = crate::server::connection::STREAM_RECV_WINDOW as usize;
@@ -92,10 +77,8 @@ fn a_message_larger_than_the_window_is_credited_as_it_fills() {
     let body = framed(&request);
     assert!(body.len() > 2 * WINDOW);
 
-    // Each round is what fits in the window the peer has at that point, sent
-    // as frames under max_frame_size — one read event each, the fake ring's
-    // buffers being 16 KiB. The next round comes after a delay, by which time
-    // the credit for the previous has gone out.
+    // Each round is what fits in the peer's window at that point, one read
+    // event per frame; the next comes after the credit for it has gone out.
     let mut events = vec![ReadEvent::Data(opening()).into()];
     let mut at = 0;
     let mut wait = Duration::ZERO;
@@ -138,8 +121,6 @@ fn a_message_larger_than_the_window_is_credited_as_it_fills() {
     );
 }
 
-/// Answers the probe the way a gRPC handler does: a head, a message, and the
-/// trailers that carry the outcome.
 async fn health(stream: Stream) {
     assert!(stream.is_grpc());
     let request: HealthCheckRequest = match stream.message().await {
@@ -169,10 +150,8 @@ async fn health(stream: Stream) {
     stream.write_trailers(&trailers);
 }
 
-/// The shape of nearly every gRPC call: one message, then an empty DATA frame
-/// whose only job is END_STREAM. The request here is the whole-server health
-/// probe, which is a message of no bytes — five on the wire, and a value with
-/// every field at its default when it comes out.
+/// One message, then an empty DATA frame whose only job is END_STREAM. The
+/// whole-server health probe is a message of no bytes — five on the wire.
 #[test]
 fn a_unary_call_is_read_decoded_and_answered() {
     let request = HealthCheckRequest {
@@ -195,10 +174,8 @@ fn a_unary_call_is_read_decoded_and_answered() {
         "head, message, trailers: {written:?}"
     );
 
-    // Taking a message credits the peer for it — but not this one: its
-    // END_STREAM came with it, and a peer that has finished sending has no
-    // use for a window. A unary call is most calls, and this is the frame it
-    // does not pay for.
+    // Not credited: its END_STREAM came with it, and a peer that has finished
+    // sending has no use for a window.
     assert!(
         !written.iter().any(|f| f.kind == WINDOW_UPDATE && f.stream_id == 1),
         "nothing left to credit: {written:?}"
@@ -237,8 +214,7 @@ fn a_unary_call_is_read_decoded_and_answered() {
 }
 
 /// Named rather than closures: a closure's returned future does not carry the
-/// higher-ranked lifetime `AsyncFn(&GrpcCall)` asks for, and an `async fn`
-/// does.
+/// higher-ranked lifetime `AsyncFn(&GrpcCall)` asks for.
 async fn waits_forever(call: &GrpcCall) -> Status {
     assert_eq!(call.timeout(), Some(Duration::from_millis(100)));
     let _: Option<HealthCheckRequest> = call.message().await.expect("no body error");
@@ -257,9 +233,7 @@ async fn not_grpc(stream: Stream) {
     stream.write_headers_final(http::StatusCode::NOT_FOUND, &http::HeaderMap::new())
 }
 
-/// What a handler puts in the head and in the trailers goes out, reserved
-/// names included: gRPC's metadata is the service's to choose, and a service
-/// answering `+json` has to be able to say so.
+/// Reserved names included: gRPC's metadata is the service's to choose.
 async fn echoes_its_metadata(call: &GrpcCall) -> Status {
     let mut head = http::HeaderMap::new();
     // Overrides the layer's only default.
@@ -356,11 +330,9 @@ fn a_trailers_only_response_carries_the_heads_fields_too() {
     );
 }
 
-/// The layer's own job: a call that outlives its `grpc-timeout` is cut off
-/// and answered, rather than left running for a client that has given up.
-///
-/// Nothing is ever sent on the body, so the handler waits on a message that
-/// never comes. Virtual time, so the 100ms is exact and costs nothing.
+/// A call that outlives its `grpc-timeout` is cut off and answered, rather
+/// than left running for a client that has given up. Nothing is sent on the
+/// body, so the handler waits on a message that never comes.
 #[test]
 fn a_call_past_its_deadline_is_answered_deadline_exceeded() {
     let mut block = grpc_block(b"application/grpc");
@@ -402,8 +374,8 @@ fn a_call_past_its_deadline_is_answered_deadline_exceeded() {
     );
 }
 
-/// And a call that answers in time keeps its own status: the deadline is
-/// armed on every call, so it has to lose the race on the ordinary ones.
+/// The deadline is armed on every call, so it has to lose the race on the
+/// ordinary ones.
 #[test]
 fn a_call_inside_its_deadline_keeps_its_own_status() {
     let mut block = grpc_block(b"application/grpc");
@@ -437,11 +409,8 @@ fn a_call_inside_its_deadline_keeps_its_own_status() {
     );
 }
 
-/// The other half of that rule, and the one it exists for: a peer that has
-/// not finished sending is credited for every message taken, at once and not
-/// past a threshold. Hold that credit back and a large message behind a small
-/// one never completes — so the handler never takes it, so the credit never
-/// goes out.
+/// A peer still sending is credited for every message taken, at once: hold
+/// it back and a large message behind a small one never completes.
 #[test]
 fn a_peer_still_sending_is_credited_for_each_message_it_takes() {
     let first = framed(
@@ -460,7 +429,7 @@ fn a_peer_still_sending_is_credited_for_each_message_it_takes() {
     let mut opening = opening();
     opening.extend_from_slice(&frame(DATA, 0, 1, &first));
 
-    // The rest only after the handler has had the first: this is a call still
+    // The rest only after the handler has had the first: a call still
     // arriving, which is what makes its window worth reopening.
     let mut rest = frame(DATA, 0, 1, &second);
     rest.extend_from_slice(&frame(DATA, FLAG_END_STREAM, 1, &[]));
@@ -495,9 +464,8 @@ fn a_peer_still_sending_is_credited_for_each_message_it_takes() {
     );
 }
 
-/// Message boundaries are not DATA boundaries. Five calls at once, the same
-/// message cut at a different place on each — inside the prefix, at its end,
-/// inside the message — and every one of them decodes to the same request.
+/// Message boundaries are not DATA boundaries: the same message cut inside
+/// the prefix, at its end, and inside the message decodes the same.
 #[test]
 fn messages_split_across_data_frames_arrive_whole() {
     let request = HealthCheckRequest {

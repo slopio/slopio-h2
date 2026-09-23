@@ -22,28 +22,21 @@ pub mod headers;
 pub mod stream_id;
 
 const FRAME_HEADER_SIZE: usize = 9;
-/// §6.5.2: SETTINGS_MAX_FRAME_SIZE until a peer says otherwise. Seeds both
-/// what the decoder accepts and what we assume a peer accepts.
+/// §6.5.2: SETTINGS_MAX_FRAME_SIZE until a peer says otherwise.
 pub const DEFAULT_MAX_FRAME_SIZE: u32 = 16_384;
-/// The 24-byte client connection preface (§3.4). The server validates it on
-/// the inbound stream; a client writes it as the very first bytes it sends.
+/// §3.4.
 pub const CLIENT_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
-/// Hard cap on the *compressed* bytes accumulated across a HEADERS frame and
-/// its CONTINUATIONs before END_HEADERS arrives. Bounds memory against the
-/// CONTINUATION flood (CVE-2024-27316): each frame is individually ≤
-/// `max_frame_size`, but nothing else limits how many CONTINUATIONs a peer may
-/// send while never setting END_HEADERS. Twice `DECODE_MAX_HEADER_LIST_SIZE`:
-/// compressed is never much larger than decoded, so anything beyond would be
-/// refused after decoding anyway.
+/// Cap on *compressed* bytes accumulated across HEADERS + CONTINUATIONs before
+/// END_HEADERS: defends against the CONTINUATION flood (CVE-2024-27316), where
+/// nothing else limits how many CONTINUATIONs a peer may send. Compressed is
+/// never much larger than decoded, so anything beyond would be refused anyway.
 const MAX_HEADER_BLOCK_SIZE: usize = 2 * DECODE_MAX_HEADER_LIST_SIZE;
 
 /// Limit on the *decompressed* header-list size (RFC 7541 §4.1: name + value
-/// + 32 octets per field) enforced during HPACK decode, and advertised as
-/// `SETTINGS_MAX_HEADER_LIST_SIZE`. The compressed cap above cannot see an
-/// HPACK bomb: tiny on the wire, huge decoded. Decoding always runs to the
-/// end (HPACK state must stay in sync); fields past the limit are dropped and
-/// the block is flagged `is_over_size` for the handler to refuse.
+/// + 32 octets per field); the compressed cap above cannot see an HPACK bomb.
+/// Decoding always runs to the end (HPACK state must stay in sync); fields past
+/// the limit are dropped and the block is flagged `is_over_size`.
 pub const DECODE_MAX_HEADER_LIST_SIZE: usize = 16 * 1024;
 
 #[derive(FromBytes, KnownLayout, Immutable)]
@@ -98,7 +91,6 @@ impl From<u8> for FrameKind {
     }
 }
 
-/// Zero-alloc iterator over a SETTINGS frame payload.
 pub struct SettingsIter<'a> {
     buf: &'a [u8],
 }
@@ -131,21 +123,14 @@ impl<'a> Iterator for SettingsIter<'a> {
     }
 }
 
-/// Callback interface invoked by [`FrameDecoder`] during parsing.
-///
-/// Each method corresponds to one complete H2 frame; the decoder calls them
-/// in the order frames appear on the wire. Payload slices borrow from the
-/// decoder's input buffer and are only valid for the duration of the call —
-/// implementations that need to retain the data must copy.
+/// Payload slices borrow from the decoder's input buffer and are only valid
+/// for the duration of the call.
 pub trait FrameHandler {
-    /// `payload` is the unpadded body delivered to the application.
-    /// `padded_len` is the original DATA frame payload length (pad-length
-    /// byte + body + padding) — what flow control accounts against per
-    /// §6.9.1.
+    /// `padded_len` (pad-length byte + body + padding) is what flow control
+    /// accounts against per §6.9.1.
     ///
-    /// Not once per frame: an unpadded DATA frame cut by the end of a read is
-    /// delivered as it arrives, one call per piece, each accounting for its own
-    /// bytes. The pieces add up to the frame, and only the last carries
+    /// Not once per frame: an unpadded DATA frame cut by a read comes one call
+    /// per piece, each accounting for its own bytes; only the last carries
     /// `end_stream`. [`on_frame`](Self::on_frame) is still once per frame.
     fn on_data(
         &mut self,
@@ -155,31 +140,19 @@ pub trait FrameHandler {
         end_stream: bool,
     );
 
-    /// How far `violation` reaches. The decoder reports it as a connection
-    /// error when this says so, and stops; the default keeps it to the stream.
     fn stream_error_scope(&self, _violation: StreamViolation) -> ErrorScope {
         ErrorScope::Stream
     }
 
-    /// Invoked for every complete frame, before it is validated or handled:
-    /// where accounting that depends only on the frame's type goes.
+    /// Invoked for every frame, before it is validated or handled.
     fn on_frame(&mut self, _kind: FrameKind, _stream_id: StreamId, _length: u32, _flags: u8) {}
 
-    /// Invoked once the 24-byte client preface has been validated, before
-    /// any frames following it are dispatched. The server preface (a
-    /// SETTINGS frame) must be the first thing we write, so handlers use
-    /// this hook to enqueue it before the decoder begins processing
-    /// subsequent frames (which may queue a SETTINGS ACK).
+    /// Runs before any following frame is dispatched: the server preface must
+    /// be written before anything they queue (e.g. a SETTINGS ACK).
     fn on_preface(&mut self) {}
 
-    /// Invoked once per complete header block (HEADERS + any CONTINUATIONs).
-    /// `headers` is fully HPACK-decoded.
-    ///
-    /// Boxed on purpose, though the decoder is done with it: passing it by
-    /// value saves this allocation but costs more than it saves. The value ends
-    /// up in the stream task's future, where rustc keeps three live copies of
-    /// it (the argument slot and two `RequestHead`s) — measured at +840 bytes
-    /// per task and two 288-byte moves per request. See `notes.md`.
+    /// Boxed on purpose: by value costs +840 bytes per stream task future
+    /// (measured). See `notes.md`.
     fn on_headers(&mut self, headers: Box<Headers>);
 
     fn on_settings(&mut self, ack: bool, settings: SettingsIter<'_>);
@@ -192,25 +165,12 @@ pub trait FrameHandler {
 
     fn on_goaway(&mut self, last_stream_id: StreamId, error_code: u32, debug_data: &[u8]);
 
-    /// Reports a decoder-detected error. The handler is responsible for
-    /// emitting the appropriate response (GOAWAY for `Connection`,
-    /// RST_STREAM for `Stream`). After a `Connection` error the decoder
-    /// stops producing events.
+    /// After a `Connection` error the decoder stops producing events.
     fn on_error(&mut self, err: DecodeError);
 }
 
-/// An unpadded DATA frame whose header has been read and whose payload is
-/// still arriving.
-///
-/// Every other frame has to be whole before it means anything, so it is
-/// gathered in `remaining`. A DATA payload is just bytes for a stream, and the
-/// nine bytes in front of it say which stream and how many: gathering it first
-/// copies it once into `remaining` and again into the stream, for up to a frame
-/// of every read that ends inside one. This is what is kept instead.
-///
-/// Padded frames do not come through here — the padding is at the far end, so
-/// telling body from padding wants the whole frame, and they are rare enough to
-/// stay on the path that has it.
+/// An unpadded DATA frame whose payload is still arriving. Padded frames never
+/// come through here: telling body from padding needs the whole frame.
 struct PartialData {
     stream_id: StreamId,
     /// Payload bytes still to come. Never zero while this is stored.
@@ -218,7 +178,6 @@ struct PartialData {
     end_stream: bool,
 }
 
-/// State accumulated across HEADERS + CONTINUATION frames before HPACK decoding.
 struct HeaderBlockState {
     headers: Headers,
     buf: BytesMut,
@@ -232,26 +191,19 @@ pub struct FrameDecoder {
     partial_data: Option<PartialData>,
     header_block: Option<HeaderBlockState>,
     preface_seen: bool,
-    /// Set once a connection-level error has been reported. Further input is
-    /// untrusted (frame alignment / HPACK table may be out of sync), so
-    /// `decode_with` no-ops.
+    /// Set once a connection-level error has been reported: further input is
+    /// untrusted (framing / HPACK table may be out of sync), so `decode_with` no-ops.
     poisoned: bool,
 }
 
 impl FrameDecoder {
-    /// True once the 24-byte client preface has been validated.
     pub fn preface_seen(&self) -> bool {
         self.preface_seen
     }
 
-    /// Whether the peer has started a header block and not finished it: a
-    /// HEADERS or CONTINUATION still arriving, or a block waiting for its
-    /// CONTINUATION. §6.10 forbids interleaving, so this state blocks every
-    /// stream on the connection, not just its own.
-    ///
-    /// A frame header too short to carry its kind counts: nine bytes that take
-    /// seconds to arrive are pathological whatever they turn out to introduce,
-    /// and refusing to guess is what keeps a slow *body* from counting here.
+    /// §6.10 forbids interleaving, so a pending header block blocks every
+    /// stream on the connection. An incomplete frame header counts too, so a
+    /// slow *body* never does.
     pub fn header_pending(&self) -> bool {
         if self.header_block.is_some() {
             return true;
@@ -279,10 +231,7 @@ impl FrameDecoder {
         }
     }
 
-    /// Decoder for the **client** side: the inbound stream (server → client)
-    /// carries no client preface, so it starts already past preface validation.
-    /// `on_preface` is therefore never dispatched; the client emits its own
-    /// preface out-of-band.
+    /// No client preface inbound, so `on_preface` is never dispatched.
     pub fn client() -> Self {
         Self {
             preface_seen: true,
@@ -290,9 +239,6 @@ impl FrameDecoder {
         }
     }
 
-    /// Parse frames from `data` and dispatch them inline to `handler`.
-    /// Errors are surfaced through `handler.on_error`; after a connection
-    /// error subsequent calls are a no-op.
     pub fn decode_with<H: FrameHandler>(&mut self, data: &[u8], handler: &mut H) {
         if self.poisoned {
             return;
@@ -321,9 +267,6 @@ impl FrameDecoder {
         }
     }
 
-    /// Accumulate up to 24 bytes of the client connection preface. Returns
-    /// `Some(rest)` once matched, `None` while buffering or after reporting
-    /// a preface mismatch.
     fn consume_preface<'a, H: FrameHandler>(
         &mut self,
         data: &'a [u8],
@@ -356,10 +299,8 @@ impl Default for FrameDecoder {
     }
 }
 
-/// Internal control signal for decoder helpers: `Ok(())` = continue, `Err(())`
-/// = a connection-level error has already been reported via `handler.on_error`
-/// and decoding must stop. Stream-level errors stay inside `dispatch_frame`
-/// and return `Ok(())` (skip the frame, keep going).
+/// `Err(())` = a connection-level error has already been reported and decoding
+/// must stop. Stream-level errors return `Ok(())`.
 type Decode<T = ()> = Result<T, ()>;
 
 #[inline]
@@ -372,7 +313,6 @@ fn report_connection<H: FrameHandler, T>(
     Err(())
 }
 
-/// A stream error, reported at the scope the handler gives it.
 fn report_violation<H: FrameHandler>(
     handler: &mut H,
     stream_id: StreamId,
@@ -425,7 +365,6 @@ fn decode_inner<H: FrameHandler>(
             handler,
         )?;
     }
-    // Either of those may have used `data` up without finishing its frame.
     if partial_data.is_some() || !remaining.is_empty() {
         debug_assert_eq!(pos, data.len());
         return Ok(());
@@ -446,15 +385,12 @@ fn decode_inner<H: FrameHandler>(
     Ok(())
 }
 
-/// Whether a DATA frame's payload can go to its stream as it arrives.
 #[inline]
 fn streams_payload(kind: FrameKind, flags: u8) -> bool {
     // §6.1: PADDED is 0x8.
     kind == FrameKind::Data && flags & 0x8 == 0
 }
 
-/// Deliver what `data` holds of the DATA payload in progress. Returns the
-/// number of bytes consumed from `data`.
 fn continue_data<H: FrameHandler>(
     partial_data: &mut Option<PartialData>,
     data: &[u8],
@@ -476,9 +412,6 @@ fn continue_data<H: FrameHandler>(
     take
 }
 
-/// Start on an unpadded DATA frame whose header has just been read, with
-/// `available` being everything that follows it. Returns the number of payload
-/// bytes consumed — all of them, or all of `available`.
 #[allow(clippy::too_many_arguments)]
 fn begin_data<H: FrameHandler>(
     hpack: &mut hpack::Decoder,
@@ -506,8 +439,8 @@ fn begin_data<H: FrameHandler>(
         return Ok(length as usize);
     }
 
-    // What `dispatch_frame` checks of a DATA frame, none of which needs the
-    // payload — so a frame it would refuse is refused before any of it lands.
+    // Must mirror `dispatch_frame`'s DATA checks, so a frame it would refuse
+    // is refused before any of it lands.
     handler.on_frame(FrameKind::Data, stream_id, length, flags);
     if header_block.is_some() {
         return report_connection(
@@ -528,8 +461,6 @@ fn begin_data<H: FrameHandler>(
     Ok(continue_data(partial_data, available, handler))
 }
 
-/// Complete a partial frame using bytes from `data`.
-/// Returns the number of bytes consumed from `data`.
 #[allow(clippy::too_many_arguments)]
 fn handle_reassembly<H: FrameHandler>(
     hpack: &mut hpack::Decoder,
@@ -543,7 +474,6 @@ fn handle_reassembly<H: FrameHandler>(
 ) -> Decode<usize> {
     let mut pos = 0;
 
-    // Step 1: ensure we have a full 9-byte header in remaining.
     if remaining.len() < FRAME_HEADER_SIZE {
         let need = FRAME_HEADER_SIZE - remaining.len();
         let copy = data.len().min(need);
@@ -554,24 +484,21 @@ fn handle_reassembly<H: FrameHandler>(
         }
     }
 
-    // Step 2: parse the header.
     let (raw, _) = RawFrameHeader::ref_from_prefix(remaining.as_slice()).unwrap();
     let length = raw.length();
     let kind = FrameKind::from(raw.kind);
     let flags = raw.flags;
     let stream_id = StreamId::from(raw.stream_id());
 
-    // max_frame_size violation: treated as connection-level here regardless of
-    // frame kind. Per RFC §4.2 some cases (e.g. oversized DATA) could be
-    // stream-level, but without trusting the declared length to skip we can't
-    // resync — so we close the connection.
+    // Always connection-level (§4.2 allows stream-level for some kinds): the
+    // declared length can't be trusted to skip and resync.
     if length > max_frame_size {
         return report_connection(handler, FRAME_SIZE_ERROR, "frame exceeds max_frame_size");
     }
     let total = FRAME_HEADER_SIZE + length as usize;
 
     // Only ever a header here: `decode_buf` starts on such a frame rather than
-    // leave its payload behind, so nothing of it was gathered.
+    // leave its payload behind.
     if streams_payload(kind, flags) {
         debug_assert_eq!(remaining.len(), FRAME_HEADER_SIZE);
         remaining.clear();
@@ -589,7 +516,6 @@ fn handle_reassembly<H: FrameHandler>(
         return Ok(pos + consumed);
     }
 
-    // Step 3: gather the rest of the frame into `remaining`.
     let payload_in_remaining = remaining.len() - FRAME_HEADER_SIZE;
     let need_from_data = (length as usize).saturating_sub(payload_in_remaining);
     let available = data.len() - pos;
@@ -616,7 +542,6 @@ fn handle_reassembly<H: FrameHandler>(
     Ok(pos)
 }
 
-/// Decode as many complete frames as possible from `buf`. Returns bytes consumed.
 fn decode_buf<H: FrameHandler>(
     hpack: &mut hpack::Decoder,
     max_frame_size: u32,
@@ -643,8 +568,6 @@ fn decode_buf<H: FrameHandler>(
         }
         let total = FRAME_HEADER_SIZE + length as usize;
         if remaining.len() < total {
-            // The read ends inside this frame. A DATA payload goes to its
-            // stream now rather than wait in `remaining` to be copied twice.
             if streams_payload(kind, flags) {
                 offset += FRAME_HEADER_SIZE
                     + begin_data(
@@ -910,7 +833,6 @@ fn dispatch_frame<H: FrameHandler>(
             if dep_id == stream_id {
                 return report_violation(handler, stream_id, StreamViolation::PrioritySelfDependency);
             }
-            // PRIORITY is validated but not emitted.
         }
 
         FrameKind::PushPromise => {
@@ -924,8 +846,7 @@ fn dispatch_frame<H: FrameHandler>(
     Ok(())
 }
 
-/// Strip the optional pad-length byte and trailing padding from a DATA
-/// payload. Both padding errors are connection-level per §6.1.
+/// Both padding errors are connection-level per §6.1.
 fn strip_data_padding<'a, H: FrameHandler>(
     payload: &'a [u8],
     flags: u8,
@@ -948,8 +869,7 @@ fn strip_data_padding<'a, H: FrameHandler>(
     Ok(&payload[1..payload.len() - pad_len])
 }
 
-/// Errors from parsing the HEADERS frame envelope (padding byte, priority
-/// bits, stream id) — all connection-level.
+/// HEADERS envelope errors are all connection-level.
 fn report_headers_load<H: FrameHandler>(handler: &mut H, e: crate::shared::hpack::Error) -> Decode {
     let message = match e {
         crate::shared::hpack::Error::InvalidStreamId => "HEADERS frame with stream ID 0",
@@ -958,9 +878,8 @@ fn report_headers_load<H: FrameHandler>(handler: &mut H, e: crate::shared::hpack
     report_connection(handler, PROTOCOL_ERROR, message)
 }
 
-/// Errors from HPACK-decoding a complete header block. `MalformedMessage`
-/// (request semantics, e.g. pseudo-header order) is stream-level per §8.1.1;
-/// true decompression failures are connection-level COMPRESSION_ERROR (§4.3).
+/// `MalformedMessage` is stream-level per §8.1.1; decompression failures are
+/// connection-level COMPRESSION_ERROR (§4.3).
 fn report_hpack<H: FrameHandler>(
     handler: &mut H,
     stream_id: StreamId,
@@ -979,7 +898,6 @@ mod tests {
     use super::*;
     use crate::shared::codec::types::ENHANCE_YOUR_CALM;
 
-    /// Records what the decoder dispatches so tests can assert on it.
     #[derive(Default)]
     struct Recorder {
         headers: usize,
@@ -1004,32 +922,25 @@ mod tests {
         }
     }
 
-    /// Append one HTTP/2 frame (9-byte header + payload) to `out`.
     fn push_frame(out: &mut Vec<u8>, kind: u8, flags: u8, stream_id: u32, payload: &[u8]) {
         let len = payload.len() as u32;
-        out.extend_from_slice(&len.to_be_bytes()[1..]); // 24-bit length
+        out.extend_from_slice(&len.to_be_bytes()[1..]);
         out.push(kind);
         out.push(flags);
         out.extend_from_slice(&stream_id.to_be_bytes());
         out.extend_from_slice(payload);
     }
 
-    /// CONTINUATION flood (CVE-2024-27316): a HEADERS frame without END_HEADERS
-    /// followed by an unbounded stream of CONTINUATION frames that never set
-    /// END_HEADERS must be rejected once the accumulated block exceeds the cap,
-    /// rather than buffered without limit.
+    /// CVE-2024-27316.
     #[test]
     fn continuation_flood_is_rejected() {
         const HEADERS: u8 = 0x1;
         const CONTINUATION: u8 = 0x9;
-        let frame_payload = vec![0u8; DEFAULT_MAX_FRAME_SIZE as usize]; // ≤ max_frame_size
+        let frame_payload = vec![0u8; DEFAULT_MAX_FRAME_SIZE as usize];
 
         let mut input = Vec::new();
         input.extend_from_slice(CLIENT_PREFACE);
-        // HEADERS on stream 1, no END_HEADERS → opens an incomplete header block.
         push_frame(&mut input, HEADERS, 0x0, 1, &frame_payload);
-        // Enough CONTINUATIONs (also no END_HEADERS) to blow past the cap.
-        // Cap / frame_size, rounded up, plus slack.
         let n = MAX_HEADER_BLOCK_SIZE / frame_payload.len() + 4;
         for _ in 0..n {
             push_frame(&mut input, CONTINUATION, 0x0, 1, &frame_payload);
@@ -1046,28 +957,23 @@ mod tests {
         );
         assert_eq!(rec.headers, 0, "block never completes, so no headers dispatched");
 
-        // After a connection error the decoder is poisoned: further input — even
-        // more flood — is ignored, so memory cannot keep growing.
+        // Poisoned: further flood is ignored, so memory cannot keep growing.
         let mut more = Vec::new();
         push_frame(&mut more, CONTINUATION, 0x0, 1, &frame_payload);
         decoder.decode_with(&more, &mut rec);
         assert_eq!(rec.errors.len(), 1, "poisoned decoder raises no further errors");
     }
 
-    /// A header block that stays under the cap and ends with END_HEADERS must
-    /// still decode normally — the cap must not reject legitimate traffic.
     #[test]
     fn small_header_block_with_continuation_is_accepted() {
         const HEADERS: u8 = 0x1;
         const CONTINUATION: u8 = 0x9;
         const END_HEADERS: u8 = 0x4;
 
-        // A single indexed header field (":method: GET" = static index 2),
-        // split HEADERS (empty) + CONTINUATION (the byte) to exercise reassembly.
         let mut input = Vec::new();
         input.extend_from_slice(CLIENT_PREFACE);
         push_frame(&mut input, HEADERS, 0x0, 1, &[]);
-        push_frame(&mut input, CONTINUATION, END_HEADERS, 1, &[0x82]); // 0x82 = indexed 2
+        push_frame(&mut input, CONTINUATION, END_HEADERS, 1, &[0x82]);
 
         let mut rec = Recorder::default();
         let mut decoder = FrameDecoder::new();
@@ -1076,10 +982,8 @@ mod tests {
         assert!(rec.errors.is_empty(), "valid small block must not error: {:?}", rec.errors);
         assert_eq!(rec.headers, 1, "the reassembled block must be dispatched once");
     }
-    /// What the decoder says about DATA, call by call.
     #[derive(Default)]
     struct DataRecorder {
-        /// `(stream, payload, padded_len, end_stream)` per `on_data`.
         calls: Vec<(u32, Vec<u8>, usize, bool)>,
         data_frames: usize,
         pings: usize,
@@ -1127,9 +1031,8 @@ mod tests {
         (0..len).map(|i| i as u8).collect()
     }
 
-    /// A DATA frame cut anywhere — inside its header, right after it, inside
-    /// its payload — reaches the stream whole, in order and once, and none of
-    /// the payload is parked in `remaining` on the way.
+    /// Reaches the stream whole, in order and once, and none of the payload is
+    /// parked in `remaining` on the way.
     #[test]
     fn a_data_frame_cut_anywhere_is_delivered_in_pieces() {
         let payload = body(300);
@@ -1173,7 +1076,6 @@ mod tests {
         }
     }
 
-    /// The worst a peer or a network can do to the framing.
     #[test]
     fn a_data_frame_fed_a_byte_at_a_time_adds_up() {
         let payload = body(64);
@@ -1194,8 +1096,7 @@ mod tests {
         assert_eq!((rec.data_frames, rec.pings), (1, 1));
     }
 
-    /// Padding is at the far end of the frame, so a padded one is still
-    /// gathered whole: one call, the body alone, flow control for all of it.
+    /// One call, the body alone, flow control for all of it.
     #[test]
     fn a_padded_data_frame_is_still_delivered_whole() {
         let mut framed = vec![4u8];
@@ -1215,7 +1116,6 @@ mod tests {
         }
     }
 
-    /// A frame that would be refused whole is refused before any of it lands.
     #[test]
     fn a_partial_data_frame_on_stream_zero_delivers_nothing() {
         let mut input = Vec::new();

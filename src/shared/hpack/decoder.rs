@@ -12,53 +12,25 @@ use std::collections::VecDeque;
 use std::io::Cursor;
 use std::str::Utf8Error;
 
-/// Decodes headers using HPACK
 #[derive(Debug)]
 pub struct Decoder {
     /// Largest dynamic-table size the peer may set (what we advertise as
-    /// SETTINGS_HEADER_TABLE_SIZE; fixed at the default).
+    /// SETTINGS_HEADER_TABLE_SIZE).
     last_max_update: usize,
-    /// §2.3.2: the dynamic table, which is connection state and stays here —
-    /// what the peer indexes against depends on every block it has sent.
+    /// §2.3.2: connection state — depends on every block the peer has sent.
     table: Table,
 }
 
-/// The two arenas a decode carves from: one set per worker, not one per
-/// connection.
-///
-/// Both are the same trick. An HPACK block arrives in a ring buffer that is
-/// owed straight back, while the values decoded out of it must outlive the
-/// request, so the block is copied once into memory we own and every field is
-/// then a refcounted slice of that copy — one copy per block instead of one
-/// allocation per field. [`Scratch::buffer`] does the same for huffman-coded
-/// strings, which cannot be slices of the input at all because they have to be
-/// decompressed somewhere.
-///
-/// Neither holds anything *between* calls: a decode appends and hands out
-/// slices, and it is the slices that keep the memory alive. So there is nothing
-/// per-connection about them — on a thread per core, no two connections decode
-/// at once — and owning them per connection cost 8 KiB apiece, pinned for the
-/// life of every connection whether or not it ever sent a header again. Shared,
-/// that measured 20.9 KiB down to 12.9 KiB per connection at 20 000 of them:
-/// 408 MB to 251 MB, for no throughput difference this machine could resolve.
-///
-/// What the worst case becomes is worth stating, because it is the obvious
-/// objection. A live header set pins the whole chunk it was carved from, and
-/// chunks are now shared, so one long-lived stream can pin bytes that other
-/// connections carved beside it. The amount is bounded by the chunk, and if
-/// every live header set pinned a chunk of its own, the cost would be one per
-/// header set — which is exactly what is paid *today, always, per connection*.
-/// The trade improves the common case and cannot lose the pathological one.
+/// Shared per worker, not per connection. Neither arena holds anything
+/// *between* calls: the slices handed out keep the memory alive.
 ///
 /// Slices from different connections therefore live in one allocation. Each
-/// holds only its own range and `Bytes` hands out no way to reach a neighbour,
-/// so this is a matter of when memory is released rather than of who can read
-/// what.
+/// holds only its own range and `Bytes` gives no way to reach a neighbour, so
+/// this affects when memory is released, not who can read what. A live header
+/// set can pin at most one chunk.
 #[derive(Debug)]
 struct Scratch {
-    /// Huffman output, decompressed here and split out as it is produced.
     buffer: BytesMut,
-    /// Staging for the compressed header blocks, see [`Decoder::stage`].
     input: BytesMut,
 }
 
@@ -69,14 +41,9 @@ thread_local! {
     });
 }
 
-/// The huffman arena, borrowed for the length of one decode.
-///
-/// Taken out of the thread-local rather than borrowed from it, so that no
-/// `RefCell` guard is alive while the caller's callback runs — a callback that
-/// decoded something itself would otherwise panic, and the callback is the
-/// caller's code, not ours. It goes back however the decode ends, which is what
-/// the `Drop` is for: a block that fails halfway out is the common case, not an
-/// exotic one.
+/// Taken out of the thread-local rather than borrowed, so no `RefCell` guard
+/// is alive while the caller's callback runs (a callback that decoded would
+/// panic). `Drop` puts it back however the decode ends.
 struct Lent(BytesMut);
 
 impl Lent {
@@ -91,28 +58,19 @@ impl Drop for Lent {
     }
 }
 
-/// Chunk size the header blocks are staged in.
-///
-/// A refill unit, not a limit: a block that does not fit in what is left of the
-/// current chunk gets a fresh one, and the old chunk lives on as long as any
-/// slice carved from it. Nothing is grown and nothing is compacted — compacting
-/// would mean moving bytes that live `Bytes` point at. A block larger than this
-/// takes a chunk of its own size; the frame decoder caps that at
-/// `MAX_HEADER_BLOCK_SIZE`.
+/// A refill unit, not a limit. Nothing is compacted — that would move bytes
+/// live `Bytes` point at. A larger block takes a chunk of its own size, capped
+/// by the frame decoder at `MAX_HEADER_BLOCK_SIZE`.
 const STAGE_CAPACITY: usize = 4096;
 
-/// Represents all errors that can be encountered while performing the decoding
-/// of an HPACK header set.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum DecoderError {
     InvalidRepresentation,
     InvalidIntegerPrefix,
     InvalidTableIndex,
     InvalidHuffmanCode,
-    /// A field HTTP refuses (§8.2.1, §8.3): its name or its value. Unlike
-    /// every other error here it is not a decompression failure — the block
-    /// was decoded to its end regardless and the table is in sync — so it is
-    /// the message that is malformed, not the connection.
+    /// §8.2.1, §8.3. Not a decompression failure: the block was decoded to its
+    /// end and the table is in sync, so only the message is malformed.
     InvalidField,
     InvalidMaxDynamicSize,
     IntegerOverflow,
@@ -127,93 +85,11 @@ pub enum NeedMore {
 }
 
 enum Representation {
-    /// Indexed header field representation
-    ///
-    /// An indexed header field representation identifies an entry in either the
-    /// static table or the dynamic table (see Section 2.3).
-    ///
-    /// # Header encoding
-    ///
-    /// ```text
-    ///   0   1   2   3   4   5   6   7
-    /// +---+---+---+---+---+---+---+---+
-    /// | 1 |        Index (7+)         |
-    /// +---+---------------------------+
-    /// ```
     Indexed,
-
-    /// Literal Header Field with Incremental Indexing
-    ///
-    /// A literal header field with incremental indexing representation results
-    /// in appending a header field to the decoded header list and inserting it
-    /// as a new entry into the dynamic table.
-    ///
-    /// # Header encoding
-    ///
-    /// ```text
-    ///   0   1   2   3   4   5   6   7
-    /// +---+---+---+---+---+---+---+---+
-    /// | 0 | 1 |      Index (6+)       |
-    /// +---+---+-----------------------+
-    /// | H |     Value Length (7+)     |
-    /// +---+---------------------------+
-    /// | Value String (Length octets)  |
-    /// +-------------------------------+
-    /// ```
     LiteralWithIndexing,
-
-    /// Literal Header Field without Indexing
-    ///
-    /// A literal header field without indexing representation results in
-    /// appending a header field to the decoded header list without altering the
-    /// dynamic table.
-    ///
-    /// # Header encoding
-    ///
-    /// ```text
-    ///   0   1   2   3   4   5   6   7
-    /// +---+---+---+---+---+---+---+---+
-    /// | 0 | 0 | 0 | 0 |  Index (4+)   |
-    /// +---+---+-----------------------+
-    /// | H |     Value Length (7+)     |
-    /// +---+---------------------------+
-    /// | Value String (Length octets)  |
-    /// +-------------------------------+
-    /// ```
     LiteralWithoutIndexing,
-
-    /// Literal Header Field Never Indexed
-    ///
-    /// A literal header field never-indexed representation results in appending
-    /// a header field to the decoded header list without altering the dynamic
-    /// table. Intermediaries MUST use the same representation for encoding this
-    /// header field.
-    ///
-    /// ```text
-    ///   0   1   2   3   4   5   6   7
-    /// +---+---+---+---+---+---+---+---+
-    /// | 0 | 0 | 0 | 1 |  Index (4+)   |
-    /// +---+---+-----------------------+
-    /// | H |     Value Length (7+)     |
-    /// +---+---------------------------+
-    /// | Value String (Length octets)  |
-    /// +-------------------------------+
-    /// ```
+    /// §6.2.3: intermediaries MUST use the same representation for encoding it.
     LiteralNeverIndexed,
-
-    /// Dynamic Table Size Update
-    ///
-    /// A dynamic table size update signals a change to the size of the dynamic
-    /// table.
-    ///
-    /// # Header encoding
-    ///
-    /// ```text
-    ///   0   1   2   3   4   5   6   7
-    /// +---+---+---+---+---+---+---+---+
-    /// | 0 | 0 | 1 |   Max size (5+)   |
-    /// +---+---------------------------+
-    /// ```
     SizeUpdate,
 }
 
@@ -224,18 +100,12 @@ struct Table {
     max_size: usize,
 }
 
-/// What a dynamic-table slot holds. HPACK indexes what the peer sent, not
-/// what HTTP accepts: a field we refuse still takes its place in the table,
-/// or every index the peer uses after it points one entry off.
+/// HPACK indexes what the peer sent, not what HTTP accepts: a field we refuse
+/// still takes its place in the table, or every later index points one off.
 #[derive(Debug, Clone)]
 enum Entry {
     Field(Header),
-    /// Kept raw, for its size and for its name: the peer may reuse the name
-    /// with a value that is fine.
-    Invalid {
-        name: Bytes,
-        value: Bytes,
-    },
+    Invalid { name: Bytes, value: Bytes },
 }
 
 impl Entry {
@@ -246,8 +116,6 @@ impl Entry {
         }
     }
 
-    /// The field under this entry's name with another value, as a literal
-    /// with an indexed name makes.
     fn with_value(&self, value: Bytes) -> Entry {
         match self {
             Entry::Field(header) => match header.name().into_entry(&value) {
@@ -261,7 +129,7 @@ impl Entry {
         }
     }
 
-    /// §4.1: name, value and 32 octets, whether we accepted it or not.
+    /// §4.1: whether we accepted it or not.
     fn len(&self) -> usize {
         match self {
             Entry::Field(header) => header.len(),
@@ -276,10 +144,7 @@ struct StringMarker {
     string: Option<Bytes>,
 }
 
-// ===== impl Decoder =====
-
 impl Decoder {
-    /// Creates a new `Decoder` with all settings set to default values.
     pub fn new(size: usize) -> Decoder {
         Decoder {
             last_max_update: size,
@@ -287,18 +152,10 @@ impl Decoder {
         }
     }
 
-    /// Copy a compressed header block into the staging buffer and hand out that
-    /// slice, to be decoded from.
-    ///
-    /// A buffer per frame would cost two allocations each: the buffer, and the
-    /// promotion to a shared one that the first `split_to` of the decode forces.
-    /// Refilling by the chunk amortizes both over every block a chunk holds.
     pub fn stage(&mut self, payload: &[u8]) -> BytesMut {
         SCRATCH.with(|scratch| {
-            // After a `split`, `capacity` is what is left of the chunk. Too
-            // little for this block and the chunk is let go rather than grown:
-            // whatever was carved from it holds it alive, and the copy below
-            // has somewhere contiguous to land.
+            // Too little left and the chunk is let go rather than grown:
+            // whatever was carved from it holds it alive.
             let input = &mut scratch.borrow_mut().input;
             if input.capacity() < payload.len() {
                 *input = BytesMut::with_capacity(payload.len().max(STAGE_CAPACITY));
@@ -308,7 +165,6 @@ impl Decoder {
         })
     }
 
-    /// Decodes the headers found in the given buffer.
     pub fn decode<F>(
         &mut self,
         src: &mut Cursor<&mut BytesMut>,
@@ -319,12 +175,10 @@ impl Decoder {
     {
         use self::Representation::*;
 
-        // Once per block rather than once per string: the arena comes out of
-        // the thread-local here and goes back when `huff` drops.
         let mut huff = Lent::take();
         let mut can_resize = true;
         // A refused field does not stop the decode: what follows it still
-        // has to reach the table. It is reported once the block is done.
+        // has to reach the table.
         let mut invalid = false;
         let mut emit = |entry: Entry| match entry {
             Entry::Field(header) => f(header),
@@ -332,9 +186,7 @@ impl Decoder {
         };
 
         while let Some(ty) = peek_u8(src) {
-            // At this point we are always at the beginning of the next block
-            // within the HPACK data. The type of the block can always be
-            // determined from the first byte.
+            // Always at the start of a representation here.
             match Representation::load(ty)? {
                 Indexed => {
                     can_resize = false;
@@ -346,7 +198,6 @@ impl Decoder {
                     can_resize = false;
                     let entry = self.decode_literal(src, true, &mut huff.0)?;
 
-                    // Insert the header into the table
                     self.table.insert(entry.clone());
                     consume(src);
 
@@ -372,7 +223,6 @@ impl Decoder {
                         return Err(DecoderError::InvalidMaxDynamicSize);
                     }
 
-                    // Handle the dynamic table size update
                     self.process_size_update(src)?;
                     consume(src);
                 }
@@ -410,16 +260,13 @@ impl Decoder {
     ) -> Result<Entry, DecoderError> {
         let prefix = if index { 6 } else { 4 };
 
-        // Extract the table index for the name, or 0 if not indexed
         let table_idx = decode_int(buf, prefix)?;
 
-        // First, read the header name
         if table_idx == 0 {
             let old_pos = buf.position();
             let name_marker = self.try_decode_string(buf, huff)?;
             let value_marker = self.try_decode_string(buf, huff)?;
             buf.set_position(old_pos);
-            // Read the name as a literal
             let name = name_marker.consume(buf);
             let value = value_marker.consume(buf);
             Ok(Entry::new(name, value))
@@ -439,13 +286,11 @@ impl Decoder {
         let old_pos = buf.position();
         const HUFF_FLAG: u8 = 0b1000_0000;
 
-        // The first bit in the first byte contains the huffman encoded flag.
         let huff = match peek_u8(buf) {
             Some(hdr) => (hdr & HUFF_FLAG) == HUFF_FLAG,
             None => return Err(DecoderError::NeedMore(NeedMore::UnexpectedEndOfStream)),
         };
 
-        // Decode the string length using 7 bit prefix
         let len = decode_int(buf, 7)?;
 
         if len > buf.remaining() {
@@ -493,8 +338,6 @@ impl Default for Decoder {
     }
 }
 
-// ===== impl Representation =====
-
 impl Representation {
     pub fn load(byte: u8) -> Result<Representation, DecoderError> {
         const INDEXED: u8 = 0b1000_0000;
@@ -503,8 +346,6 @@ impl Representation {
         const LITERAL_NEVER_INDEXED: u8 = 0b0001_0000;
         const SIZE_UPDATE_MASK: u8 = 0b1110_0000;
         const SIZE_UPDATE: u8 = 0b0010_0000;
-
-        // TODO: What did I even write here?
 
         if byte & INDEXED == INDEXED {
             Ok(Representation::Indexed)
@@ -523,9 +364,7 @@ impl Representation {
 }
 
 fn decode_int<B: Buf>(buf: &mut B, prefix_size: u8) -> Result<usize, DecoderError> {
-    // The octet limit is chosen such that the maximum allowed *value* can
-    // never overflow an unsigned 32-bit integer. The maximum value of any
-    // integer that can be encoded with 5 octets is ~2^28
+    // Bounds the value (~2^28 at 5 octets) so it can never overflow a u32.
     const MAX_BYTES: usize = 5;
     const VARINT_MASK: u8 = 0b0111_1111;
     const VARINT_FLAG: u8 = 0b1000_0000;
@@ -547,18 +386,11 @@ fn decode_int<B: Buf>(buf: &mut B, prefix_size: u8) -> Result<usize, DecoderErro
     let mut ret = (buf.get_u8() & mask) as usize;
 
     if ret < mask as usize {
-        // Value fits in the prefix bits
         return Ok(ret);
     }
 
-    // The int did not fit in the prefix bits, so continue reading.
-    //
-    // The total number of bytes used to represent the int. The first byte was
-    // the prefix, so start at 1.
     let mut bytes = 1;
 
-    // The rest of the int is stored as a varint -- 7 bits for the value and 1
-    // bit to indicate if it is the last byte.
     let mut shift = 0;
 
     while buf.has_remaining() {
@@ -611,13 +443,9 @@ impl StringMarker {
 }
 
 fn consume(buf: &mut Cursor<&mut BytesMut>) {
-    // remove bytes from the internal BytesMut when they have been successfully
-    // decoded. This is a more permanent cursor position, which will be
-    // used to resume if decoding was only partial.
+    // Commits the cursor: decoding resumes from here if it was only partial.
     take(buf, 0);
 }
-
-// ===== impl Table =====
 
 impl Table {
     fn new(max_size: usize) -> Table {
@@ -633,14 +461,7 @@ impl Table {
         self.size
     }
 
-    /// Returns the entry located at the given index.
-    ///
-    /// The table is 1-indexed and constructed in such a way that the first
-    /// entries belong to the static table, followed by entries in the dynamic
-    /// table. They are merged into a single index address space, though.
-    ///
-    /// This is according to the [HPACK spec, section 2.3.3.]
-    /// (http://http2.github.io/http2-spec/compression.html#index.address.space)
+    /// §2.3.3: 1-indexed, static entries then dynamic, one address space.
     fn get(&self, index: usize) -> Result<Entry, DecoderError> {
         if index == 0 {
             return Err(DecoderError::InvalidTableIndex);
@@ -650,7 +471,6 @@ impl Table {
             return Ok(Entry::Field(get_static(index)));
         }
 
-        // Convert the index for lookup in the entries structure.
         match self.entries.get(index - 62) {
             Some(e) => Ok(e.clone()),
             None => Err(DecoderError::InvalidTableIndex),
@@ -665,14 +485,12 @@ impl Table {
         if self.size + len <= self.max_size {
             self.size += len;
 
-            // Track the entry
             self.entries.push_front(entry);
         }
     }
 
     fn set_max_size(&mut self, size: usize) {
         self.max_size = size;
-        // Make the table size fit within the new constraints.
         self.consolidate();
     }
 
@@ -706,11 +524,6 @@ impl Table {
         }
     }
 }
-
-// ===== impl DecoderError =====
-//
-// Every way HTTP refuses a name or a value is the same error: the answer —
-// the stream is malformed — does not depend on which rule it broke.
 
 impl From<Utf8Error> for DecoderError {
     fn from(_: Utf8Error) -> DecoderError {
@@ -748,7 +561,6 @@ impl From<DecoderError> for Error {
     }
 }
 
-/// Get an entry from the static table
 pub fn get_static(idx: usize) -> Header {
     use http::header::HeaderValue;
 
@@ -963,10 +775,7 @@ pub fn get_static(idx: usize) -> Header {
 mod arena {
     use super::*;
 
-    /// The huffman arena is the worker's, not the connection's, so a string
-    /// that fails to decode on one connection must leave nothing in it: what
-    /// it left would come out in front of the next string decoded on this
-    /// thread, which belongs to somebody else.
+    /// The huffman arena is shared by every connection on the worker.
     #[test]
     fn a_failed_huffman_string_leaves_nothing_for_the_next_decoder() {
         fn block(huffman: &[u8]) -> BytesMut {
@@ -1004,9 +813,6 @@ mod arena {
         assert_eq!(path.as_deref(), Some("/ok"));
     }
 
-    /// One chunk for every connection on the worker, which is the whole point:
-    /// two decoders that know nothing of each other carve from the same
-    /// allocation, one after the other.
     #[test]
     fn two_decoders_carve_from_the_same_chunk() {
         let mut one = Decoder::new(4096);
@@ -1015,9 +821,6 @@ mod arena {
         let first = one.stage(&[1, 2, 3, 4]);
         let second = two.stage(&[5, 6, 7, 8]);
 
-        // Addresses rather than pointers: what is being asserted is adjacency
-        // in one allocation, and comparing them as integers says exactly that
-        // without reaching past either slice.
         assert_eq!(
             first.as_ptr() as usize + first.len(),
             second.as_ptr() as usize,
@@ -1025,10 +828,6 @@ mod arena {
         );
     }
 
-    /// What "the arena is full" does: nothing announces it, nothing fails, and
-    /// what was lent before the rollover stays readable — those slices hold the
-    /// old chunk alive themselves. Nothing is grown and nothing is compacted,
-    /// because compacting would move bytes that live `Bytes` point at.
     #[test]
     fn a_full_chunk_is_replaced_and_what_it_lent_survives() {
         let mut de = Decoder::new(4096);
@@ -1039,7 +838,6 @@ mod arena {
             kept.push(de.stage(&block));
         }
 
-        // The fifth no longer fits in what is left of a 4096-byte chunk.
         let after = de.stage(&vec![b'b'; 1000]);
         assert_ne!(
             kept[0].as_ptr() as usize + 4000,
@@ -1052,13 +850,10 @@ mod arena {
         }
         assert!(after.iter().all(|&b| b == b'b'));
 
-        // And the old chunk dies with its last slice, not with the rollover.
         drop(kept);
         assert!(after.iter().all(|&b| b == b'b'));
     }
 
-    /// §6.10 lets a block outgrow the refill size; it takes a chunk of its own
-    /// rather than being refused or split.
     #[test]
     fn a_block_larger_than_the_refill_size_gets_its_own_chunk() {
         let mut de = Decoder::new(4096);
@@ -1143,10 +938,8 @@ mod test {
         let mut de = Decoder::new(0);
         let value = huff_encode(b"bar");
         let mut buf = BytesMut::new();
-        // header name is non_huff encoded
         buf.extend([0b01000000, 3]);
         buf.extend(b"foo");
-        // header value is partial
         buf.extend([0x80 | 3]);
         buf.extend(&value[0..1]);
 
@@ -1156,10 +949,8 @@ mod test {
                 res.push(h);
             })
             .unwrap_err();
-        // decode error because the header value is partial
         assert_eq!(e, DecoderError::NeedMore(NeedMore::StringUnderflow));
 
-        // extend buf with the remaining header value
         buf.extend(&value[1..]);
         de.decode(&mut Cursor::new(&mut buf), |h| {
             res.push(h);
@@ -1181,7 +972,6 @@ mod test {
         }
     }
 
-    /// Decodes one block, returning what it emitted and how it ended.
     fn decode_block(de: &mut Decoder, block: &[u8]) -> (Vec<Header>, Result<(), DecoderError>) {
         let mut buf = BytesMut::from(block);
         let mut fields = vec![];
@@ -1189,8 +979,6 @@ mod test {
         (fields, res)
     }
 
-    /// A literal with incremental indexing, new name, neither string
-    /// huffman-coded.
     fn indexed_literal(name: &[u8], value: &[u8]) -> Vec<u8> {
         let mut block = vec![0x40, name.len() as u8];
         block.extend_from_slice(name);
@@ -1199,9 +987,7 @@ mod test {
         block
     }
 
-    /// A field we refuse still takes its slot in the dynamic table, or the
-    /// peer's indexes and ours part ways and every later block on the
-    /// connection decodes to the wrong fields.
+    /// Otherwise the peer's indexes and ours part ways.
     #[test]
     fn a_refused_field_still_takes_its_place_in_the_table() {
         let mut de = Decoder::new(4096);
@@ -1221,8 +1007,7 @@ mod test {
         let (_, res) = decode_block(&mut de, &[0x80 | 63]);
         assert_eq!(res, Err(DecoderError::InvalidField));
 
-        // The refused entry's name, with a value that is fine: a field like
-        // any other. Name index 63 overflows the 4-bit prefix: 15, then 48.
+        // Name index 63 overflows the 4-bit prefix: 15, then 48.
         let (fields, res) = decode_block(&mut de, &[0x0f, 48, 4, b'f', b'i', b'n', b'e']);
         assert_eq!(res, Ok(()));
         assert!(
@@ -1230,8 +1015,6 @@ mod test {
         );
     }
 
-    /// §8.2.1 and the URI grammar, one refusal each: what the decoder turns
-    /// into `InvalidField` rather than into a field.
     #[test]
     fn fields_http_refuses_are_invalid_fields() {
         let refused: [&[u8]; 8] = [
@@ -1260,9 +1043,7 @@ mod test {
         }
     }
 
-    /// What is wrong with the encoding, not with the field, is still a
-    /// decompression failure: there is no telling where the next field
-    /// starts.
+    /// There is no telling where the next field starts.
     #[test]
     fn a_bad_encoding_is_not_an_invalid_field() {
         // `:path`, huffman-coded, as a lone EOS.

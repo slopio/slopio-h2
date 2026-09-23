@@ -2,21 +2,12 @@
 //!
 //!     cargo run --release --example bench_server          # in one terminal
 //!     cargo run --release --example client                # in another
-//!
-//! `ADDR` overrides the default of `127.0.0.1:8080` and `TARGET` the request
-//! path, so this also points at anything else speaking cleartext h2 with
-//! prior knowledge. `BODY` makes it a POST carrying that text, which is the
-//! other half of the stream API:
-//!
-//!     BODY=hello TARGET=/echo cargo run --release --example client
 
 use std::net::SocketAddr;
 
 use popple_h2::client;
 use runtime::main_thread_with;
 
-// Smaller than the server's: a client holding one connection has nothing to
-// share the ring with.
 runtime::define_buf_ring!(ClientRing, bgid = 1, buffer_size = 16384, ring_size = 64);
 
 fn main() {
@@ -49,8 +40,7 @@ fn main() {
         println!("    header_table_size       {}", peer.header_table_size);
         println!("    enable_push             {}", peer.enable_push);
 
-        // §8.1: with no body, the head ends the stream. With one, it does
-        // not, and the last `write` is what does.
+        // §8.1: with no body, the head ends the stream.
         let method = if body.is_some() { "POST" } else { "GET" };
         let request = http::Request::builder()
             .method(method)
@@ -63,9 +53,6 @@ fn main() {
         };
         println!("  sent a {method} on stream {}", u32::from(stream.id()));
 
-        // In two writes, because a body does not have to be in one place to
-        // be one message — each is its own DATA frame, and only the last
-        // carries END_STREAM.
         if let Some(body) = &body {
             let (first, rest) = body.split_at(body.len() / 2);
             for (chunk, last) in [(first, false), (rest, true)] {
@@ -85,8 +72,8 @@ fn main() {
             println!("    {name}: {}", value.to_str().unwrap_or("<binary>"));
         }
 
-        // Body, a chunk at a time. Taking a chunk is what credits the peer
-        // for it, so a reader that stops reading stops the download.
+        // Taking a chunk is what credits the peer for it, so a reader that
+        // stops reading stops the download.
         let mut received = 0usize;
         loop {
             match stream.read().await {
@@ -97,8 +84,6 @@ fn main() {
         }
         println!("  read {received} bytes of body");
 
-        // Done with the connection: no more requests, the loop finishes what
-        // is on it and says goodbye, and this is where that end is heard.
         drop(stream);
         client.close();
         match client.closed().await {

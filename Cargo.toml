@@ -3,22 +3,13 @@ name = "popple-h2"
 version = "0.1.0"
 edition = "2024"
 
-# `grpc` is everything under `src/grpc` and the few places a stream hands a
-# body to it: requests with `content-type: application/grpc` are read as
-# messages. Without it they are HTTP bodies like any other.
 [features]
 default = ["grpc"]
 grpc = ["dep:prost"]
 
-# `tls` is the kTLS transport and the two entry points that build one: a
-# server that hands its accepted sockets to a TLS handshake, and a client that
-# dials one. Off by default because it is not free — rustls and aws-lc-rs are
-# the largest thing this crate would ever compile — and a build that speaks
-# h2c carries no trace of it.
+# Off by default: rustls and aws-lc-rs are the largest thing this would compile.
 tls = ["dep:popple-tls"]
 
-# The one example that needs the feature it demonstrates. Declaring a target
-# does not turn off discovery of the others, which stay conventional.
 [[example]]
 name = "grpc_server"
 path = "examples/grpc_server/main.rs"
@@ -34,8 +25,6 @@ name = "tls_client"
 path = "examples/tls_client.rs"
 required-features = ["tls"]
 
-# The pair a load test is run with: a service to measure, and the thing that
-# measures it. Two processes, so they can be given a core each.
 [[example]]
 name = "helloworld_server"
 path = "examples/helloworld_server.rs"
@@ -50,45 +39,30 @@ required-features = ["grpc"]
 bytes = "1"
 fnv = "1"
 http = "1"
-# What `application/grpc` means by default is `+proto`, so the feature that
-# reads gRPC messages is also the one that decodes them. Without `derive` —
-# that half is `prost-derive`, a proc macro, and it is the *caller* who derives
-# `Message` on its own types. Here we only ever decode into someone else's.
+# Without `derive`: the library only decodes into its callers' types.
 prost = { version = "0.14", default-features = false, features = [
     "std",
 ], optional = true }
-# The TLS transport, and only under `tls`. It brings rustls and aws-lc-rs with
-# it, which is the whole reason the feature exists.
 popple-tls = { git = "ssh://git@github.com/saucisoupe/popple-tls.git", optional = true }
 runtime = { git = "ssh://git@github.com/saucisoupe/runtime.git", version = "0.1.0" }
 runtime-streams = { git = "ssh://git@github.com/saucisoupe/runtime.git" }
 rustc-hash = "2.1.3"
 zerocopy = { version = "0.8", features = ["derive"] }
 
-# The simulated ring, for deterministic tests. A dev-dependency, so a release
-# build carries no trace of it: with `simulation` off, the driver's backend
-# enums have a single variant each and their dispatch compiles away.
-#
-# `runtime-core` is named directly because `runtime` does not re-export
-# `deterministic_testing`; the feature is what `runtime/simulation` forwards.
+# `simulation` stays a dev-dependency, so a release build carries no trace of it.
 [dev-dependencies]
 libc = "0.2"
-# The TLS integration test needs a certificate to serve and the rustls types
-# to hand one over with. Both ride in with `popple-tls` in a real build; here
-# they are the test's own.
 rcgen = { version = "0.13", features = ["aws_lc_rs"] }
 rustls = "0.23"
-# Mozilla's root store, bundled. A dev-dependency because it is the
-# *example's* answer to "who do you trust", not the library's: a real client
-# picks its roots — these, the OS store, or a pinned CA of its own.
+# A dev-dependency: which roots to trust is the application's choice.
 webpki-roots = "1"
 
-# With `derive` here: the tests are a caller, and a caller defines its own
-# messages.
+# With `derive` here: the tests are a caller, and define their own messages.
 prost = { version = "0.14", features = ["derive"] }
 runtime = { git = "ssh://git@github.com/saucisoupe/runtime.git", version = "0.1.0", features = [
     "simulation",
 ] }
+# Named directly: `runtime` does not re-export `deterministic_testing`.
 runtime-core = { git = "ssh://git@github.com/saucisoupe/runtime.git", features = [
     "simulation",
 ] }

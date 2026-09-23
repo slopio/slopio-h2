@@ -1,8 +1,4 @@
 //! `grpc.testing`, generated from `proto/` by `prost-build` and committed.
-//!
-//! Committed rather than generated at build time: an example cannot carry its
-//! own `build.rs`, and putting `prost-build` and `protoc` in the way of
-//! everyone who builds this crate to serve one example would be a poor trade.
 //! Regenerate it with `prost_build::Config::new().compile_protos(...)` over
 //! `proto/` if those ever change.
 #![allow(clippy::doc_lazy_continuation)]

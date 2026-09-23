@@ -3,22 +3,13 @@ use std::time::Duration;
 use http::HeaderMap;
 
 /// The longest one `Sleep` will take. The runtime's timewheel holds a minute
-/// and `unimplemented!`s past it, and this leaves room under that rather than
-/// naming a number the runtime does not export. A deadline beyond it is slept
-/// off in slices, which costs one wake-up per slice — nothing against an hour.
+/// and `unimplemented!`s past it.
 const SLICE: Duration = Duration::from_secs(30);
 
-/// §5's `grpc-timeout`: how long the *call* has left, sent by the client in
-/// its HEADERS. At most eight digits and a unit.
+/// §5's `grpc-timeout`: at most eight digits and a unit.
 ///
-/// A duration and not an instant, because clocks between two machines say
-/// nothing to each other. What it buys is propagation: a server that calls
-/// other services passes on what is *left*, so a chain of five hops cannot
-/// each restart the budget.
-///
-/// `None` is no deadline, which is a call that may run as long as it likes —
-/// and an unreadable one, since §5 gives no way to answer a malformed timeout
-/// and a call refused for a header it did not have to send would be worse.
+/// An unreadable one is `None`, no deadline: §5 gives no way to answer a
+/// malformed timeout.
 pub fn parse_timeout(fields: &HeaderMap) -> Option<Duration> {
     let value = fields.get("grpc-timeout")?.as_bytes();
     let (unit, digits) = value.split_last()?;
@@ -39,11 +30,8 @@ pub fn parse_timeout(fields: &HeaderMap) -> Option<Duration> {
     })
 }
 
-/// Sleeps `duration`, however long it is.
-///
-/// [`Sleep`](runtime::runtime::time::Sleep) holds up to a minute and panics
-/// past it, so anything longer is taken in slices. Each slice re-reads the
-/// clock, so the slicing cannot drift the deadline later than it was.
+/// `Sleep` panics past a minute, so anything longer is taken in slices. Each
+/// slice re-reads the clock, so the slicing cannot drift the deadline later.
 pub async fn sleep(duration: Duration) {
     let deadline = runtime::runtime::now() + duration;
     loop {
@@ -83,9 +71,6 @@ mod tests {
         assert_eq!(parse_timeout(&HeaderMap::new()), None);
     }
 
-    /// Unreadable is treated as absent: §5 gives no way to answer a malformed
-    /// timeout, and refusing a call over a header it need not have sent at all
-    /// would be the worse failure.
     #[test]
     fn what_cannot_be_read_is_no_deadline() {
         for value in ["", "S", "10", "10X", "-1S", "1.5S", "999999999S", "ten S"] {

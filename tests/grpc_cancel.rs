@@ -1,19 +1,5 @@
-//! A client that gives up on calls at random moments, against a real server.
-//!
-//! Cancelling is ordinary: a deadline passes, a user navigates away, one of
-//! two hedged calls comes back first. §8.1 spells it RST_STREAM CANCEL, and
-//! dropping a [`Call`] is how this client sends one. What the server must do
-//! is stop working, forget the stream, and go on serving the calls beside it
-//! — while it may well be part way through writing a response into a stream
-//! that no longer exists.
-//!
-//! Rapid Reset (CVE-2023-44487) is the same frame in a loop, so the server
-//! counts resets — but against the streams it has *finished*, not against a
-//! lifetime ceiling. The attack is cancelling instead of working; cancelling
-//! while working is Tuesday. So all three shapes are here: cancelling among
-//! calls that complete, cancelling far past the flat limit while paying for
-//! every one of them, and cancelling and nothing else, which is the attack
-//! and still ends in GOAWAY ENHANCE_YOUR_CALM.
+//! Rapid Reset (CVE-2023-44487): the server counts resets against the streams
+//! it has *finished*, not against a lifetime ceiling.
 //!
 //! Random, but seeded: a failure here reproduces. `SEED` overrides it.
 
@@ -50,17 +36,14 @@ const STREAM: &str = "/test.Chaos/Stream";
 const UNARY: &str = "/test.Chaos/Unary";
 
 /// Enough messages that a cancellation lands while the server is still
-/// writing, which is the case worth testing rather than the tidy one.
+/// writing.
 const MESSAGES: usize = 20;
 
-/// Cancellations the first half makes: enough to prove a reset is ordinary,
-/// far enough below `FAULT_LIMIT` that no seed can reach it.
+/// Far enough below `FAULT_LIMIT` that no seed can reach it.
 const CANCELLATIONS: usize = 60;
 
-/// Whatever `FAULT_LIMIT` is over in `server::connection::protocol` — not
-/// reachable from an integration test, so it is named here and checked
-/// loosely. It is how far resets may run ahead of completed streams, not a
-/// lifetime total.
+/// `FAULT_LIMIT` in `server::connection::protocol`, not reachable from an
+/// integration test: how far resets may run ahead of completed streams.
 const FAULT_LIMIT: usize = 100;
 
 async fn route(call: &GrpcCall) -> Status {
@@ -97,7 +80,6 @@ fn pick_port() -> u16 {
     port
 }
 
-/// xorshift64*, so that "at random" is the same run twice.
 struct Rng(u64);
 
 impl Rng {
@@ -138,16 +120,13 @@ async fn connect(port: u16) -> client::Client {
     panic!("the server never came up");
 }
 
-/// What the client made of a run, as plain data the test thread can hold.
 #[derive(Debug, Default)]
 struct Run {
     finished: usize,
     cancelled: usize,
-    /// Calls that were meant to finish and did not.
     broken: Vec<String>,
     live_streams_at_end: usize,
     connection_closed: bool,
-    /// Whether one last call worked once the chaos was over.
     still_usable: bool,
 }
 
@@ -168,11 +147,8 @@ fn cancelling_calls_at_random_leaves_the_connection_working() {
             let mut rng = Rng(seed);
             let mut run = Run::default();
 
-            // Driven by the number of *cancellations*, not of calls: this
-            // half has to stay well under `FAULT_LIMIT`, and at roughly one
-            // call in two being abandoned a fixed call count would drift
-            // towards the wall on some seeds and fail for a reason that is
-            // not the one under test.
+            // Driven by the number of *cancellations*, not of calls: a fixed
+            // call count would drift towards `FAULT_LIMIT` on some seeds.
             while run.cancelled < CANCELLATIONS {
                 let call = match grpc.call(STREAM) {
                     Ok(call) => call,
@@ -186,10 +162,7 @@ fn cancelling_calls_at_random_leaves_the_connection_working() {
                     break;
                 }
 
-                // Where to give up, if at all: before the head, after it, or
-                // part way through the messages.
                 match rng.below(4) {
-                    // Three calls in four are read to the end.
                     0 => {
                         run.cancelled += 1;
                         drop(call); // §8.1: RST_STREAM CANCEL
@@ -214,14 +187,12 @@ fn cancelling_calls_at_random_leaves_the_connection_working() {
                         match failed {
                             Some(why) => run.broken.push(why),
                             None if seen == MESSAGES => {
-                                // Read to the end, so the status is owed.
                                 let status = call.status().await;
                                 match status.is_ok() {
                                     true => run.finished += 1,
                                     false => run.broken.push(format!("{status:?}")),
                                 }
                             }
-                            // Stopped part way and walked away: a cancel.
                             None => {
                                 run.cancelled += 1;
                                 drop(call);
@@ -231,7 +202,6 @@ fn cancelling_calls_at_random_leaves_the_connection_working() {
                 }
             }
 
-            // The chaos is over. Is this still a connection?
             run.live_streams_at_end = grpc.connection().live_streams();
             run.connection_closed = grpc.connection().is_closed();
             run.still_usable = grpc
@@ -246,7 +216,6 @@ fn cancelling_calls_at_random_leaves_the_connection_working() {
     let run = rx
         .recv_timeout(Duration::from_secs(60))
         .expect("the client reports");
-    // Printed under `--nocapture`, so that a passing run can still be read.
     eprintln!("{run:?}");
 
     assert!(
@@ -278,12 +247,9 @@ fn cancelling_calls_at_random_leaves_the_connection_working() {
     );
 }
 
-/// The attack itself: open, cancel, repeat, and never finish anything.
-///
-/// Nothing is completed here, so nothing pays for the resets and the budget
-/// never grows — the connection ends at `FAULT_LIMIT`, measured at 104. This
-/// is the case the defence exists for, and the one that must not be softened
-/// by letting honest clients through.
+/// The attack itself: open, cancel, repeat, and never finish anything. The
+/// case the defence exists for, and not to be softened by letting honest
+/// clients through.
 #[test]
 fn a_hundred_cancellations_end_the_connection() {
     let port = pick_port();
@@ -301,8 +267,6 @@ fn a_hundred_cancellations_end_the_connection() {
                 }
                 match grpc.call(STREAM) {
                     Ok(call) => {
-                        // Opened and abandoned, which is the shape of the
-                        // attack and of an impatient client alike.
                         let _ = call.write_message_final(&Request::default()).await;
                         cancelled += 1;
                         drop(call);
@@ -345,15 +309,6 @@ fn a_hundred_cancellations_end_the_connection() {
     );
 }
 
-/// The other half of the same rule: a client that finishes work earns the
-/// room to cancel.
-///
-/// Rapid Reset is cancelling *instead of* finishing — the attack exists to
-/// make a server do a request's work without paying for a response. So the
-/// budget is spent against completed streams rather than against a flat
-/// ceiling, and this is the honest client the flat ceiling used to close on:
-/// one that cancels three hundred times, and answers for every one of them
-/// with a call it saw through.
 #[test]
 fn a_client_that_finishes_its_work_may_keep_cancelling() {
     let port = pick_port();
@@ -366,9 +321,7 @@ fn a_client_that_finishes_its_work_may_keep_cancelling() {
             let mut cancelled = 0;
             let mut failed = false;
 
-            // Three times what `FAULT_LIMIT` allows on its own.
             while cancelled < FAULT_LIMIT * 3 {
-                // One call seen through to its status...
                 if grpc
                     .unary::<_, Reply>(UNARY, &Request::default())
                     .await
@@ -377,7 +330,6 @@ fn a_client_that_finishes_its_work_may_keep_cancelling() {
                     failed = true;
                     break;
                 }
-                // ...and one abandoned.
                 match grpc.call(STREAM) {
                     Ok(call) => {
                         let _ = call.write_message_final(&Request::default()).await;

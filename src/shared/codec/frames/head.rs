@@ -24,8 +24,6 @@ pub enum Kind {
     Continuation = 9,
 }
 
-// ===== impl Head =====
-
 impl Head {
     pub fn new(kind: Kind, flag: u8, stream_id: StreamId) -> Head {
         Head {

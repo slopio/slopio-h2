@@ -3,26 +3,16 @@ use http::{HeaderMap, Method, header};
 use super::GrpcEncoding;
 use crate::shared::codec::frames::headers::Headers;
 
-/// What a gRPC request's messages are serialised as: the subtype after
-/// `application/grpc` in its `content-type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrpcFormat {
-    /// `application/grpc+proto` — and bare `application/grpc`, which the
-    /// protocol defines as the same thing.
     Proto,
-    /// `application/grpc+json`.
     Json,
-    /// Some other `+subtype`. The request's `content-type` still has its
-    /// name.
     Other,
 }
 
 impl GrpcFormat {
-    /// `Some` is a gRPC request: a POST whose `content-type` is
-    /// `application/grpc`, bare or followed by a `+subtype` or a parameter.
-    ///
-    /// All there is to go on at HEADERS. `te: trailers` is required of clients
-    /// and not asked for here, some proxies having been known to drop it.
+    /// `te: trailers` is required of clients and not asked for here, some
+    /// proxies having been known to drop it.
     pub fn of(headers: &Headers) -> Option<Self> {
         if headers.pseudo().method != Some(Method::POST) {
             return None;
@@ -35,12 +25,8 @@ impl GrpcFormat {
         Self::of_suffix(&value[GRPC.len()..])
     }
 
-    /// The same question asked of a *response*, where there is no method to
-    /// check and the fields have already been turned into a `HeaderMap`.
-    ///
     /// §4.1 requires the same `content-type` back, and a response without one
-    /// is not carrying messages — most often a proxy's error page, which is
-    /// why this is asked before a body is read as anything.
+    /// is not carrying messages — most often a proxy's error page.
     pub(crate) fn of_response(fields: &HeaderMap) -> Option<Self> {
         const GRPC: &[u8] = b"application/grpc";
         let value = fields.get(header::CONTENT_TYPE)?.as_bytes();
@@ -50,8 +36,7 @@ impl GrpcFormat {
         Self::of_suffix(&value[GRPC.len()..])
     }
 
-    /// What follows `application/grpc`: nothing, `;parameters`, or `+subtype`
-    /// and perhaps parameters after it. Anything else is another media type
+    /// Anything but nothing, `;parameters` or `+subtype` is another media type
     /// that only starts the same way.
     fn of_suffix(suffix: &[u8]) -> Option<Self> {
         match suffix {
@@ -72,16 +57,10 @@ impl GrpcFormat {
     }
 }
 
-/// What a request's `grpc-encoding` says its compressed messages are
-/// compressed with. It says nothing of whether any message *is*: that is each
-/// prefix's Compressed-Flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnnouncedEncoding {
-    /// No `grpc-encoding`, or `identity`: a set Compressed-Flag has nothing
-    /// to mean.
     None,
     Known(GrpcEncoding),
-    /// One this side has no name for.
     Unknown,
 }
 
@@ -115,7 +94,6 @@ mod tests {
         AnnouncedEncoding::of(&fields)
     }
 
-    /// What follows `application/grpc` in the `content-type`.
     #[test]
     fn the_subtype_names_the_format_and_none_means_proto() {
         for (suffix, expected) in [

@@ -2,26 +2,6 @@
 //!
 //!     cargo run --release --features tls --example tls_client
 //!     cargo run --release --features tls --example tls_client https://cloudflare.com/
-//!
-//! The default is `https://www.google.com/`, so with no arguments this makes
-//! a real request to a real server and checks its certificate against
-//! Mozilla's roots — which is the part a local test cannot prove.
-//!
-//! Two environment variables, for the two reasons a local server is
-//! different. `ADDR` sends the packets somewhere other than where the name
-//! resolves, and the certificate is still checked against the name. `INSECURE`
-//! turns the checking off, which is the only way to talk to a self-signed
-//! server and is never right anywhere else:
-//!
-//!     openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
-//!         -days 1 -nodes -subj /CN=localhost
-//!     nghttpd -d /tmp/docroot 8443 key.pem cert.pem
-//!     INSECURE=1 cargo run --features tls --example tls_client \
-//!         https://localhost:8443/hello.txt
-//!
-//! Who to trust is the application's choice, which is why the roots are this
-//! example's and not the library's: `webpki-roots` here, the OS store via
-//! `rustls-native-certs`, or one pinned CA of your own.
 
 use std::net::{SocketAddr, ToSocketAddrs};
 
@@ -31,24 +11,18 @@ use popple_tls::{
 };
 use runtime::main_thread_with;
 
-// Smaller than the server's: a client holding one connection has nothing to
-// share the ring with.
 runtime::define_buf_ring!(ClientRing, bgid = 1, buffer_size = 16384, ring_size = 64);
 
-/// §3.3: ALPN is not optional over TLS, and `h2` is the only thing we speak.
-/// A server that will not agree to it is refused by `connect_tls` rather than
-/// spoken HTTP/2 at.
+/// §3.3: ALPN is not optional over TLS. A server that will not agree to `h2`
+/// is refused by `connect_tls` rather than spoken HTTP/2 at.
 const H2: &[&[u8]] = &[b"h2"];
 
-/// The three parts of a URL this needs, which is all of them it understands.
 struct Target {
     host: String,
     port: u16,
     path: String,
 }
 
-/// `https://host[:port][/path]`, by hand. A URL parser is a dependency this
-/// does not need to make a request with.
 fn parse(url: &str) -> Result<Target, String> {
     let rest = url
         .strip_prefix("https://")
@@ -76,7 +50,6 @@ fn parse(url: &str) -> Result<Target, String> {
 
 fn main() {
     // rustls needs a crypto provider installed before any config is built.
-    // The application's job, once, at startup — not the library's.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let url = std::env::args()
@@ -87,9 +60,8 @@ fn main() {
         Err(e) => return eprintln!("{e}"),
     };
 
-    // Resolution is the standard library's, and it happens before the runtime
-    // starts: this runtime has no resolver, and a DNS lookup is not what the
-    // example is about.
+    // Resolution happens before the runtime starts: this runtime has no
+    // resolver.
     let addr: SocketAddr = match std::env::var("ADDR") {
         Ok(addr) => match addr.parse() {
             Ok(addr) => addr,
@@ -106,8 +78,7 @@ fn main() {
 
     let insecure = std::env::var_os("INSECURE").is_some();
     let config = match insecure {
-        // Never right off a loopback address, and the warning is printed
-        // rather than commented so that it is seen by whoever ran it.
+        // Never right off a loopback address.
         true => {
             eprintln!("INSECURE: the server's certificate is not being checked\n");
             client_config_dangerous_no_verification(Some(H2))
@@ -167,8 +138,6 @@ fn main() {
             }
         }
         println!("\n{} bytes of body", body.len());
-        // Enough to see it is the page that was asked for, without pasting a
-        // megabyte of minified HTML into a terminal.
         let head: String = String::from_utf8_lossy(&body).chars().take(200).collect();
         println!("{head}");
 

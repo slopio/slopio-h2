@@ -1,30 +1,6 @@
 //! Two gRPC services, answered by hand — no code generation, no stubs.
 //!
-//! `grpc.health.v1.Health`, which every gRPC deployment already has and
-//! Kubernetes probes, and a bidirectional `popple.echo.v1.Echo` to talk both
-//! ways at once. Cleartext on 8080, as gRPC over h2c. Their `.proto` files sit
-//! beside this one, under `proto/`, and are what a client needs to call them.
-//!
 //!     cargo run --example grpc_server
-//!
-//!     grpc-health-probe -addr localhost:8080
-//!     grpc-health-probe -addr localhost:8080 -service down
-//!
-//!     grpcurl -plaintext -proto examples/grpc_server/proto/health.proto \
-//!         -d '{}' localhost:8080 grpc.health.v1.Health/Check
-//!
-//!     printf '{"text":"hi","index":1}' | grpcurl -plaintext \
-//!         -proto examples/grpc_server/proto/echo.proto -d @ \
-//!         localhost:8080 popple.echo.v1.Echo/Chat
-//!
-//! [`grpc::service`] is what makes these handlers handlers: it owns the call,
-//! reads the request's messages, writes the response's, and turns the [`Status`]
-//! each one returns into the trailers — or into a Trailers-Only response, when
-//! the call failed before it produced anything. The deadline in `grpc-timeout`
-//! is its business too, so a handler is never left running for a client that
-//! has given up.
-//!
-//! What is left here is the service: routing on `:path`, and what to answer.
 
 use http::{HeaderMap, StatusCode};
 use popple_h2::grpc::{GrpcCall, Status, service};
@@ -39,10 +15,6 @@ runtime::define_buf_ring!(
     pool_size = 512
 );
 
-/// `grpc.health.v1.HealthCheckRequest`. An empty `service` asks after the
-/// server as a whole — and encodes to nothing at all, proto3 writing no bytes
-/// for a field at its default. That request is five bytes on the wire: its
-/// prefix, and no content.
 #[derive(Clone, PartialEq, prost::Message)]
 struct HealthCheckRequest {
     #[prost(string, tag = "1")]
@@ -75,10 +47,8 @@ struct EchoResponse {
 const SERVING: i32 = 1;
 const NOT_SERVING: i32 = 2;
 
-/// What this server says it is: everything but `down` is up.
 fn status_of(service: &str) -> Option<i32> {
     match service {
-        // The whole server.
         "" => Some(SERVING),
         "down" => Some(NOT_SERVING),
         "ready" | "grpc.health.v1.Health" => Some(SERVING),
@@ -92,7 +62,6 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(8080);
 
-    // As the other examples: one worker per core of the affinity mask.
     let per_core = std::env::var("PER_CORE").is_ok_and(|v| v != "0");
 
     println!("gRPC health and echo services on :{port} (h2c), per_core={per_core}");
@@ -116,9 +85,7 @@ async fn serve(port: u16) {
     }
 }
 
-/// §9.1: the path is `/package.Service/Method`, and one this server does not
-/// have is UNIMPLEMENTED — which a client wants as a `grpc-status` and not as
-/// a 404, the HTTP exchange having gone perfectly well.
+/// §9.1: a method this server does not have is UNIMPLEMENTED rather than a 404.
 async fn route(call: &GrpcCall) -> Status {
     match call.path() {
         Some("/grpc.health.v1.Health/Check") => check(call).await,
@@ -128,8 +95,6 @@ async fn route(call: &GrpcCall) -> Status {
     }
 }
 
-/// A unary call: one message in, one out. Every way the request can fail to be
-/// one is already a `Status`, so `?` answers them.
 async fn check(call: &GrpcCall) -> Status {
     let Some(request) = (match call.message::<HealthCheckRequest>().await {
         Ok(request) => request,
@@ -146,7 +111,6 @@ async fn check(call: &GrpcCall) -> Status {
     Status::ok()
 }
 
-/// A stream in both directions: one answer per message, as each arrives.
 async fn chat(call: &GrpcCall) -> Status {
     let started = std::time::Instant::now();
     let mut answered = 0;
@@ -179,8 +143,6 @@ async fn chat(call: &GrpcCall) -> Status {
     Status::ok()
 }
 
-/// Everything on this port that is not gRPC. One connection carries both, and
-/// the layer tells them apart by the request's `content-type`.
 async fn plain_http(stream: Stream) {
     stream.write_headers_final(StatusCode::NOT_FOUND, &HeaderMap::new());
 }

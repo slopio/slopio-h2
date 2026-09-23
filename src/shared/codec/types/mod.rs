@@ -1,31 +1,23 @@
 use crate::shared::codec::frames::stream_id::StreamId;
 
-/// An error detected by the frame decoder. The decoder reports these via
-/// `FrameHandler::on_error`; the handler decides the response (typically
-/// GOAWAY for `Connection`, RST_STREAM for `Stream`).
 #[derive(Debug, Clone, Copy)]
 pub enum DecodeError {
-    /// Connection-level error (RFC 9113 §5.4.1). Once reported, the decoder
-    /// no-ops on subsequent `decode_with` calls.
+    /// §5.4.1. Once reported, the decoder no-ops on subsequent `decode_with` calls.
     Connection {
         code: u32,
         message: &'static str,
     },
-    /// Stream-level error (RFC 9113 §5.4.2). Decoding continues with the
-    /// next frame; the in-progress frame is discarded.
+    /// §5.4.2. Decoding continues with the next frame; the in-progress frame
+    /// is discarded.
     Stream {
         stream_id: StreamId,
-        /// Which rule was broken, for a handler whose answer depends on it:
-        /// a malformed HEADERS opened — and so spent — its stream id, where
-        /// a bad PRIORITY did nothing of the kind.
+        /// A malformed HEADERS still spent its stream id; a bad PRIORITY did not.
         violation: StreamViolation,
         code: u32,
         message: &'static str,
     },
 }
 
-/// A stream error the RFC names (§5.4.2), identified so a connection can
-/// decide per violation whether resetting the stream is enough.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamViolation {
     /// §6.9: a WINDOW_UPDATE of 0 on a stream.
@@ -80,7 +72,6 @@ impl StreamViolation {
     }
 }
 
-/// How far a violation reaches: a reset of its stream, or the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorScope {
     Stream,

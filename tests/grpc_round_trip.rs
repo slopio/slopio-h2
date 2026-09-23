@@ -1,13 +1,4 @@
 //! Our gRPC client against our gRPC server, over a real socket.
-//!
-//! Both halves have been tested against scripted bytes — the server against a
-//! scripted client, the client against a scripted server — which proves each
-//! one reads what the other is supposed to write. It does not prove they
-//! agree, because the same person wrote both scripts. This runs the two for
-//! real: a listener, a connection, and messages that cross a kernel.
-//!
-//! Cleartext on purpose. TLS has its own round trip; what is under test here
-//! is gRPC, and a failure should not have two layers to be in.
 
 #![cfg(feature = "grpc")]
 
@@ -43,9 +34,7 @@ const STREAM: &str = "/test.Greeter/SayMany";
 const FAILS: &str = "/test.Greeter/Fail";
 const REJECTS: &str = "/test.Greeter/Reject";
 
-/// A message that exercises §9.1's percent-encoding across the wire: the
-/// server encodes it into `grpc-message`, the client decodes it back, and the
-/// two halves have never met before now.
+/// Exercises §9.1's percent-encoding across the wire.
 const AWKWARD: &str = "échec: 50% du flux";
 
 async fn route(call: &GrpcCall) -> Status {
@@ -72,22 +61,17 @@ async fn route(call: &GrpcCall) -> Status {
             Status::ok()
         }
         Some(FAILS) => Status::not_found(AWKWARD),
-        // Judged on the first message of a client stream, before the rest has
-        // arrived: the status goes out, and the stream's token stops the
-        // upload with RST_STREAM(NO_ERROR) behind it (§8.1).
+        // Judged on the first message of a client stream: the status goes
+        // out, and RST_STREAM(NO_ERROR) stops the upload behind it (§8.1).
         Some(REJECTS) => match call.message::<HelloRequest>().await {
             Ok(Some(_)) => Status::invalid_argument("rejected on sight"),
             Ok(None) => Status::invalid_argument("no request message"),
             Err(status) => status,
         },
-        // §9.1: a path this server does not have. The HTTP exchange went
-        // perfectly; the call did not happen.
         _ => Status::unimplemented("no such method"),
     }
 }
 
-/// Anything that is not gRPC. Nothing under test sends one, but `service`
-/// wants somewhere to put it.
 async fn not_grpc(stream: Stream) {
     stream.write_headers(StatusCode::NOT_FOUND, &HeaderMap::new());
     stream.write_data_final(b"").await;
@@ -100,8 +84,7 @@ fn pick_port() -> u16 {
     port
 }
 
-/// What the client made of the four calls, reported back as plain data: the
-/// test thread cannot hold anything from the runtime's thread.
+/// Plain data: the test thread cannot hold anything from the runtime's thread.
 type Outcome = (
     Result<String, (Code, String)>,
     Result<Vec<String>, (Code, String)>,
@@ -118,8 +101,7 @@ fn the_client_and_the_server_agree_over_a_real_socket() {
     let port = pick_port();
     let (done_tx, done_rx) = mpsc::channel::<Outcome>();
 
-    // Detached: the accept loop runs until the process ends, and the test
-    // ends when the client has its answers.
+    // Detached: the accept loop runs until the process ends.
     thread::spawn(move || {
         main_thread_with::<ServerRing, _>(async move {
             let settings = ServerSettings {
@@ -150,7 +132,6 @@ fn the_client_and_the_server_agree_over_a_real_socket() {
             }
             let grpc = GrpcClient::new(connected.expect("the server came up"));
 
-            // One message out, one back.
             let unary = grpc
                 .unary::<_, HelloReply>(
                     UNARY,
@@ -162,8 +143,6 @@ fn the_client_and_the_server_agree_over_a_real_socket() {
                 .map(|reply| reply.message)
                 .map_err(flatten);
 
-            // Several messages, then a status. The handle hands them over one
-            // at a time and `None` is the end.
             let streamed = async {
                 let call = grpc
                     .call(STREAM)
@@ -182,8 +161,6 @@ fn the_client_and_the_server_agree_over_a_real_socket() {
             }
             .await;
 
-            // A call that ran and failed, with a message that has to survive
-            // being encoded into a header and read back.
             let failed = grpc
                 .unary::<_, HelloReply>(FAILS, &HelloRequest::default())
                 .await
@@ -230,12 +207,8 @@ fn the_client_and_the_server_agree_over_a_real_socket() {
     );
 }
 
-/// A server that answers a client-streaming call before the client is done —
-/// judging it on its first message — sends its status and then stops the
-/// upload with RST_STREAM(NO_ERROR). §8.1 says the client keeps the response.
-/// It used to take the reset for a failure of the whole stream and report
-/// UNAVAILABLE, which a caller retries, for a call the server had rejected on
-/// purpose.
+/// §8.1: a status followed by RST_STREAM(NO_ERROR) is a response the client
+/// keeps, not a failure of the stream.
 #[test]
 fn a_status_sent_before_the_upload_ends_is_the_one_reported() {
     let port = pick_port();

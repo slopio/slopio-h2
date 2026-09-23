@@ -8,14 +8,8 @@ use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::{cmp, mem};
 
-/// HPACK encoder table
 #[derive(Debug)]
 pub struct Table {
-    /// Whether a `:path` may be kept in the dynamic table. Off by default,
-    /// which is the right answer for a connection whose paths are nearly all
-    /// distinct; see [`Header::skip_value_index`].
-    ///
-    /// [`Header::skip_value_index`]: super::Header::skip_value_index
     index_paths: bool,
     mask: usize,
     indices: Vec<Option<Pos>>,
@@ -28,19 +22,11 @@ pub struct Table {
 
 #[derive(Debug)]
 pub enum Index {
-    // The header is already fully indexed
     Indexed(usize, Header),
-
-    // The name is indexed, but not the value
     Name(usize, Header),
-
-    // The full header has been inserted into the table.
     Inserted(usize),
-
-    // Only the value has been inserted (hpack table idx, slots idx)
+    // (hpack table idx, slots idx)
     InsertedValue(usize, usize),
-
-    // The header is not indexed by this table
     NotIndexed(Header),
 }
 
@@ -113,7 +99,6 @@ impl Table {
         self.max_size
     }
 
-    /// Gets the header stored in the table
     pub fn resolve<'a>(&'a self, index: &'a Index) -> &'a Header {
         use self::Index::*;
 
@@ -138,26 +123,19 @@ impl Table {
         }
     }
 
-    /// Whether `:path` values may enter the dynamic table on this connection.
     pub fn index_paths(&mut self, on: bool) {
         self.index_paths = on;
     }
 
-    /// Index the header in the HPACK table.
     pub fn index(&mut self, header: Header) -> Index {
-        // Check the static table
         let statik = index_static(&header);
 
-        // Don't index certain headers. This logic is borrowed from nghttp2.
         if header.skip_value_index(self.index_paths) {
-            // Right now, if this is true, the header name is always in the
-            // static table. At some point in the future, this might not be true
-            // and this logic will need to be updated.
+            // Relies on every skipped header having a static-table name.
             debug_assert!(statik.is_some(), "skip_value_index requires a static name",);
             return Index::new(statik, header);
         }
 
-        // If the header is already indexed by the static table, return that
         if let Some((n, true)) = statik {
             return Index::Indexed(n, header);
         }
@@ -174,14 +152,11 @@ impl Table {
         debug_assert!(self.assert_valid_state("one"));
 
         if header.len() + self.size < self.max_size || !header.is_sensitive() {
-            // Only grow internal storage if needed
             self.reserve_one();
         }
 
         if self.indices.is_empty() {
-            // If `indices` is not empty, then it is impossible for all
-            // `indices` entries to be `Some`. So, we only need to check for the
-            // empty case.
+            // A non-empty `indices` always has a `None`, so the probe ends.
             return Index::new(statik, header);
         }
 
@@ -191,20 +166,15 @@ impl Table {
         let mut probe = desired_pos;
         let mut dist = 0;
 
-        // Start at the ideal position, checking all slots
         probe_loop!(probe < self.indices.len(), {
             if let Some(pos) = self.indices[probe] {
-                // The slot is already occupied, but check if it has a lower
-                // displacement.
                 let their_dist = probe_distance(self.mask, pos.hash, probe);
 
                 let slot_idx = pos.index.wrapping_add(self.inserted);
 
                 if their_dist < dist {
-                    // Index robinhood
                     return self.index_vacant(header, hash, dist, probe, statik);
                 } else if pos.hash == hash && self.slots[slot_idx].header.name() == header.name() {
-                    // Matching name, check values
                     return self.index_occupied(header, hash, pos.index, statik.map(|(n, _)| n));
                 }
             } else {
@@ -224,15 +194,10 @@ impl Table {
     ) -> Index {
         debug_assert!(self.assert_valid_state("top"));
 
-        // There already is a match for the given header name. Check if a value
-        // matches. The header will also only be inserted if the table is not at
-        // capacity.
         loop {
-            // Compute the real index into the VecDeque
             let real_idx = index.wrapping_add(self.inserted);
 
             if self.slots[real_idx].header.value_eq(&header) {
-                // We have a full match!
                 return Index::Indexed(real_idx + DYN_OFFSET, header);
             }
 
@@ -249,10 +214,8 @@ impl Table {
 
             self.update_size(header.len(), Some(index));
 
-            // Insert the new header
             self.insert(header, hash);
 
-            // Recompute real_idx as it just changed.
             let new_real_idx = index.wrapping_add(self.inserted);
 
             // The previous node in the linked list may have gotten evicted
@@ -265,10 +228,9 @@ impl Table {
 
             debug_assert!(self.assert_valid_state("bottom"));
 
-            // Even if the previous header was evicted, we can still reference
-            // it when inserting the new one...
+            // Even if the previous header was evicted, it can still be
+            // referenced when inserting the new one.
             return if let Some(n) = statik {
-                // If name is in static table, use it instead
                 Index::InsertedValue(n, 0)
             } else {
                 Index::InsertedValue(real_idx + DYN_OFFSET, 0)
@@ -291,8 +253,6 @@ impl Table {
         debug_assert!(self.assert_valid_state("top"));
         debug_assert!(dist == 0 || self.indices[probe.wrapping_sub(1) & self.mask].is_some());
 
-        // Passing in `usize::MAX` for prev_idx since there is no previous
-        // header in this case.
         if self.update_size(header.len(), None) {
             while dist != 0 {
                 let back = probe.wrapping_sub(1) & self.mask;
@@ -328,7 +288,6 @@ impl Table {
         );
 
         if let Some(mut prev) = prev {
-            // Shift forward
             let mut probe = probe + 1;
 
             probe_loop!(probe < self.indices.len(), {
@@ -399,11 +358,9 @@ impl Table {
         debug_assert!(!self.slots.is_empty());
         debug_assert!(self.assert_valid_state("one"));
 
-        // Remove the header
         let slot = self.slots.pop_back().unwrap();
         let mut probe = desired_pos(self.mask, slot.hash);
 
-        // Update the size
         self.size -= slot.header.len();
 
         debug_assert_eq!(
@@ -415,7 +372,6 @@ impl Table {
             1
         );
 
-        // Find the associated position
         probe_loop!(probe < self.indices.len(), {
             debug_assert!(self.indices[probe].is_some());
 
@@ -440,8 +396,6 @@ impl Table {
         debug_assert!(self.assert_valid_state("two"));
     }
 
-    // Shifts all indices that were displaced by the header that has just been
-    // removed.
     fn remove_phase_two(&mut self, probe: usize) {
         let mut last_probe = probe;
         let mut probe = probe + 1;
@@ -480,12 +434,9 @@ impl Table {
 
     #[inline]
     fn grow(&mut self, new_raw_cap: usize) {
-        // This path can never be reached when handling the first allocation in
-        // the map.
-
+        // Never reached for the first allocation in the map.
         debug_assert!(self.assert_valid_state("top"));
 
-        // find first ideally placed element -- start of cluster
         let mut first_ideal = 0;
 
         for (i, pos) in self.indices.iter().enumerate() {
@@ -497,8 +448,8 @@ impl Table {
             }
         }
 
-        // visit the entries in an order where we can simply reinsert them
-        // into self.indices without any bucket stealing.
+        // Starting at a cluster's first ideally placed element lets entries be
+        // reinserted without any bucket stealing.
         let old_indices = mem::replace(&mut self.indices, vec![None; new_raw_cap]);
         self.mask = new_raw_cap.wrapping_sub(1);
 
@@ -515,12 +466,10 @@ impl Table {
 
     fn reinsert_entry_in_order(&mut self, pos: Option<Pos>) {
         if let Some(pos) = pos {
-            // Find first empty bucket and insert there
             let mut probe = desired_pos(self.mask, pos.hash);
 
             probe_loop!(probe < self.indices.len(), {
                 if self.indices[probe].is_none() {
-                    // empty bucket, insert here
                     self.indices[probe] = Some(pos);
                     return;
                 }
@@ -636,12 +585,10 @@ impl Table {
 
 #[cfg(test)]
 impl Table {
-    /// Returns the number of headers in the table
     pub fn len(&self) -> usize {
         self.slots.len()
     }
 
-    /// Returns the table size
     pub fn size(&self) -> usize {
         self.size
     }
@@ -685,8 +632,7 @@ fn hash_header(header: &Header) -> HashValue {
     HashValue((h.finish() & MASK) as usize)
 }
 
-/// Checks the static table for the header. If found, returns the index and a
-/// boolean representing if the value matched as well.
+/// The `bool` is whether the value matched as well.
 fn index_static(header: &Header) -> Option<(usize, bool)> {
     match *header {
         Header::Field {

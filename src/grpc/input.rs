@@ -6,84 +6,49 @@ use super::frame::{Accumulating, GrpcFrame};
 use super::prefix::{Prefix, PrefixRead};
 use super::request::{AnnouncedEncoding, GrpcFormat};
 
-/// Why a gRPC request body stopped being one. Handed to the handler rather
-/// than turned into a RST_STREAM, because the answer to each of these is a
-/// `grpc-status`, and the handler is who speaks gRPC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrpcError {
-    /// A message longer than [`GrpcInput::MESSAGE_LIMIT`]. RESOURCE_EXHAUSTED.
     MessageTooLarge { declared: u32 },
-    /// A Compressed-Flag that is neither 0 nor 1. INTERNAL.
     InvalidCompressedFlag(u8),
-    /// A compressed message on a request that announced no `grpc-encoding`,
-    /// or `identity`. INTERNAL.
     CompressedWithoutEncoding,
-    /// A compressed message, in an encoding there is no name for here.
-    /// UNIMPLEMENTED.
     UnsupportedEncoding,
-    /// More whole messages waiting than [`GrpcInput::QUEUE_LIMIT`].
-    /// RESOURCE_EXHAUSTED.
     TooManyMessages,
-    /// END_STREAM inside a prefix or a message. INTERNAL.
     Truncated,
 }
 
-/// What is being read: every message is a prefix, then as many bytes as the
-/// prefix said.
 enum Reading {
     Prefix(Prefix),
     Frame(Accumulating),
 }
 
-/// Where a gRPC request body lands: a sequence of length-prefixed messages,
-/// delivered one whole frame at a time.
-///
 /// Message boundaries owe nothing to DATA frames: a prefix may straddle two,
 /// and one frame may hold several messages.
 pub struct GrpcInput {
     reading: Reading,
-    /// Whole, and not taken yet.
     ready: VecDeque<GrpcFrame>,
     /// Set once, by the first thing wrong with the body. Nothing after it is
-    /// read: the framing is lost, and the handler is about to say so.
+    /// read: the framing is lost.
     failed: Option<GrpcError>,
-    /// Told to the handler already, which is when `take` starts answering
-    /// `None`.
     failure_taken: bool,
     announced: AnnouncedEncoding,
     format: GrpcFormat,
-    /// `content-length`, on the rare gRPC request that declares one. §8.1.1
-    /// holds whatever the content type.
+    /// §8.1.1 holds whatever the content type.
     declared: Option<u64>,
 }
 
 impl GrpcInput {
     /// Largest message held, and gRPC's own default.
     ///
-    /// Not tied to any window. A message fills from the bytes of DATA frames,
-    /// each of which is consumed — copied in here — the moment it lands, and
-    /// credited back to the peer as an HTTP handler's `consume` would. So a
-    /// message may be far larger than a stream's window: it flows through it,
-    /// as every gRPC transport has it flow. What bounds memory is this limit,
-    /// checked at the prefix, times the streams open at once.
-    ///
-    /// The one time bytes keep their credit is when a whole message is already
-    /// waiting for the handler: then the handler is behind, and the window is
-    /// what tells the peer to wait too. See `StreamState::recv_data`.
+    /// Not tied to any window: DATA bytes are consumed and credited back the
+    /// moment they land, so a message may be far larger than a stream's
+    /// window. What bounds memory is this limit, checked at the prefix, times
+    /// the streams open at once.
     pub const MESSAGE_LIMIT: usize = 4 * 1024 * 1024;
 
-    /// Most messages waiting to be taken.
-    ///
-    /// The window bounds them in bytes and not in entries, and the two come
-    /// apart: a message costs five bytes of window and rather more than five
-    /// bytes to hold — an entry, and an allocation that a short one barely
-    /// fills. A peer sending the smallest messages it can into a stream
-    /// nobody is draining spends 64 KiB of window on some thirteen thousand
-    /// of them.
-    ///
-    /// Well above any honest burst: this is what piles up between two polls
-    /// of a handler that is keeping up, and a client-streaming peer that gets
-    /// this far ahead is not one.
+    /// Most messages waiting to be taken. The window bounds them in bytes and
+    /// not in entries: a peer sending the smallest messages it can into a
+    /// stream nobody is draining spends 64 KiB of window on some thirteen
+    /// thousand of them.
     pub const QUEUE_LIMIT: usize = 256;
 
     pub fn new(format: GrpcFormat, fields: &HeaderMap, declared: Option<u64>) -> Self {
@@ -102,25 +67,20 @@ impl GrpcInput {
         self.declared
     }
 
-    /// Whether a whole message is waiting for the handler. While one is, the
-    /// bytes that arrive hold their credit: the handler is behind, and the
-    /// window is what tells the peer so.
+    /// While a whole message is waiting, the bytes that arrive hold their
+    /// credit: the window is what tells the peer the handler is behind.
     pub fn has_ready(&self) -> bool {
         !self.ready.is_empty()
     }
 
-    /// Takes the next of the body. `true` when the task has something new to
-    /// be woken for: a frame became whole, or the body went wrong.
-    ///
     /// Nothing here knows about flow control: whether the bytes keep their
-    /// credit is decided by whoever calls this, from [`has_ready`] after it.
+    /// credit is decided by the caller, from [`has_ready`] after it.
     ///
     /// [`has_ready`]: Self::has_ready
     pub fn push(&mut self, mut payload: &[u8]) -> bool {
         let mut wake = false;
         while !payload.is_empty() && self.failed.is_none() {
-            // Cut at what the current piece is missing: it refuses more, and
-            // what is past the cut belongs to the piece after it.
+            // Cut at what the current piece is missing: it refuses more.
             let missing = match &self.reading {
                 Reading::Prefix(prefix) => prefix.missing(),
                 Reading::Frame(frame) => frame.missing(),
@@ -136,13 +96,8 @@ impl GrpcInput {
         wake || self.failed.is_some()
     }
 
-    /// Moves on from whatever has all its bytes: a prefix becomes the frame it
-    /// announced, a frame becomes ready and leaves a fresh prefix behind.
-    /// `true` when a frame became ready.
-    ///
     /// A loop because a prefix announcing zero bytes is a frame that is whole
-    /// the moment it begins — a message like any other, what a protobuf with
-    /// every field at its default serialises to.
+    /// the moment it begins.
     fn advance(&mut self) -> bool {
         let mut became_ready = false;
         loop {
@@ -178,8 +133,8 @@ impl GrpcInput {
         }
     }
 
-    /// Judges a prefix, which is where a message is refused: before anything
-    /// is reserved for a length the peer has only claimed.
+    /// Refuses a message at its prefix, before anything is reserved for a
+    /// length the peer has only claimed.
     fn begin(&self, read: PrefixRead) -> Result<Accumulating, GrpcError> {
         let encoding = match (read.compressed_flag, self.announced) {
             (0, _) => None,
@@ -200,8 +155,6 @@ impl GrpcInput {
         ))
     }
 
-    /// The peer's END_STREAM. It has to fall between two messages: there is
-    /// no end marker in the body, so anything else is a body cut short.
     pub fn end(&mut self) {
         let between = matches!(&self.reading, Reading::Prefix(prefix) if prefix.is_untouched());
         if !between && self.failed.is_none() {
@@ -209,7 +162,6 @@ impl GrpcInput {
         }
     }
 
-    /// The next whole frame, then the failure if there was one — once.
     pub fn take(&mut self) -> Option<Result<GrpcFrame, GrpcError>> {
         if let Some(frame) = self.ready.pop_front() {
             return Some(Ok(frame));
@@ -243,7 +195,6 @@ mod tests {
         out
     }
 
-    /// What `take` gave, as the bytes of an uncompressed frame.
     fn data(taken: Option<Result<GrpcFrame, GrpcError>>) -> Vec<u8> {
         match taken {
             Some(Ok(GrpcFrame::Uncompressed(frame))) => frame.into_data().into_vec(),
@@ -251,8 +202,6 @@ mod tests {
         }
     }
 
-    /// Frames are the transport's, messages are gRPC's: wherever the bytes are
-    /// cut, the same messages come out.
     #[test]
     fn frames_come_out_whole_wherever_the_bytes_are_cut() {
         let bytes = [framed(0, b"first"), framed(0, b""), framed(0, b"third one")].concat();
@@ -295,7 +244,6 @@ mod tests {
         assert_eq!(input.take(), None);
     }
 
-    /// The flag and the announced encoding only mean something together.
     #[test]
     fn a_compressed_message_needs_an_encoding_with_a_name() {
         for (announced, expected) in [
@@ -319,8 +267,6 @@ mod tests {
         }
     }
 
-    /// The window bounds the queue in bytes, this bounds it in entries: the
-    /// two come apart when the messages are small enough.
     #[test]
     fn a_peer_that_queues_past_the_limit_fails_the_body() {
         let mut input = input(None);
@@ -337,8 +283,6 @@ mod tests {
         assert_eq!(input.take(), None);
     }
 
-    /// Taking them keeps the room: a handler that drains is never refused,
-    /// however many messages the call has.
     #[test]
     fn a_drained_queue_takes_more_than_the_limit_in_all() {
         let mut input = input(None);
@@ -353,8 +297,6 @@ mod tests {
         assert_eq!(input.take(), None, "nothing went wrong");
     }
 
-    /// Refused at the prefix: nothing is reserved for a length the peer only
-    /// claimed.
     #[test]
     fn a_message_past_the_limit_is_refused_at_its_prefix() {
         let prefix = |declared: u32| [&[0][..], &declared.to_be_bytes()].concat();

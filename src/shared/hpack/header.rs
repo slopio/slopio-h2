@@ -7,7 +7,6 @@ use http::header::{HeaderName, HeaderValue};
 use http::{Method, StatusCode};
 use std::fmt;
 
-/// HTTP/2 Header
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Header<T = HeaderName> {
     Field { name: T, value: HeaderValue },
@@ -20,7 +19,6 @@ pub enum Header<T = HeaderName> {
     Status(StatusCode),
 }
 
-/// The header field name
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum Name<'a> {
     Field(&'a HeaderName),
@@ -62,10 +60,8 @@ impl Header<Option<HeaderName>> {
 }
 
 impl Header {
-    /// A field as HTTP sees it, or `InvalidField` for one it refuses.
-    ///
-    /// Borrows rather than takes, because a refused field is not dropped:
-    /// the decoder still owes the dynamic table an entry for it.
+    /// A refused field is not dropped: the decoder still owes the dynamic
+    /// table an entry for it.
     pub fn new(name: &[u8], value: &Bytes) -> Result<Header, DecoderError> {
         if name.is_empty() {
             return Err(DecoderError::InvalidField);
@@ -111,7 +107,6 @@ impl Header {
         }
     }
 
-    /// Returns the header name
     pub fn name(&self) -> Name<'_> {
         match *self {
             Header::Field { ref name, .. } => Name::Field(name),
@@ -180,19 +175,6 @@ impl Header {
         }
     }
 
-    /// Whether this header's *value* should be kept out of the dynamic table.
-    ///
-    /// `index_paths` is the caller's answer to one question the encoder cannot
-    /// answer for itself: does this connection send the same `:path` over and
-    /// over? A browser does not — its paths carry query strings and are very
-    /// nearly unique, so indexing them evicts the entries that would have been
-    /// reused, and nghttp2's rule (which the rest of this list is borrowed
-    /// from) is to leave them out.
-    ///
-    /// A gRPC client is the opposite case: the path *is* the method name, a
-    /// handful of values repeated for the life of the connection. Left out,
-    /// each call re-Huffman-encodes the same 28 characters and sends 23 bytes
-    /// that one index byte would have carried.
     pub fn skip_value_index(&self, index_paths: bool) -> bool {
         use http::header;
 
@@ -215,7 +197,6 @@ impl Header {
     }
 }
 
-// Mostly for tests
 impl From<Header> for Header<Option<HeaderName>> {
     fn from(src: Header) -> Self {
         match src {
@@ -234,7 +215,6 @@ impl From<Header> for Header<Option<HeaderName>> {
 }
 
 impl<'a> Name<'a> {
-    /// As [`Header::new`], for a name the table already holds.
     pub fn into_entry(self, value: &Bytes) -> Result<Header, DecoderError> {
         match self {
             Name::Field(name) => Ok(Header::Field {
@@ -263,9 +243,8 @@ impl<'a> Name<'a> {
     }
 }
 
-/// §8.2.1: a field value is malformed with NUL, CR or LF anywhere, or
-/// whitespace at either end. `HeaderValue` refuses the first three and every
-/// other control character; the ends are ours to check.
+/// §8.2.1: `HeaderValue` refuses NUL, CR, LF and other controls; whitespace
+/// at either end is ours to check.
 fn field_value(value: &[u8]) -> Result<HeaderValue, DecoderError> {
     if value
         .first()
@@ -278,18 +257,14 @@ fn field_value(value: &[u8]) -> Result<HeaderValue, DecoderError> {
     Ok(HeaderValue::from_bytes(value)?)
 }
 
-/// `:authority`, `:scheme`, `:path` and `:protocol` are URI components or a
-/// token, and none of those grammars has room for a control character, a
-/// space or DEL. Refusing them here is what keeps a `:path` of
-/// `/a\r\nX: y` from reaching a handler that relays it to HTTP/1.1.
+/// No control character, space or DEL fits these grammars. Refusing them keeps
+/// a `:path` of `/a\r\nX: y` from reaching a handler that relays it to HTTP/1.1.
 fn pseudo_value(value: &Bytes) -> Result<BytesStr, DecoderError> {
     if value.iter().any(|&b| b <= b' ' || b == 0x7f) {
         return Err(DecoderError::InvalidField);
     }
     Ok(BytesStr::try_from(value.clone())?)
 }
-
-// ===== impl BytesStr =====
 
 impl BytesStr {
     pub(crate) const fn from_static(value: &'static str) -> Self {

@@ -1,23 +1,7 @@
 //! What a connection costs a server before it has served anything.
 //!
-//! Opens `N` connections, finishes their handshakes and holds them, so the
-//! server's RSS delta over its own baseline, divided by `N`, is the cost of an
-//! idle connection. That is the number [`accept_only`] asks for and never
-//! provided a way to produce.
-//!
 //!     PORT=8090 cargo run --release --example bench_server &
 //!     N=2000 ADDR=127.0.0.1:8090 cargo run --release --example idle_clients
-//!
-//! It measured 12.73 KiB before the HPACK arenas moved to one set per worker
-//! and 8.78 after — reproducible to the byte across runs, and within a
-//! rounding error of the 4 KiB the decoder used to allocate per connection at
-//! birth. The staging arena is not in that figure: it is allocated at the
-//! first header block, which an idle connection never sends.
-//!
-//! It is also the only thing that drives the client at this scale, which is
-//! worth something on its own: 2000 connections, 2000 loop tasks, one thread.
-//!
-//! [`accept_only`]: ../accept_only/index.html
 
 use std::net::SocketAddr;
 

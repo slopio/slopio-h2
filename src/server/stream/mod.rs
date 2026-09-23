@@ -21,14 +21,7 @@ use crate::{
 
 mod input_data;
 
-/// Where a request's body lands, chosen once, at HEADERS.
-///
-/// Two types and not one with more variants: an HTTP body and a gRPC one have
-/// different contracts with the stream task — what is delivered, when the task
-/// is woken, when credit goes back — and nothing of [`InputData`] had to
-/// change for the other to exist.
 enum Input {
-    /// END_STREAM on the HEADERS, or a declared length of zero.
     None,
     Http(InputData),
     #[cfg(feature = "grpc")]
@@ -51,136 +44,68 @@ impl Input {
     }
 }
 
-/// How long a body is given before its rate is judged at all.
-///
-/// Covers the first round trip and the handler's first poll, so a stream is
-/// never failed for the time it took to get started. Five seconds is far more
-/// than either needs and costs an attacker five seconds a stream, which is not
-/// a budget worth having.
+/// How long a body is given before its rate is judged at all, so a stream is
+/// never failed for the time it took to get started.
 const BODY_GRACE: Duration = Duration::from_secs(5);
 
-/// Bytes per second below which a request body is not slow but held.
-///
-/// This is a floor, not a service level, and it is set where it is because the
-/// honest slow case has to pass it comfortably: 256 B/s is about a fortieth of
-/// a 2G link, so any peer actually sending a body clears it by orders of
-/// magnitude. What it does not clear is the attack, which sends one byte per
-/// frame and per minute to hold a stream open for nothing.
-///
-/// Read with `BODY_GRACE`, this is what a peer must have sent by the time it
-/// is first judged: 1280 bytes at five seconds.
+/// Bytes per second below which a request body is not slow but held: a floor
+/// against a peer trickling bytes to hold a stream open, not a service level.
 const MIN_BODY_RATE: u64 = 256;
 
 /// How long a response may have waited on the peer's credit, in total, before
-/// its rate is judged.
-///
-/// Time spent waiting for credit and not time since the first byte, which is
-/// the difference between judging the peer and judging ourselves: a handler
-/// thinks before its first byte and may think between any two after it — an
-/// event stream is mostly that — and a clock that ran through those pauses
-/// would fail the stream whenever the *handler* was slow. There is no
-/// equivalent dead time inbound, which is why [`BODY_GRACE`] can start where
-/// it does.
+/// its rate is judged. Only time waiting for credit counts, so a slow handler
+/// never fails its own stream.
 const SEND_GRACE: Duration = Duration::from_secs(5);
 
 /// Bytes per second below which a peer is not receiving a response, it is
-/// holding one.
-///
-/// Set against the same reasoning as [`MIN_BODY_RATE`] and with the same
-/// caveat: a floor on how fast we will serve is a service level, not an abuse
-/// signal, because nothing at this layer can tell a phone on a bad train line
-/// from an attacker — both advertise small windows and drain slowly. So it is
-/// pitched as an insult rather than a threshold. The attack it answers credits
-/// a byte at a time; 256 B/s is thousands of times more than that and far
-/// below anything a real client sustains.
+/// holding one: a floor against a peer crediting a byte at a time.
 const MIN_SEND_RATE: u64 = 256;
 
 /// Reached only through an `Rc` shared with the stream task, so everything the
 /// connection mutates while a frame is being decoded lives behind a `Cell`.
 ///
-/// A stream has two halves that close independently (§5.1): the peer's, by
-/// its END_STREAM on DATA or trailers, and ours, by the END_STREAM of our
-/// response. `no_more_input` and `no_more_output` track them one each; both
-/// set is the closed state that lets the connection take the stream out of
-/// its map.
+/// The two halves close independently (§5.1); both `no_more_input` and
+/// `no_more_output` set is the closed state that lets the connection take the
+/// stream out of its map.
 pub struct StreamState {
-    /// When the peer's HEADERS opened this stream.
-    ///
-    /// The runtime's clock, not the OS's: the event loop samples
-    /// `SystemTime::now()` once per scheduler pass and the timewheel keeps
-    /// it, so every stream opened in that pass reads the same cached value
-    /// and opening one costs no clock call of its own. Fresh to within a
-    /// pass, which is finer than anything a stream deadline cares about.
     created_at: SystemTime,
     header: Box<Headers>,
-    /// §8.1: the trailers, if the request had any. Written once by the
-    /// connection at END_STREAM, taken once by the task after the body. The
-    /// decoder's own `Box`, kept as is: 8 bytes per stream for something
-    /// almost no request carries.
     trailers: Cell<Option<Box<Headers>>>,
-    /// The peer's half is done: its END_STREAM came, on the HEADERS, a DATA
-    /// or the trailers. Half-closed(remote) from here on — DATA or HEADERS
-    /// after it is a frame on a stream that, from its side, no longer
-    /// exists.
+    /// Half-closed(remote) once set: DATA or HEADERS after it is a stream
+    /// error.
     no_more_input: Cell<bool>,
-    /// Our half is done: the response is written, END_STREAM included. Says
-    /// nothing about the peer's half — the stream is half-closed(local), and
-    /// §5.1 still lets the peer send its body.
+    /// Says nothing about the peer's half: §5.1 still lets the peer send its
+    /// body.
     no_more_output: Cell<bool>,
     input: RefCell<Input>,
-    /// What the request's `content-type` made of it, body or no body: a gRPC
-    /// call that sends no message is still one, and is answered as one.
     #[cfg(feature = "grpc")]
     grpc: Option<GrpcFormat>,
-    /// Body bytes taken so far, padding excluded. Doubles as the write cursor
-    /// of a pre-allocated buffer.
+    /// Padding excluded. Doubles as the write cursor of a pre-allocated
+    /// buffer.
     received: Cell<u64>,
-    /// Response body bytes handed to the peer.
-    ///
-    /// Counted where `write_data` writes a frame, which is the point the peer
-    /// controls: that loop only advances by what the stream and connection
-    /// windows have credited, so this measures the peer's pace and not ours.
     sent: Cell<u64>,
-    /// Since when the writer has been parked with no credit from the peer, or
-    /// `None` while it is not.
     send_blocked_since: Cell<Option<SystemTime>>,
-    /// Every such wait already over, added up.
-    ///
-    /// With the one above, the clock [`Stream::output_is_starving`] runs on:
-    /// only time the peer made us wait. A handler that has produced nothing,
-    /// or is between two writes, accrues none and is never judged.
+    /// Only time the peer made us wait accrues here, so a slow handler is
+    /// never judged.
     send_blocked: Cell<Duration>,
-    /// Body bytes taken from the connection window and not yet consumed by
-    /// the task — still holding credit. Whatever is left when the stream
-    /// goes must be given back, or the connection window shrinks for good.
+    /// Connection credit still held. Whatever is left when the stream goes
+    /// must be given back, or the connection window shrinks for good.
     unreleased: Cell<u32>,
-    /// A response head has been written. Not the same as `no_more_output`,
-    /// which the token sets on the way out whether or not anything was said:
-    /// this is what tells a handler that returned in silence from one that
-    /// answered.
+    /// Not the same as `no_more_output`, which the token sets on the way out
+    /// whether or not anything was said.
     responded: Cell<bool>,
-    /// This stream is out of the connection's live table: it finished and was
-    /// retired, or the peer reset it, or the connection is going down. Either
-    /// way nothing its task writes from here reaches anyone.
-    ///
-    /// The fact belongs here rather than in the table's membership, which is
-    /// where it used to be read from. Whether it is still in that table is the
-    /// one thing a stream's own task cannot otherwise know — and asking cost a
-    /// `Weak::upgrade`, a hash lookup and an `Rc` round trip on every request,
-    /// to answer a question only a cancelled stream ever asks. It measured 3%.
+    /// Out of the connection's live table: nothing its task writes from here
+    /// reaches anyone.
     retired: Cell<bool>,
     window: StreamWindow,
     waker: RefCell<Option<Waker>>,
 }
 
 impl StreamState {
-    /// `settings` are the peer's: they credit the send window.
     pub fn create(settings: &Settings, header: Box<Headers>) -> Result<Self, StreamViolation> {
         let content_length =
             content_length(header.fields()).map_err(|()| StreamViolation::MalformedRequest)?;
 
-        // END_STREAM already on the request: the stream is born
-        // half-closed(remote).
         let end_stream = header.is_end_stream();
 
         // §8.1.1: with END_STREAM on the HEADERS no DATA can follow, so a
@@ -189,14 +114,9 @@ impl StreamState {
             return Err(StreamViolation::ContentLengthMismatch);
         }
 
-        // Read whether or not a body follows: a gRPC call that sends no
-        // message is still one, and is answered as one.
         #[cfg(feature = "grpc")]
         let grpc = GrpcFormat::of(&header);
 
-        // Nothing is allocated for a request that cannot carry a body, nor
-        // for one that declares an empty one. For the others, all there is to
-        // go on is the HEADERS.
         let input = match content_length {
             _ if end_stream => Input::None,
             Some(0) => Input::None,
@@ -233,50 +153,25 @@ impl StreamState {
         })
     }
 
-    /// When this stream was opened.
     pub fn created_at(&self) -> SystemTime {
         self.created_at
     }
 
-    /// How long this stream has been open, read off the same cached clock.
-    ///
-    /// That clock is the wall clock, so it can step backwards under NTP; an
-    /// age that would come out negative reads as zero instead. Nothing that
-    /// asks a stream its age — a deadline, a slow-request counter — is worth
-    /// failing a request over a clock adjustment.
+    /// Floors at zero on a wall clock that stepped backwards, so a clock
+    /// adjustment never fails a request.
     pub fn age(&self) -> Duration {
         runtime::runtime::now()
             .duration_since(self.created_at)
             .unwrap_or_default()
     }
 
-    /// Whether this stream's body is arriving too slowly to be a body.
+    /// A rate and not a deadline: a deadline cannot tell a large upload from
+    /// a slow one. Averaged from the stream opening, so a peer cannot bank
+    /// credit by starting fast and then stalling.
     ///
-    /// A rate and not a deadline, because a deadline cannot tell a large
-    /// upload from a slow one: 100 MB legitimately takes longer than 1 KB, and
-    /// any single duration that lets the first through lets a peer hold a
-    /// stream for exactly that long with one byte. Bytes over age says the
-    /// same thing about both.
-    ///
-    /// Nothing is judged before `BODY_GRACE`. A stream milliseconds old has no
-    /// meaningful rate — the first DATA frame of a perfectly healthy upload
-    /// arrives when it arrives — and dividing by an age near zero is how a
-    /// defence starts killing the requests it exists to protect.
-    ///
-    /// `age` is measured from the stream opening, not from the last frame, so
-    /// this is an average and not an instantaneous rate: a peer cannot bank
-    /// credit by starting fast and then stalling, which is what a
-    /// since-last-frame measure would allow. It also means the clock runs
-    /// while a handler is thinking, which is why the rate has to be set low
-    /// enough to be an insult rather than a service level.
-    ///
-    /// Fails open on a clock that stepped backwards: [`Stream::age`] floors at
-    /// zero, so the comparison reads as infinitely fast rather than as a
-    /// stalled peer.
+    /// Fails open on a clock that stepped backwards.
     pub fn body_is_starving(&self) -> bool {
-        // END_STREAM came: the peer owes nothing more, so whatever time
-        // passes from here is the handler's. The sweep asks every live
-        // stream, and a GET is one whose body ended with its HEADERS.
+        // The peer owes nothing more; whatever time passes is the handler's.
         if self.no_more_input.get() {
             return false;
         }
@@ -284,35 +179,26 @@ impl StreamState {
         if age < BODY_GRACE {
             return false;
         }
-        // Multiply rather than divide: `age` is at least `BODY_GRACE` here, so
-        // there is no division by zero to guard, and no rounding to argue
-        // about.
         let owed = MIN_BODY_RATE.saturating_mul(age.as_secs());
         self.received.get() < owed
     }
 
-    /// The id the peer opened this stream with.
     pub fn id(&self) -> crate::shared::codec::frames::stream_id::StreamId {
         self.header.stream_id()
     }
 
-    /// The request's `:path`.
     pub fn path(&self) -> Option<&str> {
         self.header.pseudo().path.as_deref()
     }
 
-    /// The request's `:method`.
     pub fn method(&self) -> Option<&http::Method> {
         self.header.pseudo().method.as_ref()
     }
 
-    /// Its ordinary fields, pseudo-headers excluded — those are `method`,
-    /// `path` and their neighbours (§8.3).
     pub fn fields(&self) -> &http::HeaderMap {
         self.header.fields()
     }
 
-    /// Whether a response head has gone out for this stream.
     pub fn has_responded(&self) -> bool {
         self.responded.get()
     }
@@ -321,19 +207,15 @@ impl StreamState {
         self.responded.set(true);
     }
 
-    /// Whether this stream is out of the connection's live table.
     pub fn is_retired(&self) -> bool {
         self.retired.get()
     }
 
-    /// Called by whoever takes it out, which is the connection and never the
-    /// stream's own task.
+    /// Called by the connection, never the stream's own task.
     pub fn note_retired(&self) {
         self.retired.set(true);
     }
 
-    /// Records `n` response body bytes as having gone to the peer, which
-    /// ends whatever wait for credit came before them.
     pub fn note_sent(&self, n: usize) {
         if let Some(since) = self.send_blocked_since.take() {
             self.send_blocked
@@ -342,7 +224,6 @@ impl StreamState {
         self.sent.set(self.sent.get() + n as u64);
     }
 
-    /// The writer found no credit and is about to park on it.
     fn note_send_blocked(&self) {
         if self.send_blocked_since.get().is_none() {
             self.send_blocked_since
@@ -350,18 +231,9 @@ impl StreamState {
         }
     }
 
-    /// Whether the peer is taking its response too slowly to be receiving it.
-    ///
-    /// The mirror of [`Stream::body_is_starving`], and it has to exist
-    /// separately because the two measure opposite directions: `received`
-    /// counts what arrives, and a peer that metes out a response with
-    /// one-byte WINDOW_UPDATEs sends us nothing to count.
-    ///
-    /// The rate is bytes over the time spent *waiting for the peer's credit*,
-    /// not over the life of the response — see [`SEND_GRACE`]. A peer that
-    /// credits a byte at a time keeps the writer parked between every two
-    /// bytes, so nearly all of its elapsed time counts; a handler pacing its
-    /// own output to a peer with credit to spare counts none.
+    /// Catches a peer metering a response out with one-byte WINDOW_UPDATEs.
+    /// The rate is over time spent waiting for the peer's credit only (see
+    /// [`SEND_GRACE`]).
     pub fn output_is_starving(&self) -> bool {
         let waiting = self
             .send_blocked_since
@@ -374,16 +246,13 @@ impl StreamState {
         self.sent.get() < MIN_SEND_RATE.saturating_mul(blocked.as_secs())
     }
 
-    /// A WINDOW_UPDATE on this stream. The task may be waiting on exactly
-    /// this, so it is woken; it re-checks the window itself.
     pub fn credit_send(&self, increment: u32) -> Result<(), ()> {
         self.window.credit_send(increment)?;
         self.wake();
         Ok(())
     }
 
-    /// §6.9.2: the peer's initial window changed. Woken only when the change
-    /// opens room — a shrink has nothing to offer a waiting task.
+    /// §6.9.2: the peer's initial window changed.
     pub fn adjust_send(&self, delta: i32) -> Result<(), ()> {
         self.window.adjust_send(delta)?;
         if delta > 0 {
@@ -392,30 +261,24 @@ impl StreamState {
         Ok(())
     }
 
-    /// What a DATA frame may still spend on this stream.
     pub fn available_send(&self) -> u32 {
         self.window.available_send()
     }
 
-    /// Whether the writer is parked for want of credit, and still has none.
-    ///
-    /// Both halves, because the first alone can go stale: a writer woken by
-    /// credit that then found the output full is parked on room, not credit,
-    /// and has not written anything to clear the mark yet.
-    /// `connection_credit` is the other window a DATA frame spends.
+    /// Both checks, because `send_blocked_since` alone can go stale: a writer
+    /// woken by credit that then found the output full is parked on room, not
+    /// credit.
     pub fn is_stalled_on_credit(&self, connection_credit: u32) -> bool {
         self.send_blocked_since.get().is_some() && self.available_send().min(connection_credit) == 0
     }
 
-    /// Debits the send window for a DATA frame of ours. `Err` is the peer's
-    /// credit running short, with nothing debited.
+    /// `Err` debits nothing.
     pub fn debit_send(&self, len: u32) -> Result<(), ()> {
         self.window.debit_send(len)
     }
 
-    /// The task parks here, on whatever it waits for — body bytes, a
-    /// WINDOW_UPDATE. One slot: a stream has one task, and that task waits
-    /// on one thing at a time. Whoever wakes it, it re-checks its condition.
+    /// One slot: a stream has one task, and that task waits on one thing at a
+    /// time. Whoever wakes it, it re-checks its condition.
     pub fn register_waker(&self, waker: &Waker) {
         let mut slot = self.waker.borrow_mut();
         if !slot.as_ref().is_some_and(|w| w.will_wake(waker)) {
@@ -423,56 +286,41 @@ impl StreamState {
         }
     }
 
-    /// Debits the receive window. Split from `recv_data` because an overrun
-    /// here is a connection error, not a stream one.
+    /// Split from `recv_data` because an overrun here is a connection error,
+    /// not a stream one.
     pub fn recv_window(&self, padded_len: u32) -> Result<(), ()> {
         self.window.recv(padded_len)
     }
 
-    /// Connection credit this stream still holds, zeroed on the way out so
-    /// it can only be given back once.
+    /// Zeroed on the way out so it can only be given back once.
     pub fn take_unreleased(&self) -> u32 {
         self.unreleased.replace(0)
     }
 
-    /// Our half is done. Called by the stream's `StreamToken` on the way
-    /// out, so it happens however the task ends — returning, reset, or going
-    /// down with its connection. Only our half: the stream leaves the map
-    /// once the peer's is closed too.
     pub fn end_output(&self) {
         self.no_more_output.set(true);
     }
 
-    /// Whether the peer's half is done: its END_STREAM came, or we stopped
-    /// expecting one.
     pub fn input_ended(&self) -> bool {
         self.no_more_input.get()
     }
 
-    /// Whether our END_STREAM has gone out: on the head of a response with no
-    /// body, on the last of its DATA, or on its trailers.
     pub fn output_ended(&self) -> bool {
         self.no_more_output.get()
     }
 
-    /// Stops expecting anything more from the peer, for a stream we have just
-    /// reset: a RST_STREAM closes both halves at once (§5.1), and whatever of
-    /// the body is still in flight lands on a stream that is gone.
+    /// For a stream we have just reset: RST_STREAM closes both halves (§5.1).
     pub fn abandon_input(&self) {
         self.no_more_input.set(true);
     }
 
-    /// Both halves done, which is what lets the connection remove the
-    /// stream. A task that answered before the peer finished sending keeps
-    /// the stream in the map until its END_STREAM, or a reset, arrives;
-    /// §8.1 lets us hurry that along with a RST_STREAM(NO_ERROR) after a
-    /// complete response, later.
+    /// Both halves done, which is what lets the connection remove the stream.
     pub fn is_closed(&self) -> bool {
         self.no_more_output.get() && self.no_more_input.get()
     }
 
-    /// Takes the second and last HEADERS of a request (§8.1). Ends the input
-    /// exactly as END_STREAM on DATA does, with the same final check.
+    /// §8.1. Ends the input exactly as END_STREAM on DATA does, with the same
+    /// final check.
     pub fn recv_trailers(&self, headers: Box<Headers>) -> Result<(), StreamViolation> {
         if self.no_more_input.get() {
             return Err(StreamViolation::DataAfterEndStream);
@@ -494,8 +342,6 @@ impl StreamState {
         if declared.is_some_and(|declared| self.received.get() != declared) {
             return Err(StreamViolation::ContentLengthMismatch);
         }
-        // A gRPC client sends no trailers, but one that did has ended its
-        // body all the same, and between two messages or not.
         #[cfg(feature = "grpc")]
         {
             if let Input::Grpc(input) = &mut *self.input.borrow_mut() {
@@ -509,17 +355,10 @@ impl StreamState {
         Ok(())
     }
 
-    /// The trailers, once and only once — the task's to take after the body.
     pub fn take_trailers(&self) -> Option<Box<Headers>> {
         self.trailers.take()
     }
 
-    /// Which of the two body contracts this request falls under, decided by
-    /// its `content-length` when the stream was created: `true` for the one
-    /// delivered whole by [`Stream::body`], `false` for the one drained
-    /// through [`Stream::readable`], [`Stream::peek`] and
-    /// [`Stream::consume`]. A request with no body counts as the first, and
-    /// `body` answers `None` for it.
     pub fn body_is_oneshot(&self) -> bool {
         self.input
             .borrow()
@@ -527,35 +366,21 @@ impl StreamState {
             .is_none_or(|input| !input.wakes_per_frame())
     }
 
-    /// Whether this request is gRPC, and its body therefore a sequence of
-    /// messages taken through [`Stream::message`] rather than a body.
     #[cfg(feature = "grpc")]
     pub fn is_grpc(&self) -> bool {
         self.grpc.is_some()
     }
 
-    /// What a gRPC request's messages are serialised as, `None` when the
-    /// request is not gRPC.
     #[cfg(feature = "grpc")]
     pub fn grpc_format(&self) -> Option<GrpcFormat> {
         self.grpc
     }
 
-    /// The whole body, once it is whole.
-    ///
-    /// Resolves at END_STREAM and not before — nothing is handed over in
-    /// pieces. The credit is another matter: each frame's bytes are credited
-    /// back as they land, since they are in the buffer and nothing about
-    /// them waits on the peer, so a body left unfinished holds no window,
-    /// only its stream's slot, until the starvation sweep takes that too.
-    /// What bounds this form is `InputData::ONESHOT_LIMIT`, on memory alone.
-    ///
-    /// `None` when the request carried no body, or when it is large enough
-    /// that it has to be drained instead — [`Stream::body_is_oneshot`] is
-    /// what tells the two apart beforehand.
+    /// Each frame's bytes are credited back as they land, so an unfinished
+    /// body holds no window, only its stream's slot, until the starvation
+    /// sweep takes that too.
     pub fn body(&self) -> impl Future<Output = Option<Box<[u8]>>> {
         std::future::poll_fn(move |cx| {
-            // Incomplete: the peer's half is still open, so more is coming.
             if !self.no_more_input.get() {
                 self.register_waker(cx.waker());
                 return Poll::Pending;
@@ -571,12 +396,6 @@ impl StreamState {
         })
     }
 
-    /// Waits until the body has bytes to take, or has ended.
-    ///
-    /// `false` is the end: the peer's half is closed and the buffer is
-    /// drained, so no further [`Stream::peek`] will ever show anything. A
-    /// body that ended with bytes still buffered answers `true` until they
-    /// are consumed.
     pub fn readable(&self) -> impl Future<Output = bool> {
         std::future::poll_fn(move |cx| {
             if self.available_len() > 0 {
@@ -590,20 +409,15 @@ impl StreamState {
         })
     }
 
-    /// Shows what is buffered without consuming it. The slice borrows the
-    /// stream's buffer, hence the closure: nothing may hold it across the
-    /// `await` that would let the connection push more in.
+    /// The slice must not be held across the `await` that would let the
+    /// connection push more in, hence the closure.
     pub fn peek<R>(&self, with: impl FnOnce(&[u8]) -> R) -> R {
         let input = self.input.borrow();
         with(input.http().map_or(&[][..], InputData::available))
     }
 
-    /// Takes the `n` leading bytes the handler is done with, and says how
-    /// many that was — `n` clamped to what is actually there.
-    ///
-    /// Only the bookkeeping: the credit those bytes were holding is now owed
-    /// back to the peer, and `SharedConnection::consume` is what turns it
-    /// into WINDOW_UPDATE frames, being the half that can write.
+    /// Only the bookkeeping: `SharedConnection::consume` writes the
+    /// WINDOW_UPDATE frames.
     pub fn consume(&self, n: usize) -> u32 {
         let mut input = self.input.borrow_mut();
         let Some(input) = input.http_mut() else {
@@ -611,15 +425,13 @@ impl StreamState {
         };
         let n = n.min(input.available().len());
         input.consume(n);
-        // Held credit, so bounded by the receive window and by `unreleased`
-        // itself, which counts the same bytes.
+        // Cannot underflow: `unreleased` counts the same bytes.
         self.unreleased.set(self.unreleased.get() - n as u32);
         n as u32
     }
 
-    /// Credit owed back to the peer on *this stream* for consumed bytes.
-    /// `Some` is the amount to announce, already credited here, so the
-    /// caller must write the frame that carries it.
+    /// `Some` is already credited here, so the caller must write the frame
+    /// that carries it.
     #[must_use]
     pub fn release_recv(&self, len: u32) -> Option<u32> {
         self.window.release_recv(len)
@@ -632,27 +444,11 @@ impl StreamState {
             .map_or(0, |input| input.available().len())
     }
 
-    /// Takes one DATA payload, already stripped of its padding.
+    /// `payload` is already stripped of padding: flow control accounts for
+    /// padding, `content-length` does not.
     ///
-    /// The length that matters here is `payload.len()`, never the padded one:
-    /// flow control accounts for padding, `content-length` does not.
-    ///
-    /// `Ok(n)` is how much of the payload was consumed on the spot and owes
-    /// the peer its credit back now — on the connection, and on the stream
-    /// unless `end_stream` made that pointless. The caller writes the frames,
-    /// this half cannot.
-    ///
-    /// What counts as consumed is what was copied somewhere the transport is
-    /// done with. A body held whole for [`Stream::body`] answers the whole
-    /// payload: the bytes are in the buffer that will be handed over, and
-    /// nothing about them waits on the peer. A gRPC body answers the same as
-    /// long as no whole message is waiting for the handler, and zero once one
-    /// is, so that a handler that has fallen behind is a peer that waits;
-    /// what is held goes back through [`release_held`]. A drained body
-    /// answers zero: its bytes wait for the handler's `consume`, which is
-    /// the one contract where the handler's pace is the peer's.
-    ///
-    /// [`release_held`]: Self::release_held
+    /// `Ok(n)` is how much was consumed on the spot and owes the peer its
+    /// credit back now; the caller must write the frames.
     pub fn recv_data(&self, payload: &[u8], end_stream: bool) -> Result<u32, StreamViolation> {
         if self.no_more_input.get() {
             return Err(StreamViolation::DataAfterEndStream);
@@ -673,13 +469,10 @@ impl StreamState {
             return Err(StreamViolation::ContentLengthMismatch);
         }
 
-        // §8.1.1 again: exceeding the declared length is an error as soon as
-        // it happens — no reason to take the rest of the body first. Whether a
-        // payload fits is for what holds the body to say, and `push` is where
-        // an HTTP body says it.
+        // §8.1.1: exceeding the declared length is an error as soon as it
+        // happens; for an HTTP body, `push` decides.
         let (wake, consumed) = match &mut *input {
-            // No buffer at all is a declared length of zero, so any byte is
-            // one too many.
+            // A declared length of zero, so any byte is one too many.
             Input::None if !payload.is_empty() => {
                 return Err(StreamViolation::ContentLengthMismatch);
             }
@@ -688,10 +481,6 @@ impl StreamState {
                 input
                     .push(at, payload)
                     .map_err(|_| StreamViolation::ContentLengthMismatch)?;
-                // A body held whole is worth waking for only once, and its
-                // bytes are consumed as they land; a drained one has
-                // something to take on every frame, and holds it until the
-                // handler does.
                 if input.wakes_per_frame() {
                     (true, 0)
                 } else {
@@ -707,9 +496,8 @@ impl StreamState {
                 if end_stream {
                     input.end();
                 }
-                // Consumed into the message being assembled, unless a whole
-                // one is waiting: then the handler is behind, and these bytes
-                // keep their credit until it takes one.
+                // While a whole message waits, the handler is behind and
+                // these bytes keep their credit until it takes one.
                 let consumed = if input.has_ready() {
                     0
                 } else {
@@ -719,9 +507,8 @@ impl StreamState {
             }
         };
 
-        // Only now: a payload that was refused never landed. What was not
-        // consumed on the spot holds connection credit until a handler takes
-        // it — bounded by the receive window, so it cannot outgrow a u32.
+        // Only now: a payload that was refused never landed. `unreleased` is
+        // bounded by the receive window, so it cannot outgrow a u32.
         self.received.set(received);
         self.unreleased
             .set(self.unreleased.get() + payload.len() as u32 - consumed);
@@ -734,11 +521,6 @@ impl StreamState {
         Ok(consumed)
     }
 
-    /// The next gRPC message, once it is whole.
-    ///
-    /// `None` is the end: the peer's END_STREAM came and every message has
-    /// been taken — or the request is not gRPC. `Some(Err(_))` is a body that
-    /// stopped being gRPC, told once, after whatever was whole before it.
     #[cfg(feature = "grpc")]
     pub fn message(&self) -> impl Future<Output = Option<Result<GrpcFrame, GrpcError>>> {
         std::future::poll_fn(move |cx| {
@@ -757,14 +539,8 @@ impl StreamState {
         })
     }
 
-    /// Lets go of every byte still holding credit — what arrived while a
-    /// whole message was waiting, now that the handler has taken one. The
-    /// first is the connection's share, the caller's to hand back; the second
-    /// is the stream's, to announce.
-    ///
-    /// At once rather than accumulated, unlike [`release_recv`]: the peer
-    /// was made to wait on exactly this, and credit held back below a
-    /// threshold is credit it keeps waiting for.
+    /// At once rather than accumulated, unlike [`release_recv`]: the peer was
+    /// made to wait on exactly this.
     ///
     /// [`release_recv`]: Self::release_recv
     #[cfg(feature = "grpc")]
@@ -781,13 +557,7 @@ impl StreamState {
     }
 }
 
-/// One request, and the response owed for it: what a handler is handed.
-///
-/// The mirror of the client's [`Stream`](crate::client::Stream), and owned the
-/// same way — it is the handler's for as long as the handler runs, and
-/// dropping it is what ends the server's half of the exchange (§5.1). A
-/// handler that returns without answering gets a `500` written for it, because
-/// the alternative is a peer waiting for a response that will never come.
+/// Dropping it is what ends the server's half of the exchange (§5.1).
 ///
 /// Not `Clone` and not `Send`: one stream, one task, one thread.
 pub struct Stream {
@@ -803,101 +573,63 @@ impl Stream {
         self.token.stream()
     }
 
-    /// §5.1.1: the id the peer opened this stream with. Odd, since a client
-    /// opens it.
+    /// §5.1.1: odd, since a client opens it.
     pub fn id(&self) -> StreamId {
         self.token.id()
     }
 
-    /// The request's `:method`.
     pub fn method(&self) -> Option<&http::Method> {
         self.state().method()
     }
 
-    /// The request's `:path`.
     pub fn path(&self) -> Option<&str> {
         self.state().path()
     }
 
-    /// The request's ordinary fields.
     pub fn fields(&self) -> &http::HeaderMap {
         self.state().fields()
     }
 
-    /// Which body contract this request falls under, decided by its
-    /// `content-length` when the stream was created: `true` for one delivered
-    /// whole by [`Stream::body`], `false` for one drained through
-    /// [`Stream::readable`], [`Stream::peek`] and [`Stream::consume`].
     pub fn body_is_oneshot(&self) -> bool {
         self.state().body_is_oneshot()
     }
 
-    /// The whole body, once it is whole. `None` when the request carried none,
-    /// or when it is large enough that it has to be drained instead.
     pub fn body(&self) -> impl Future<Output = Option<Box<[u8]>>> {
         self.state().body()
     }
 
-    /// Waits until the body has bytes to take, or has ended. `false` is the
-    /// end.
     pub fn readable(&self) -> impl Future<Output = bool> {
         self.state().readable()
     }
 
-    /// Shows what is buffered without consuming it. The slice borrows the
-    /// stream's buffer, hence the closure: nothing may hold it across the
-    /// `await` that would let the connection push more in.
+    /// The slice must not be held across the `await` that would let the
+    /// connection push more in, hence the closure.
     pub fn peek<R>(&self, with: impl FnOnce(&[u8]) -> R) -> R {
         self.state().peek(with)
     }
 
-    /// Takes the `n` leading bytes the handler is done with, and hands the
-    /// peer back the credit they were holding (§6.9.1). A handler that stops
-    /// consuming is a handler that stops the upload, which is the point.
+    /// §6.9.1: a handler that stops consuming stops the upload.
     pub fn consume(&self, n: usize) {
         self.token.shared().consume(self.id(), self.state(), n);
     }
 
-    /// Whether the request is gRPC: a POST with `content-type:
-    /// application/grpc`, whether or not it carries a body — one that ends on
-    /// its HEADERS is a call with no message, and still a call. Its body is a
-    /// sequence of messages, taken through [`message`](Self::message); the
-    /// body accessors answer as they do for a request that has none.
     #[cfg(feature = "grpc")]
     pub fn is_grpc(&self) -> bool {
         self.state().is_grpc()
     }
 
-    /// What the request's messages are serialised as — `+proto`, `+json` —
-    /// known from its HEADERS, before any message. `None` when the request is
-    /// not gRPC.
     #[cfg(feature = "grpc")]
     pub fn grpc_format(&self) -> Option<GrpcFormat> {
         self.state().grpc_format()
     }
 
-    /// The next gRPC message, whole: a [`GrpcFrame`], whose two variants are
-    /// what the prefix's Compressed-Flag said. Only the uncompressed one hands
-    /// out its bytes; the compressed one knows its encoding and converts.
-    ///
-    /// `None` is the peer's half-close with nothing left to take. A unary
-    /// handler calls this once and expects `None` from a second call; a
-    /// client-streaming one loops. `Some(Err(_))` is a body that stopped
-    /// being gRPC — a message over the limit, a bad flag, an END_STREAM in the
-    /// middle of one — for the handler to answer with a `grpc-status`.
-    ///
-    /// A message's bytes are credited back as they arrive, so a peer is
-    /// never short of window for the one it is sending. Only while a whole
-    /// message is waiting here do the bytes after it keep their credit, and
-    /// taking a message is what lets go of it.
+    /// Only while a whole message is waiting here do the bytes after it keep
+    /// their credit, and taking a message is what lets go of it.
     #[cfg(feature = "grpc")]
     pub async fn message(&self) -> Option<Result<GrpcFrame, GrpcError>> {
         let taken = self.state().message().await;
-        // Nothing to credit a peer that has finished sending, and a unary
-        // call — most calls — is one message and a half-close, so the frame
-        // would go out on every one of them for nothing. What is still held
-        // of the connection window goes back where an HTTP body's does, when
-        // the stream retires.
+        // Once input has ended, held connection credit goes back when the
+        // stream retires.
         if let Some(Ok(_)) = &taken
             && !self.state().input_ended()
         {
@@ -906,31 +638,18 @@ impl Stream {
         taken
     }
 
-    /// §8.1: the trailers, if the request carried any. `None` until the body
-    /// has ended, since that is what a trailer section follows.
+    /// §8.1: `None` until the body has ended.
     pub fn trailers(&self) -> Option<http::HeaderMap> {
         self.state()
             .take_trailers()
             .map(|headers| (*headers).into_fields())
     }
 
-    /// Writes the response head, with more of the response to follow. §8.3
-    /// puts `:status` before every ordinary field, which is done here rather
-    /// than asked of the caller.
+    /// Must precede [`write_data`](Self::write_data), or DATA goes out on a
+    /// stream the peer has had no head for.
     ///
-    /// The body follows through [`write_data`](Self::write_data), and calling
-    /// that first would put DATA on a stream the peer has had no head for. A
-    /// response that is its head and nothing else is
-    /// [`write_headers_final`](Self::write_headers_final).
-    ///
-    /// None of the writers takes an `end_stream` flag. What ends a response is
-    /// a method that takes the stream with it — `write_headers_final`,
-    /// [`write_data_final`](Self::write_data_final),
-    /// [`write_trailers`](Self::write_trailers) — so that writing after the
-    /// end is a compile error rather than a frame on a closed stream, and so
-    /// that the end is something a handler has to say. One that returns
-    /// without saying it has its stream reset, since the peer would otherwise
-    /// wait for the rest of a response that is not coming.
+    /// The `_final` writers take the stream by value so that writing after
+    /// the end is a compile error rather than a frame on a closed stream.
     pub fn write_headers(&self, status: StatusCode, fields: &http::HeaderMap) {
         self.token
             .shared()
@@ -938,10 +657,6 @@ impl Stream {
         self.state().note_responded();
     }
 
-    /// The whole response in its head: `status`, `fields`, END_STREAM.
-    ///
-    /// What a gRPC server calls Trailers-Only, with `grpc-status` among the
-    /// fields.
     pub fn write_headers_final(self, status: StatusCode, fields: &http::HeaderMap) {
         self.token
             .shared()
@@ -950,14 +665,7 @@ impl Stream {
         self.state().end_output();
     }
 
-    /// Writes the next of the response body, with more to follow — or
-    /// trailers.
-    ///
-    /// §6.9.1: cut into DATA frames by what the stream's send window, the
-    /// connection's and the peer's `max_frame_size` allow, and by the room
-    /// left in the output. With none of it this waits, so a body larger than
-    /// the peer will take does not have to be held anywhere but where the
-    /// caller already has it.
+    /// §6.9.1: waits for credit and output room rather than buffering.
     pub async fn write_data(&self, data: &[u8]) {
         self.token
             .shared()
@@ -965,53 +673,27 @@ impl Stream {
             .await;
     }
 
-    /// Writes one gRPC message: its five-byte prefix, then the message
-    /// encoded as protobuf.
-    ///
-    /// No `_final` to go with it, and none is missing. A gRPC response ends
-    /// with its trailers and never with END_STREAM on a DATA frame, so every
-    /// message a handler writes has something after it —
-    /// [`write_trailers`](Self::write_trailers) at the very least, carrying
-    /// the `grpc-status`.
-    ///
-    /// Protobuf, whatever the request's [`grpc_format`](Self::grpc_format)
-    /// said, and unlike [`decode`] this does not refuse: those are the
-    /// handler's own bytes and it picked the method, where a request's bytes
-    /// are the peer's and reading them as the wrong thing is a correctness
-    /// question. Serving `+json` means framing it with
-    /// [`write_data`](Self::write_data) instead — `grpc::frame_message` is
-    /// what this one uses.
-    ///
-    /// [`decode`]: crate::grpc::UncompressedGrpcFrame::decode
+    /// No `_final`: a gRPC response always ends with its trailers, never with
+    /// END_STREAM on DATA.
     #[cfg(feature = "grpc")]
     pub async fn write_message<M: prost::Message>(&self, message: &M) {
         self.write_data(&crate::grpc::frame_message(message)).await;
     }
 
-    /// Writes the last of the response body, END_STREAM on its last frame.
     pub async fn write_data_final(self, data: &[u8]) {
         self.token
             .shared()
             .write_data(self.id(), self.state(), data, true)
             .await;
-        // After the await and not before: a write that is dropped half way
-        // never wrote the frame that carries the flag.
+        // After the await: a write dropped half way never wrote the frame
+        // that carries the flag.
         self.state().end_output();
     }
 
-    /// Ends the response with a trailer section (§8.1): a last HEADERS frame,
-    /// after the body, carrying END_STREAM.
+    /// §8.1 allows no pseudo-header here, which `HeaderName` guarantees.
     ///
-    /// For what is only known once the body has been produced — gRPC puts the
-    /// outcome of the whole call there, as `grpc-status`.
-    ///
-    /// `fields` are ordinary fields only, which the type already guarantees —
-    /// a `HeaderName` cannot start with `:`, and §8.1 allows no pseudo-header
-    /// here.
-    ///
-    /// Does nothing on a stream with no response head yet: trailers the peer
-    /// has had no head for are a malformed response. That leaves the handler
-    /// having answered nothing, and it gets the `500` that is owed for that.
+    /// Does nothing on a stream with no response head yet: trailers without a
+    /// head are a malformed response, and the handler gets the `500` instead.
     pub fn write_trailers(self, fields: &http::HeaderMap) {
         let state = self.state();
         if !state.has_responded() || state.is_retired() {
@@ -1022,14 +704,8 @@ impl Stream {
     }
 }
 
-/// What [`SharedConnection::write_data`] needs of a stream: the send window,
-/// and where to park a writer that has run out of it.
-///
-/// One waker slot serves both directions here, which is sound because a
-/// server stream has one task and that task waits on one thing at a time —
-/// either for body bytes to arrive or for credit to write with, never both.
-///
-/// [`SharedConnection::write_data`]: crate::shared::connection::SharedConnection::write_data
+/// One waker slot serves both directions, which is sound because a server
+/// stream has one task and that task waits on one thing at a time.
 impl crate::shared::connection::SendSide for StreamState {
     fn available_send(&self) -> u32 {
         self.available_send()
@@ -1039,8 +715,8 @@ impl crate::shared::connection::SendSide for StreamState {
         self.debit_send(len)
     }
 
-    /// Only ever called for want of credit — a full output parks elsewhere —
-    /// so this is also where the wait on the peer starts being timed.
+    /// Only ever called for want of credit (a full output parks elsewhere),
+    /// which is what makes it the right place to start timing the wait.
     fn register_send_waker(&self, waker: &Waker) {
         self.note_send_blocked();
         self.register_waker(waker);
@@ -1051,8 +727,7 @@ impl crate::shared::connection::SendSide for StreamState {
     }
 }
 
-/// Floors at zero on a clock that stepped backwards, as [`StreamState::age`]
-/// does.
+/// Floors at zero on a clock that stepped backwards.
 fn elapsed_since(since: SystemTime) -> Duration {
     runtime::runtime::now()
         .duration_since(since)

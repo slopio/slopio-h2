@@ -1,27 +1,19 @@
-//! Extensions specific to the HTTP/2 protocol.
-
 use std::fmt;
 
 use crate::shared::hpack::BytesStr;
 
-/// Represents the `:protocol` pseudo-header used by
-/// the [Extended CONNECT Protocol].
-///
-/// [Extended CONNECT Protocol]: https://datatracker.ietf.org/doc/html/rfc8441#section-4
 #[derive(Clone, Eq, PartialEq)]
 pub struct Protocol {
     value: BytesStr,
 }
 
 impl Protocol {
-    /// Converts a static string to a protocol name.
     pub const fn from_static(value: &'static str) -> Self {
         Self {
             value: BytesStr::from_static(value),
         }
     }
 
-    /// Returns a str representation of the header.
     pub fn as_str(&self) -> &str {
         self.value.as_str()
     }

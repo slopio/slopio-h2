@@ -1,13 +1,3 @@
-//! Everything a client connection holds that is not the transport.
-//!
-//! The connection loop owns the socket and the decoder and is a task of its
-//! own; the application holds [`Client`] and [`Stream`] handles. All three
-//! reach the same state through an `Rc`, which is why every field below is
-//! behind a cell: opening a stream, writing a body and decoding a frame all
-//! mutate it, and they run in different tasks.
-//!
-//! [`Client`]: crate::client::Client
-
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -23,24 +13,14 @@ use crate::shared::hpack::{BytesStr, Header};
 /// §5.1.1: the first stream a client may open.
 const FIRST_CLIENT_STREAM: STREAM_ID = 1;
 
-/// §5.1.1: ids are 31 bits, and one past the last usable odd one is where a
-/// client has to stop and open a new connection.
+/// §5.1.1: ids are 31 bits.
 const MAX_STREAM_ID: STREAM_ID = (1 << 31) - 1;
 
-/// Why no stream could be opened, and what the caller should do about it.
-///
-/// Two answers rather than one error, because they call for opposite things:
-/// one is a wait on this connection, the other is another connection. Neither
-/// is a fault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unavailable {
-    /// §5.1.2: the peer's `max_concurrent_streams` is reached. Finish a
-    /// stream and ask again — opening one anyway earns a REFUSED_STREAM, and
-    /// a refusal we could have predicted is worse than a wait.
+    /// §5.1.2: the peer's `max_concurrent_streams` is reached.
     AtLimit,
-    /// The connection cannot carry another request, ever: it is closing, or
-    /// §5.1.1's 31-bit ids are spent. Open another one; there is no
-    /// recycling, because the peer remembers every id it has seen.
+    /// Closing, or §5.1.1's ids are spent; ids are never recycled.
     Closed,
 }
 
@@ -55,34 +35,22 @@ impl std::fmt::Display for Unavailable {
 
 impl std::error::Error for Unavailable {}
 
-/// The connection's live streams. No task per stream, unlike the server's:
-/// the application's own task drives a client stream through its handle, so
-/// there is no handle to store beside the state.
 pub(crate) type LiveStreams = StreamMap<StreamState, ()>;
 
 pub(crate) struct ClientShared {
-    /// The send chain, the encoder and the connection window — the half of a
-    /// connection that is the same at both ends.
     pub(crate) core: SharedConnection,
     pub(crate) streams: LiveStreams,
-    /// §5.1.1: the id the next request will use. Odd, and only ever forward —
-    /// a client that reused one would be reopening a stream the peer
-    /// considers closed.
+    /// §5.1.1: odd, and only ever forward; reusing one would reopen a stream
+    /// the peer considers closed.
     next_stream_id: Cell<STREAM_ID>,
-    /// What the server told us it will accept. Read whenever a stream is
-    /// opened, replaced whenever a SETTINGS frame arrives.
     peer_settings: RefCell<Settings>,
-    /// Set once this connection can take no more streams: a GOAWAY arrived,
-    /// the loop is sending one, or the transport is gone.
+    /// Set once this connection can take no more streams.
     closing: Cell<bool>,
 }
 
 impl ClientShared {
-    /// `recv_window` is the connection receive window this client will
-    /// announce once the handshake is done.
     pub(crate) fn new(recv_window: u32) -> Self {
-        // §6.5.2 defaults, until the peer's SETTINGS says otherwise — and the
-        // encoder and frame size we start from are those same defaults.
+        // §6.5.2 defaults until the peer's SETTINGS arrives.
         let peer_settings = Settings::default();
         Self {
             core: SharedConnection::new(
@@ -97,32 +65,21 @@ impl ClientShared {
         }
     }
 
-    /// What the peer said it will accept, as of the last SETTINGS frame.
-    ///
-    /// A copy: the borrow must not escape, and a caller that held one across
-    /// an `await` would be holding it while the loop applied the next
-    /// SETTINGS.
+    /// A copy: the borrow must not escape across an `await`, where the loop
+    /// may apply the next SETTINGS.
     pub(crate) fn peer_settings(&self) -> Settings {
         self.peer_settings.borrow().clone()
     }
 
-    /// Takes the peer's new settings, and with them the frame size every
-    /// writer is bounded by.
     pub(crate) fn set_peer_settings(&self, settings: Settings) {
         self.core.set_max_frame_size(settings.max_frame_size);
         self.core.set_header_table_size(settings.header_table_size);
         *self.peer_settings.borrow_mut() = settings;
     }
 
-    /// §5.1: whether `id` names a stream this client never opened — which,
-    /// on a client connection, is every id the peer could invent. An id it
-    /// *did* open and has since retired is not idle, and a frame arriving
-    /// late on one of those is tolerated rather than fatal.
-    ///
-    /// The even ids are the server's, opened only by a push, and we refused
-    /// push in our SETTINGS: every one of them is idle, however low. They
-    /// used to pass for retired streams of ours whenever they were below the
-    /// next id we would use.
+    /// §5.1: an id this client never opened. A retired id of ours is not
+    /// idle, so late frames on it are tolerated. Even ids are always idle,
+    /// however low, since we refused push.
     pub(crate) fn is_idle(&self, id: STREAM_ID) -> bool {
         id.is_multiple_of(2) || id >= self.next_stream_id.get()
     }
@@ -131,29 +88,16 @@ impl ClientShared {
         self.closing.get()
     }
 
-    /// Jumps the next stream id, for a test that needs a connection near
-    /// the end of its ids without opening a billion streams to get there.
     #[cfg(test)]
     pub(crate) fn skip_to_stream_id(&self, id: STREAM_ID) {
         self.next_stream_id.set(id);
     }
 
-    /// No more streams may be opened. The live ones are left alone: a GOAWAY
-    /// does not cancel what the peer already took up (§6.8), and the
-    /// connection stays useful until they finish.
+    /// Live streams are left alone (§6.8).
     pub(crate) fn stop_opening(&self) {
         self.closing.set(true);
     }
 
-    /// Opens a stream and puts `request`'s head on it.
-    ///
-    /// `end_stream` says the request has no body, which §8.1 lets end the
-    /// message at its head. The response is not waited for: a client that
-    /// blocked on one per request would have multiplexing it could not use.
-    ///
-    /// The frame is written, not sent — the connection loop is what flushes
-    /// it, and `write_frame` is what tells the loop there is something to
-    /// flush.
     pub(crate) fn send_request(
         self: &Rc<Self>,
         request: &http::Request<()>,
@@ -164,8 +108,7 @@ impl ClientShared {
         }
 
         let settings = self.peer_settings();
-        // §5.1.2: the peer's limit is the peer's to set and ours to respect.
-        // The map holds exactly the live streams, so its length is the count.
+        // §5.1.2. The map holds exactly the live streams.
         let allowed = settings.max_concurrent_streams.unwrap_or(u32::MAX);
         if self.streams.len() as u64 >= allowed as u64 {
             return Err(Unavailable::AtLimit);
@@ -175,14 +118,8 @@ impl ClientShared {
         if raw > MAX_STREAM_ID {
             return Err(Unavailable::Closed);
         }
-        // Odd to odd. The peer is the only one who opens the even ones, and
-        // it has told us it will not (§8.2, and we asked for no push).
         self.next_stream_id.set(raw.saturating_add(2));
-        // §5.1.1: that was the last id this connection has. It can finish
-        // what it carries and take nothing more, which is what `closing`
-        // says — to `Client::is_closed`, and to a pool deciding where the
-        // next request goes. It used to go on answering "open" and failing
-        // every request made on it.
+        // §5.1.1: the last id is spent, so `closing` must say so up front.
         if raw.saturating_add(2) > MAX_STREAM_ID {
             self.stop_opening();
         }
@@ -198,12 +135,8 @@ impl ClientShared {
         Ok(Stream::new(id, state, Rc::clone(self)))
     }
 
-    /// Takes a stream out once both its halves are done (§5.1), handing back
-    /// whatever connection credit it still held.
-    ///
-    /// Called by whichever half closes last, which is why it checks rather
-    /// than assumes: the peer's END_STREAM reports through the connection
-    /// loop, ours through the handle that wrote it, and either may be second.
+    /// §5.1. Called by whichever half closes last, and either may be second,
+    /// so it checks rather than assumes.
     pub(crate) fn retire_if_closed(&self, id: STREAM_ID) {
         if !self.streams.get(id).is_some_and(|state| state.is_closed()) {
             return;
@@ -211,9 +144,7 @@ impl ClientShared {
         self.remove_stream(id);
     }
 
-    /// Ours: the stream is cancelled, the peer is told (§6.4), and anything
-    /// waiting on it is failed. A stream already retired is simply gone, and
-    /// no frame goes out for it — §5.1 has nothing left to reset.
+    /// §6.4. No frame goes out for a stream already retired (§5.1).
     pub(crate) fn reset_stream(&self, id: StreamId, error_code: u32) {
         let Some(state) = self.remove_stream(id.into()) else {
             return;
@@ -223,10 +154,7 @@ impl ClientShared {
         state.fail(Failure::Gone("stream cancelled"));
     }
 
-    /// The peer broke the rules on this stream (§5.4.2): it is reset with
-    /// the violation's code, and whoever was waiting on it is told what the
-    /// violation was. It used to be told "stream cancelled", the same as a
-    /// cancel of our own, which sent a caller looking in the wrong place.
+    /// §5.4.2.
     pub(crate) fn reject_stream(&self, id: StreamId, violation: StreamViolation) {
         let Some(state) = self.remove_stream(id.into()) else {
             return;
@@ -236,18 +164,15 @@ impl ClientShared {
         state.fail(Failure::Gone(violation.message()));
     }
 
-    /// Theirs: §6.4, and nothing is written back — the stream just goes.
+    /// §6.4: nothing is written back.
     pub(crate) fn peer_reset(&self, id: StreamId, error_code: u32) {
         if let Some(state) = self.remove_stream(id.into()) {
             state.fail(Failure::Reset(error_code));
         }
     }
 
-    /// The connection is over. Every live stream is failed with the same
-    /// reason, so nothing is left waiting on frames that will never come.
-    ///
-    /// The handles outlive this: a `Stream` whose state has been failed still
-    /// yields whatever body arrived before the end, and then the error.
+    /// A failed `Stream` still yields the body that arrived before the end,
+    /// and then the error.
     pub(crate) fn shut_down(&self, reason: &'static str) {
         self.closing.set(true);
         for (state, ()) in self.streams.take_all() {
@@ -255,12 +180,10 @@ impl ClientShared {
         }
     }
 
-    /// §6.8: a GOAWAY says nothing above `last_stream_id` was processed, so
-    /// those requests are safe to retry — elsewhere, since this connection is
-    /// done taking them. Everything at or below it is still being answered.
+    /// §6.8: streams above `last_stream_id` were not processed.
     pub(crate) fn fail_unprocessed(&self, last_stream_id: STREAM_ID) {
-        // Collected first: removing walks into the map, and doing that inside
-        // `try_for_each` would re-enter the borrow it is contracted not to.
+        // Collected first: removing inside `try_for_each` would re-enter the
+        // borrow it is contracted not to.
         let mut abandoned = Vec::new();
         let _ = self.streams.try_for_each(|state| {
             if STREAM_ID::from(state.id()) > last_stream_id {
@@ -278,14 +201,11 @@ impl ClientShared {
         }
     }
 
-    /// §6.9.2: shifts every live stream's send window. The first overflow
-    /// stops the walk — the connection is over, the rest does not matter.
+    /// §6.9.2. The first overflow stops the walk; the connection is over.
     pub(crate) fn adjust_send_windows(&self, delta: i32) -> Result<(), ()> {
         self.streams.try_for_each(|state| state.adjust_send(delta))
     }
 
-    /// Out of the map, with its credit handed back. The state itself lives on
-    /// for as long as a handle holds it.
     fn remove_stream(&self, id: STREAM_ID) -> Option<Rc<StreamState>> {
         let (state, ()) = self.streams.remove(id)?;
         // Body bytes the application never read still hold connection credit.
@@ -294,11 +214,7 @@ impl ClientShared {
     }
 }
 
-/// A request's field section in wire order.
-///
-/// §8.3: every request pseudo-header comes before every ordinary field, and
-/// `:authority` is where a request carries what HTTP/1.1 put in `Host` —
-/// §8.3.1 prefers it and a server may reject a request that has neither.
+/// §8.3: every pseudo-header must come before every ordinary field.
 fn request_headers(
     request: &http::Request<()>,
 ) -> impl Iterator<Item = Header<Option<HeaderName>>> + '_ {
@@ -325,14 +241,8 @@ fn request_headers(
     pseudo.into_iter().chain(authority).map(reify).chain(fields)
 }
 
-/// §8.2.2: fields that describe an HTTP/1.1 connection, which an HTTP/2
-/// message MUST NOT carry — a conforming server treats the request as
-/// malformed and resets it. `TE` is the exception that may stay, with
-/// `trailers` as its only value.
-///
-/// Dropped rather than refused: they are hop-by-hop, so they were never the
-/// request's to begin with, and an application relaying headers from an
-/// HTTP/1.1 request would otherwise have every such request fail.
+/// §8.2.2: connection-specific fields an HTTP/2 message MUST NOT carry. `TE`
+/// may stay only as `trailers`.
 fn is_connection_specific(name: &HeaderName, value: &http::HeaderValue) -> bool {
     use http::header;
     matches!(
@@ -343,9 +253,8 @@ fn is_connection_specific(name: &HeaderName, value: &http::HeaderValue) -> bool 
         || (*name == header::TE && value != "trailers")
 }
 
-/// The encoder takes header names as `Option`, which is how it says "the same
-/// name as the one before" for a run of fields. A pseudo-header never repeats,
-/// so they all carry their own.
+/// `None` means "same name as the previous field" to the encoder, so every
+/// name here must be `Some`.
 fn reify(header: Header) -> Header<Option<HeaderName>> {
     match header {
         Header::Field { name, value } => Header::Field {

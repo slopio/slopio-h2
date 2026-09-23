@@ -1,33 +1,21 @@
-//! The connection's live streams, reachable from the tasks that run them.
-//!
-//! A stream task takes itself out of this map on the way down, so the map
-//! cannot be something the connection holds by `&mut`: the removal happens
-//! while the connection is suspended at an `await`, inside the destructor of
-//! a future the scheduler is dropping. An `UnsafeCell` behind an `Rc` is
-//! what lets both reach it.
+//! A stream task removes itself from this map inside the destructor of a
+//! future dropped while the connection is suspended, so the map is an
+//! `UnsafeCell` behind an `Rc`.
 //!
 //! # Safety
 //!
-//! What makes that sound is two rules, and the API exists to enforce them
-//! rather than ask for them.
+//! **A reference into the map never outlives the call that made it.** Nothing
+//! here returns a reference: [`StreamMap::get`] hands back a fresh `Rc`, and
+//! [`StreamMap::remove`] and [`StreamMap::take_all`] hand back owned values so
+//! their destructors run at the caller with no borrow outstanding. An escaped
+//! borrow would still be live the next time the connection yielded, which is
+//! exactly when a task may remove an entry.
 //!
-//! **A reference into the map never outlives the call that made it.**
-//! [`StreamMap::get`] hands back a fresh `Rc` instead of lending one, and
-//! [`StreamMap::remove`] and [`StreamMap::take_all`] hand back owned values
-//! so their destructors — a `Handle` detaching its task, among them — run at
-//! the caller with no borrow outstanding. Nothing here returns a reference,
-//! which is the point: a borrow that escaped would still be live the next
-//! time the connection yielded, which is exactly when a task may remove an
-//! entry.
+//! **Nothing re-enters under the borrow.** Only `FxHashMap`'s own code runs —
+//! and, for [`StreamMap::try_for_each`], its closure, the one method that has
+//! to ask rather than enforce.
 //!
-//! **Nothing re-enters under the borrow.** The only code that runs while a
-//! reference exists is `FxHashMap`'s own — and, for
-//! [`StreamMap::try_for_each`], the closure it is given, which is the one
-//! method that has to ask rather than enforce.
-//!
-//! Both rules are what the tests at the bottom check, and they check them
-//! under Miri, whose Stacked Borrows model is what turns "no overlapping
-//! references" from a claim into a failing test.
+//! The tests at the bottom check both rules under Miri (Stacked Borrows).
 
 use std::cell::UnsafeCell;
 use std::rc::Rc;
@@ -36,9 +24,8 @@ use rustc_hash::FxHashMap;
 
 use crate::shared::connection::STREAM_ID;
 
-/// Generic over what it stores so its safety contract can be tested against
-/// a value whose destructor re-enters, which is the case that matters and
-/// the one a `Handle<()>` cannot be made to demonstrate.
+/// Generic so the safety contract can be tested against a value whose
+/// destructor re-enters.
 pub struct StreamMap<S, H> {
     live: UnsafeCell<FxHashMap<STREAM_ID, (Rc<S>, H)>>,
 }
@@ -50,16 +37,13 @@ impl<S, H> StreamMap<S, H> {
         }
     }
 
-    /// §5.1.2: the map only holds live streams, so its length is the current
-    /// count.
+    /// §5.1.2: the map only holds live streams.
     pub fn len(&self) -> usize {
         // SAFETY: the reference dies with the expression, and `len` cannot
         // re-enter.
         unsafe { (*self.live.get()).len() }
     }
 
-    /// The stream under `id`, as a fresh `Rc` rather than a reference into
-    /// the map.
     pub fn get(&self, id: STREAM_ID) -> Option<Rc<S>> {
         // SAFETY: the reference dies with the expression. `Rc::clone` only
         // touches the refcount, and cannot re-enter.
@@ -72,13 +56,10 @@ impl<S, H> StreamMap<S, H> {
 
     pub fn insert(&self, id: STREAM_ID, stream: Rc<S>, handle: H) {
         // SAFETY: the reference dies with the expression. An insert may
-        // reallocate the table, which is why no reference into it may be
-        // outstanding — the rule this whole API is shaped around.
+        // reallocate the table, so no reference into it may be outstanding.
         unsafe { (*self.live.get()).insert(id, (stream, handle)) };
     }
 
-    /// Takes a stream out, handing back what it held so the caller drops it
-    /// outside the borrow.
     pub fn remove(&self, id: STREAM_ID) -> Option<(Rc<S>, H)> {
         // SAFETY: the `&mut` dies before the entry is handed back, so the
         // destructors the caller then runs — which may come straight back
@@ -86,21 +67,15 @@ impl<S, H> StreamMap<S, H> {
         unsafe { (*self.live.get()).remove(&id) }
     }
 
-    /// Empties the map, handing back everything it held for the same reason
-    /// `remove` does. A `drain` whose destructors ran inside the borrow
-    /// would be a removal during iteration, which is not a subtlety.
+    /// Destructors run inside a `drain` would be a removal during iteration.
     pub fn take_all(&self) -> Vec<(Rc<S>, H)> {
         // SAFETY: the drain completes and the reference dies before the
         // `Vec` is handed back.
         unsafe { (*self.live.get()).drain().map(|(_, entry)| entry).collect() }
     }
 
-    /// Walks every live stream, stopping at the first error.
-    ///
-    /// The one method that asks rather than enforces: `f` runs while a
-    /// reference into the map is live, so it must not touch this map. Its
-    /// caller walks to shift send windows (§6.9.2), which wakes tasks and
-    /// touches nothing here.
+    /// `f` runs while a reference into the map is live, so it must not touch
+    /// this map.
     pub fn try_for_each<E>(&self, mut f: impl FnMut(&Rc<S>) -> Result<(), E>) -> Result<(), E> {
         // SAFETY: the reference dies with the loop, and `f` is contracted
         // above not to re-enter.
@@ -118,12 +93,8 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Weak;
 
-    /// A handle whose destructor reaches back into the map it was stored in,
-    /// which is what a `StreamToken` does and what the two rules exist for.
-    ///
-    /// `Weak`, not `Rc`, and for a reason production shares: the map holds
-    /// this value, so holding the map back would be a cycle neither ever
-    /// leaves. Miri's leak check is what says so.
+    /// `Weak`, not `Rc`: holding the map back would be a cycle, which Miri's
+    /// leak check catches.
     struct Reentrant {
         map: Weak<StreamMap<u32, Reentrant>>,
         removes: Option<STREAM_ID>,
@@ -135,8 +106,6 @@ mod tests {
         fn drop(&mut self) {
             self.log.borrow_mut().push(self.id);
             if let Some((map, id)) = self.map.upgrade().zip(self.removes) {
-                // Straight back into the map, from inside a destructor the
-                // map's own `remove` produced.
                 drop(map.remove(id));
             }
         }
@@ -184,9 +153,6 @@ mod tests {
             },
         );
 
-        // Dropping 3 takes 1 out from inside its own destructor, which is a
-        // `&mut` to the map taken while one of its values is being dropped
-        // by a `remove` the caller made.
         drop(map.remove(3));
         assert_eq!(*log.borrow(), vec![3]);
         assert_eq!(map.len(), 0, "the destructor's removal took effect");
@@ -208,9 +174,6 @@ mod tests {
             },
         );
 
-        // The token's own case: it is already out of the map by the time its
-        // destructor asks, and asking for an absent id is a lookup like any
-        // other.
         drop(map.remove(1));
         assert_eq!(*log.borrow(), vec![1]);
         assert_eq!(map.len(), 0);
@@ -227,8 +190,6 @@ mod tests {
                 Rc::new(id * 11),
                 Reentrant {
                     map: Rc::downgrade(&map),
-                    // Each one reaches for an id the drain already took, the
-                    // way every token does when its connection dies.
                     removes: Some(id),
                     log: Rc::clone(&log),
                     id,
@@ -239,7 +200,6 @@ mod tests {
         let taken = map.take_all();
         assert_eq!(taken.len(), 3);
         assert_eq!(map.len(), 0);
-        // The destructors run here, at the caller, with the drain long over.
         drop(taken);
         assert_eq!(log.borrow().len(), 3);
     }

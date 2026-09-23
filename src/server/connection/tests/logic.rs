@@ -1,8 +1,5 @@
-//! Sequences a conforming peer produces, which the connection has to serve.
-//!
-//! The suite beside this one is about peers that misbehave. These are the
-//! other half: a defence that fires on an honest exchange is an outage, and
-//! each test here is an honest exchange that one of them could mistake.
+//! Sequences a conforming peer produces, which the connection has to serve:
+//! a defence that fires on an honest exchange is an outage.
 
 use std::time::Duration;
 
@@ -27,11 +24,7 @@ fn status_of(head: &Frame) -> Option<String> {
     super::decode_block(&head.payload).get(":status").cloned()
 }
 
-/// A GET whose handler takes longer than `BODY_GRACE` to answer, on a
-/// connection the peer keeps alive with a PING.
-///
-/// The request carried END_STREAM, so there is no body to be slow about: the
-/// peer owes nothing, and the wait is the handler's.
+/// The request carried END_STREAM, so there is no body to be slow about.
 #[test]
 fn a_slow_handler_is_not_a_starved_body() {
     let mut open = preface();
@@ -72,11 +65,8 @@ fn a_slow_handler_is_not_a_starved_body() {
     assert_eq!(status_of(head).as_deref(), Some("200"));
 }
 
-/// A handler that answers a second after its request, on a connection the
-/// peer has nothing more to say on. Its response has to leave when it is
-/// written: it used to wait for the peer's next chunk, and a peer waiting for
-/// a response sends none — here the PING at three seconds carried it, and
-/// without one it was the idle GOAWAY, two minutes on.
+/// A response has to leave when it is written: a peer waiting for it sends
+/// no next chunk to carry it.
 #[test]
 fn a_late_response_leaves_without_waiting_for_the_peer() {
     let mut open = preface();
@@ -117,13 +107,9 @@ fn a_late_response_leaves_without_waiting_for_the_peer() {
     );
 }
 
-/// The other side of flushing on a handler's output: it must not count as
-/// the peer being alive. A handler streaming a body to a peer that has gone
-/// quiet keeps waking the loop, and a deadline counted in ticks that such a
-/// wake restarts would never expire — the connection would last as long as
-/// the handler kept writing. Silence is measured from the peer's last chunk,
-/// so `ACTIVE_TICKS` still brings the PING, and the PING going unanswered
-/// ends it.
+/// A handler's output must not count as the peer being alive, or a deadline
+/// restarted by it would never expire. Silence is measured from the peer's
+/// last chunk.
 #[test]
 fn a_streaming_response_does_not_keep_a_silent_peer_alive() {
     let mut open = preface();
@@ -160,9 +146,8 @@ fn a_streaming_response_does_not_keep_a_silent_peer_alive() {
         written.iter().any(|f| f.kind == PING && f.flags & 0x1 == 0),
         "it was asked first: {written:?}"
     );
-    // One DATA every two seconds, for `ACTIVE_TICKS` of silence and then
-    // `PING_TIMEOUT_TICKS` without an answer, give or take a tick — not the
-    // five hundred the EOF would have allowed.
+    // One DATA every two seconds for `ACTIVE_TICKS` + `PING_TIMEOUT_TICKS`,
+    // give or take a tick — not the five hundred the EOF would have allowed.
     let data = written.iter().filter(|f| f.kind == DATA).count() as u32;
     let expected = (super::super::ACTIVE_TICKS + super::super::PING_TIMEOUT_TICKS) * 5 / 2;
     assert!(
@@ -171,11 +156,8 @@ fn a_streaming_response_does_not_keep_a_silent_peer_alive() {
     );
 }
 
-/// A handler that takes longer than `ACTIVE_TICKS` to answer, for a peer that
-/// sent its whole request and has nothing more to say — a slow RPC, a long
-/// poll. Its silence used to close the connection at thirty seconds, blaming
-/// it for time that was the handler's. It is asked with a PING instead, and a
-/// peer that answers is served.
+/// The silence is the handler's time, not the peer's: it is asked with a
+/// PING, and a peer that answers is served.
 #[test]
 fn a_handler_slower_than_the_active_deadline_is_waited_for() {
     let mut open = preface();
@@ -190,8 +172,7 @@ fn a_handler_slower_than_the_active_deadline_is_waited_for() {
     let silence = second * 5 * super::super::ACTIVE_TICKS;
     let inbound: Vec<Scripted> = vec![
         ReadEvent::Data(open).into(),
-        // The ACK our probe asks for, a few seconds after it went out. Any
-        // opaque will do: whatever the peer sends answers the question.
+        // Any opaque will do: whatever the peer sends answers the question.
         ReadEvent::Data(frame(PING, 0x1, 0, &1u64.to_be_bytes())).after(silence + second * 7),
         ReadEvent::Eof.after(silence + second * 30),
     ];
@@ -221,10 +202,8 @@ fn a_handler_slower_than_the_active_deadline_is_waited_for() {
     );
 }
 
-/// What the PING does not change: a peer that opens a stream, sends no body,
-/// and answers every probe is holding the stream, not waiting on us. The
-/// answer is a chunk like any other, the sweep runs on it, and the stream
-/// whose body is not coming is reset.
+/// A peer that opens a stream, sends no body, and answers every probe is
+/// holding the stream: the sweep still resets it.
 #[test]
 fn answering_pings_does_not_hold_a_stream_without_its_body() {
     let mut open = preface();
@@ -251,11 +230,8 @@ fn answering_pings_does_not_hold_a_stream_without_its_body() {
     );
 }
 
-/// A request whose handler takes a moment, from a peer that says goodbye
-/// while it works. GOAWAY(NO_ERROR) is the peer opening nothing more, not
-/// the peer giving up on what it asked (§6.8): the connection drains, the
-/// answer goes out, and only then does it close. It used to close at once
-/// and kill the handler, and the peer got nothing.
+/// §6.8: GOAWAY(NO_ERROR) is the peer opening nothing more, not giving up on
+/// what it asked: the connection drains.
 #[test]
 fn a_peer_that_says_goodbye_still_gets_its_answer() {
     let mut open = preface();
@@ -271,8 +247,7 @@ fn a_peer_that_says_goodbye_still_gets_its_answer() {
     let inbound: Vec<Scripted> = vec![
         ReadEvent::Data(open).into(),
         ReadEvent::Data(goaway).after(Duration::from_millis(10)),
-        // Far past the answer: the connection has to end on its own, when
-        // its last stream does, and not wait for this.
+        // The connection has to end on its own, when its last stream does.
         ReadEvent::Eof.after(Duration::from_secs(1000)),
     ];
     let written = run_connection_with(inbound, |_, _| {}, slow_ok);
@@ -288,8 +263,7 @@ fn a_peer_that_says_goodbye_still_gets_its_answer() {
     );
 }
 
-/// The same, with the peer closing its half of the transport instead: it
-/// sends no more, and can still read. The answer goes out.
+/// A half-closed peer sends no more, and can still read.
 #[test]
 fn a_peer_that_half_closes_still_gets_its_answer() {
     let mut open = preface();
@@ -313,10 +287,8 @@ fn a_peer_that_half_closes_still_gets_its_answer() {
     assert_eq!(status_of(head).as_deref(), Some("200"));
 }
 
-/// What a half-close does to a request whose body was still coming: it will
-/// never come. The stream is reset rather than left to a handler that would
-/// read the end of the input as the end of the body — while the request
-/// beside it, which the peer finished sending, is answered as usual.
+/// A body cut short by a half-close is reset rather than left to a handler
+/// that would read the end of the input as the end of the body.
 #[test]
 fn a_half_close_resets_the_bodies_it_cut_short() {
     let mut open = preface();
@@ -353,9 +325,8 @@ fn a_half_close_resets_the_bodies_it_cut_short() {
     );
 }
 
-/// A half-closed peer cannot answer a PING, so the wait for its answers is
-/// bounded by time alone: a handler that never finishes does not hold the
-/// connection past `HALF_CLOSED_TICKS`.
+/// A half-closed peer cannot answer a PING, so the wait is bounded by
+/// `HALF_CLOSED_TICKS` alone.
 #[test]
 fn a_half_closed_peer_is_not_waited_on_forever() {
     let mut open = preface();
@@ -391,18 +362,10 @@ fn a_half_closed_peer_is_not_waited_on_forever() {
     );
 }
 
-/// A response larger than the window the peer left open cannot finish once
-/// the peer has half-closed: the WINDOW_UPDATE it needs will never come. So
-/// it is reset as soon as its writer runs dry, rather than held until
-/// `HALF_CLOSED_TICKS` — whether it ran dry before the EOF (stream 1, which
-/// spends the whole connection window at once) or after it (stream 3, which
-/// starts its body once there is no credit left anywhere).
-///
-/// Stream 3 sends its head before the EOF, so that running dry after it
-/// writes nothing at all: the only thing that can tell the loop is the
-/// writer parking, which is the wake this is about. Without it the reset
-/// still comes, on the next tick — so stream 5, answered two seconds on, is
-/// what tells the two apart: the reset has to be out before its answer.
+/// After a half-close a response out of credit can never finish, so it is
+/// reset as soon as its writer runs dry — before the EOF (stream 1) or after
+/// it (stream 3). Stream 5, answered two seconds on, tells a reset on the
+/// writer parking from one on the next tick.
 #[test]
 fn a_half_closed_peer_does_not_hold_responses_out_of_credit() {
     let mut open = preface();
@@ -466,14 +429,11 @@ fn a_half_closed_peer_does_not_hold_responses_out_of_credit() {
     );
 }
 
-/// A handler that answers `200` a hundred milliseconds in.
 async fn slow_ok(stream: crate::server::Stream) {
     Sleep::during(Duration::from_millis(100)).await;
     stream.write_headers_final(http::StatusCode::OK, &http::HeaderMap::new());
 }
 
-/// A small upload, complete, whose handler then thinks for a while. The body
-/// is all there — END_STREAM came — so its rate has nothing left to say.
 #[test]
 fn a_finished_body_is_not_judged_on_its_rate() {
     let mut open = preface();
@@ -508,9 +468,6 @@ fn a_finished_body_is_not_judged_on_its_rate() {
     assert!(written.iter().any(|f| f.kind == HEADERS));
 }
 
-/// A response the *handler* paces — an event stream — to a peer with all the
-/// credit in the world. The peer is not holding anything: there is nothing to
-/// take.
 #[test]
 fn a_response_paced_by_its_handler_is_not_a_starved_one() {
     let mut open = preface();
@@ -553,12 +510,7 @@ fn a_response_paced_by_its_handler_is_not_a_starved_one() {
 }
 
 /// §6.9.1: padding is debited from the stream window like the payload, and
-/// like the payload it has to come back — the handler never sees it, so
-/// nobody else will return it.
-///
-/// 300 frames of 1000 bytes under 255 of padding. Delivered 15 KB at a time
-/// and consumed as it lands, so a server that accounts correctly never has
-/// more than a fraction of the window outstanding.
+/// has to come back — the handler never sees it, so nobody else will.
 #[test]
 fn padding_is_credited_back_on_the_stream() {
     let mut bytes = preface();
@@ -588,9 +540,8 @@ fn padding_is_credited_back_on_the_stream() {
     assert_eq!(body.payload, b"read 300000 bytes\n");
 }
 
-/// §6.5.2 / RFC 7541 §4.2: a peer that announces SETTINGS_HEADER_TABLE_SIZE 0
-/// has no dynamic table, and a response that indexes into one cannot be
-/// decoded by it.
+/// §6.5.2 / RFC 7541 §4.2: a peer with SETTINGS_HEADER_TABLE_SIZE 0 cannot
+/// decode a response that indexes into a dynamic table.
 #[test]
 fn a_peer_with_no_hpack_table_is_not_sent_indexed_fields() {
     use crate::shared::hpack::Decoder;
@@ -635,11 +586,9 @@ fn a_peer_with_no_hpack_table_is_not_sent_indexed_fields() {
     }
 }
 
-/// §8.2.1: a field HTTP refuses makes its request malformed, and nothing
-/// more — the other streams share the HPACK table, not the fault. Refused
-/// fields are still indexed, which is what the second request checks: it
-/// names an entry that sits *behind* the refused one, and finds it only if
-/// the refused one took its slot.
+/// §8.2.1: a refused field makes only its request malformed. Refused fields
+/// are still indexed: the second request names an entry behind the refused
+/// one, and finds it only if the refused one took its slot.
 #[test]
 fn a_refused_field_resets_its_stream_and_nothing_else() {
     let mut first = GET_BLOCK.to_vec();
@@ -675,11 +624,8 @@ fn a_refused_field_resets_its_stream_and_nothing_else() {
     );
 }
 
-/// §5.1: whoever sends RST_STREAM ignores what the peer had in flight — and a
-/// request refused before it was ever opened is reset all the same. Its body
-/// and its trailers were on the wire before our reset could reach the peer,
-/// and they used to land on a stream nothing remembered: the trailers read as
-/// HEADERS on a closed stream, and the connection went for them.
+/// §5.1: whoever sends RST_STREAM ignores what the peer had in flight, also
+/// for a request refused before it was ever opened.
 #[test]
 fn trailers_behind_a_malformed_request_do_not_end_the_connection() {
     let mut bytes = preface();
@@ -759,11 +705,9 @@ fn trailers_behind_a_refused_stream_do_not_end_the_connection() {
     );
 }
 
-/// §5.4.2 / §5.1: a request whose header block is malformed is a *stream*
-/// error, and the stream it was opening is closed by the reset — not idle. A
-/// client that sent `HEADERS, DATA` back to back had the DATA on the wire
-/// before our RST_STREAM could reach it, and the connection has to survive
-/// that.
+/// §5.4.2 / §5.1: a malformed header block is a stream error, and the reset
+/// closes the stream rather than leaving it idle, so DATA already in flight
+/// must not end the connection.
 #[test]
 fn a_body_in_flight_behind_a_malformed_request_does_not_end_the_connection() {
     let mut bytes = preface();
@@ -794,12 +738,9 @@ fn a_body_in_flight_behind_a_malformed_request_does_not_end_the_connection() {
     );
 }
 
-/// A handler that answers before the upload is over — a `401`, a `413` — and
-/// returns. §8.1 lets the server follow a complete response with
-/// RST_STREAM(NO_ERROR) to stop the body, and the stream's token does, on its
-/// way out. Without it an honest peer is left parked on a stream window nobody
-/// will ever reopen, holding one of `MAX_CONCURRENT_STREAMS` until
-/// `body_is_starving` blames it.
+/// §8.1: a complete early response is followed by RST_STREAM(NO_ERROR) to
+/// stop the body; otherwise the peer is parked on a window nobody reopens,
+/// holding one of `MAX_CONCURRENT_STREAMS`.
 #[test]
 fn an_early_response_does_not_strand_the_upload() {
     let mut bytes = preface();
@@ -836,10 +777,8 @@ fn an_early_response_does_not_strand_the_upload() {
     );
 }
 
-/// §5.1: whoever sends RST_STREAM tolerates what the peer had in flight. A
-/// handler that answers early has its stream reset on the way out, and
-/// trailers the peer sent before it could have seen that land on an id that
-/// is gone — which is a race, and used to cost every stream on the connection.
+/// §5.1: trailers in flight behind the reset of an early response are a
+/// race, not a protocol error.
 #[test]
 fn trailers_in_flight_after_an_early_response_do_not_end_the_connection() {
     let mut first = preface();
@@ -884,9 +823,8 @@ fn trailers_in_flight_after_an_early_response_do_not_end_the_connection() {
     );
 }
 
-/// A gRPC call that ends on its HEADERS has no message, and is still a gRPC
-/// call: the handler has to know, to answer with a `grpc-status` and not as
-/// the HTTP request it would otherwise take it for.
+/// A gRPC call that ends on its HEADERS is still gRPC: the handler has to
+/// answer with a `grpc-status`.
 #[cfg(feature = "grpc")]
 #[test]
 fn a_grpc_call_with_no_body_is_still_grpc() {

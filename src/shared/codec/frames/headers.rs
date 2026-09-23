@@ -10,21 +10,14 @@ use bytes::{Buf, BytesMut};
 
 use std::io::Cursor;
 
-/// Header frame
-///
-/// This could be either a request or a response.
 #[derive(Eq, PartialEq, Debug)]
 pub struct Headers {
-    /// The ID of the stream with which this frame is associated.
     stream_id: StreamId,
 
-    /// The stream dependency information, if any.
     stream_dep: Option<StreamDependency>,
 
-    /// The header block fragment
     header_block: HeaderBlock,
 
-    /// The associated flags
     flags: HeadersFlag,
 }
 
@@ -54,17 +47,12 @@ pub struct Pseudo {
 
 #[derive(Debug, PartialEq, Eq)]
 struct HeaderBlock {
-    /// The decoded header fields
     fields: HeaderMap,
 
-    /// Precomputed size of all of our header fields, for perf reasons
     field_size: usize,
 
-    /// Set to true if decoding went over the max header list size.
     is_over_size: bool,
 
-    /// Pseudo headers, these are broken out as they must be sent as part of the
-    /// headers frame.
     pseudo: Pseudo,
 }
 
@@ -73,12 +61,7 @@ const END_HEADERS: u8 = 0x4;
 const PADDED: u8 = 0x8;
 const PRIORITY: u8 = 0x20;
 
-// ===== impl Headers =====
-
 impl Headers {
-    /// Loads the header frame but doesn't actually do HPACK decoding.
-    ///
-    /// HPACK decoding is done in the `load_hpack` step.
     pub fn load(head: Head, mut src: BytesMut) -> Result<(Self, BytesMut), Error> {
         let flags = HeadersFlag(head.flag());
         let mut pad = 0;
@@ -87,18 +70,15 @@ impl Headers {
             return Err(Error::InvalidStreamId);
         }
 
-        // Read the padding length
         if flags.is_padded() {
             if src.is_empty() {
                 return Err(Error::MalformedMessage);
             }
             pad = src[0] as usize;
 
-            // Drop the padding
             src.advance(1);
         }
 
-        // Parse priority data if present (5 bytes: 4-byte stream dependency + 1-byte weight)
         let stream_dep = if flags.is_priority() {
             if src.len() < 5 {
                 return Err(Error::MalformedMessage);
@@ -181,8 +161,6 @@ impl Headers {
     }
 }
 
-// ===== impl HeadersFlag =====
-
 impl HeadersFlag {
     pub fn is_end_stream(&self) -> bool {
         self.0 & END_STREAM == END_STREAM
@@ -200,8 +178,6 @@ impl HeadersFlag {
         self.0 & PRIORITY == PRIORITY
     }
 }
-
-// ===== HeaderBlock =====
 
 impl HeaderBlock {
     fn load(
@@ -235,18 +211,14 @@ impl HeaderBlock {
 
         let mut cursor = Cursor::new(src);
 
-        // If the header frame is malformed, we still have to continue decoding
-        // the headers. A malformed header frame is a stream level error, but
-        // the hpack state is connection level. In order to maintain correct
-        // state for other streams, the hpack decoding process must complete.
+        // A malformed block is a stream error, but HPACK state is
+        // connection-level: decoding must still complete for other streams.
         let res = decoder.decode(&mut cursor, |header| {
             use crate::shared::hpack::Header::*;
 
             match header {
                 Field { name, value } => {
-                    // Connection level header fields are not supported and must
-                    // result in a protocol error.
-
+                    // Connection-specific fields must be a protocol error.
                     if name == header::CONNECTION
                         || name == header::TRANSFER_ENCODING
                         || name == header::UPGRADE
@@ -279,8 +251,7 @@ impl HeaderBlock {
         });
 
         match res {
-            // §8.2.1: a field HTTP refuses makes the message malformed, which
-            // §8.1.1 makes a stream error. The decoder ran the block to its
+            // §8.2.1/§8.1.1: a stream error. The decoder ran the block to its
             // end first, so the table the other streams need is intact.
             Err(hpack::DecoderError::InvalidField) => malformed = true,
             Err(e) => return Err(e.into()),
@@ -294,13 +265,7 @@ impl HeaderBlock {
         Ok(())
     }
 
-    /// Calculates the size of the currently decoded header list.
-    ///
-    /// According to http://httpwg.org/specs/rfc7540.html#SETTINGS_MAX_HEADER_LIST_SIZE
-    ///
-    /// > The value is based on the uncompressed size of header fields,
-    /// > including the length of the name and value in octets plus an
-    /// > overhead of 32 octets for each header field.
+    /// SETTINGS_MAX_HEADER_LIST_SIZE: uncompressed name + value + 32 octets per field.
     fn calculate_header_list_size(&self) -> usize {
         macro_rules! pseudo_size {
             ($name:ident) => {{
@@ -325,14 +290,9 @@ fn decoded_header_size(name: usize, value: usize) -> usize {
     name + value + 32
 }
 
-/// The declared body length, or `None` when the message declared none.
-/// Shared by both ends: a request's for the server, a response's for the
-/// client, and the same §8.1.1 check on either.
-///
-/// RFC 9110 §8.6 gives `content-length` the grammar `1*DIGIT` with no upper
-/// bound, and requires recipients to anticipate numerals too large to convert
-/// — hence the checked accumulation rather than a parse that could wrap. A
-/// repeated field is legal only if every value agrees.
+/// RFC 9110 §8.6: `1*DIGIT` with no upper bound, so accumulation is checked
+/// rather than allowed to wrap. A repeated field is legal only if every value
+/// agrees.
 pub fn content_length(fields: &HeaderMap) -> Result<Option<u64>, ()> {
     let mut declared: Option<u64> = None;
 

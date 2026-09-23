@@ -5,24 +5,20 @@ use crate::shared::hpack::DecoderError;
 
 use bytes::{BufMut, BytesMut};
 
-// Constructed in the generated `table.rs` file
 struct Decoder {
     state: u8,
     maybe_eos: bool,
 }
 
 // These flags must match the ones in genhuff.rs
-
 const MAYBE_EOS: u8 = 1;
 const DECODED: u8 = 2;
 const ERROR: u8 = 4;
 
 pub fn decode(src: &[u8], buf: &mut BytesMut) -> Result<BytesMut, DecoderError> {
-    // `buf` outlives this call — it is the thread's shared arena — so what a
-    // failed decode wrote before failing must not stay in it: `split` hands
-    // out everything in the buffer, and the next string decoded on this
-    // thread, from whatever connection, would come back with these bytes in
-    // front of its own.
+    // `buf` is the thread's shared arena: a failed decode's bytes must not
+    // stay in it, or the next string decoded, from any connection, would
+    // come back with them in front of its own.
     let start = buf.len();
     let decoded = decode_into(src, buf);
     if decoded.is_err() {
@@ -87,9 +83,7 @@ impl Decoder {
         }
     }
 
-    // Decodes 4 bits
     fn decode4(&mut self, input: u8) -> Result<Option<u8>, DecoderError> {
-        // (next-state, byte, flags)
         let (next, byte, flags) = DECODE_TABLE[self.state as usize][input as usize];
 
         if flags & ERROR == ERROR {

@@ -1,11 +1,3 @@
-//! What a server connection shares with the tasks running its streams.
-//!
-//! The send chain, the encoder and the connection window are not here: they
-//! were never server-specific and now live in
-//! [`shared::connection`](crate::shared::connection). What is left is the part
-//! that is — the map of live streams and the task tokens that retire them, and
-//! the two writers whose shape is a *response*.
-
 use std::rc::Rc;
 
 use http::{HeaderMap, StatusCode};
@@ -25,16 +17,10 @@ use crate::shared::{
 use runtime::Handle;
 use std::rc::Weak;
 
-/// The connection's live streams. Each entry owns its stream and the handle
-/// of the task running it.
 pub type LiveStreams = StreamMap<StreamState, Handle<()>>;
 
-/// Takes a stream out once both its halves are done (§5.1), handing back
-/// whatever connection credit it still held.
-///
-/// Called by whichever half closes last, which is why it checks rather than
-/// assumes: the task reports through its [`StreamToken`], the peer's
-/// END_STREAM reports through the connection, and either may be second.
+/// Called by whichever half closes last (§5.1), which is why it checks rather
+/// than assumes: the task and the peer's END_STREAM may each be second.
 pub fn retire_if_closed(map: &LiveStreams, shared: &SharedConnection, id: STREAM_ID) {
     if !map.get(id).is_some_and(|stream| stream.is_closed()) {
         return;
@@ -43,32 +29,24 @@ pub fn retire_if_closed(map: &LiveStreams, shared: &SharedConnection, id: STREAM
         return;
     };
     stream.note_retired();
-    // Both halves closed with nobody resetting anything, which is the only
-    // path a stream reaches this by: a reset one is taken out where the
-    // RST_STREAM is handled, and never arrives here. So this is the place
-    // that knows a stream finished, which is what the fault budget spends
-    // itself against.
+    // A reset stream is removed where the RST_STREAM is handled and never
+    // arrives here, so this is the one place that knows a stream finished
+    // cleanly, which is what the fault budget spends itself against.
     shared.note_completed();
-    // Body bytes no handler consumed still hold credit. `_handle` drops
-    // here, outside the map, which for a task retiring itself is that task
-    // detaching its own handle — sound because the scheduler holds a
-    // reference to the task for the whole poll its destructor runs in.
+    // `_handle` drops here, outside the map; for a task retiring itself that
+    // is sound because the scheduler holds a reference to the task for the
+    // whole poll its destructor runs in.
     shared.release_stream_credit(stream.take_unreleased());
 }
 
-/// What a stream task holds for as long as it runs, and what cleans up when
-/// it stops — however it stops. Returning normally, being reset by the peer,
-/// going down with its connection: all of them drop this.
-///
-/// The connection used to ask instead, walking every live stream once per
-/// turn of its loop to see which had finished. A task knows when it is done
-/// and nothing else does, so it is the task that says so.
+/// Cleans up when a stream task stops, however it stops: returning, being
+/// reset, or going down with its connection all drop this.
 pub struct StreamToken {
     id: StreamId,
     stream: Rc<StreamState>,
     shared: Rc<SharedConnection>,
-    /// `Weak` because the map owns this token, by way of the handle of the
-    /// task that holds it: an `Rc` back would be a cycle neither ever leaves.
+    /// `Weak` because the map owns this token via the task's handle: an `Rc`
+    /// back would be a cycle.
     map: Weak<LiveStreams>,
 }
 
@@ -101,30 +79,17 @@ impl StreamToken {
 }
 
 impl Drop for StreamToken {
-    /// Our half of the stream is over (§5.1): the task wrote whatever it was
-    /// going to. Whatever body bytes it never consumed still hold connection
-    /// credit, and they go back here — `take_unreleased` zeroes as it reads,
-    /// so the removal that follows can safely ask again for whatever arrived
-    /// in between.
+    /// `take_unreleased` zeroes as it reads, so the removal can safely ask
+    /// again for credit that arrived in between.
     ///
-    /// Then it takes itself out of the map, if the peer is done too. Safe to
-    /// do from here because a task only ever runs — and so only ever drops —
-    /// while the connection is suspended at an `await`, holding no reference
-    /// into the map; `StreamMap` is where that argument lives in full.
+    /// Taking itself out of the map is safe from here because a task only
+    /// ever runs, and so drops, while the connection is suspended at an
+    /// `await` holding no reference into the map; see `StreamMap`.
     fn drop(&mut self) {
-        // A handler that returned without answering leaves the peer waiting
-        // for a response that cannot come: nothing else on this connection
-        // will ever speak for that stream. So it gets a `500` on the way out.
-        //
-        // Only for a stream still in the connection's table. One the peer
-        // reset, or one the connection killed, is already out of it — and a
-        // HEADERS frame on a stream that no longer exists is noise the peer
-        // has to account for.
-        //
-        // Both facts are `Cell` reads on the stream itself. The second used
-        // to be read from the table's membership instead, which cost a
-        // `Weak::upgrade`, a hash lookup and an `Rc` round trip on every
-        // request — 3% — to answer a question only a cancelled stream asks.
+        // A handler that returned without answering gets a `500`, since
+        // nothing else will ever speak for that stream. Only for a stream
+        // not yet retired: a HEADERS frame on a stream that no longer exists
+        // is noise the peer has to account for.
         if !self.stream.has_responded() && !self.stream.is_retired() {
             self.shared.write_response(
                 self.id,
@@ -133,13 +98,9 @@ impl Drop for StreamToken {
                 true,
             );
         } else if !self.stream.output_ended() && !self.stream.is_retired() {
-            // The other way to leave the peer waiting: a head, perhaps some
-            // body, and no END_STREAM — a handler that returned between its
-            // last `write_data` and its `write_trailers`, or on an error half way
-            // through a body. There is no honest way to finish that response
-            // for it: an empty DATA with END_STREAM would pass a truncated
-            // body off as a whole one. RST_STREAM says what happened, and it
-            // closes both halves, so nothing more is expected of the peer.
+            // A response started but not ended must be reset, not finished:
+            // an empty DATA with END_STREAM would pass a truncated body off as
+            // a whole one.
             self.shared
                 .write_frame(|out| encode_rst_stream(out, self.id, INTERNAL_ERROR));
             if !self.stream.input_ended() {
@@ -148,12 +109,8 @@ impl Drop for StreamToken {
             self.stream.abandon_input();
         }
 
-        // A complete response to a request that is still arriving: answered
-        // early, as a refusal is. §8.1 has us say so with RST_STREAM(NO_ERROR)
-        // rather than take a body nobody will read — and rather than keep the
-        // stream's place in the table until the peer finishes, or until the
-        // sweep takes an honest client's unhurried upload for a starved one
-        // and counts it as a fault.
+        // §8.1: a complete response to a request still arriving is followed
+        // by RST_STREAM(NO_ERROR) rather than taking a body nobody will read.
         if !self.stream.input_ended() && !self.stream.is_retired() {
             self.shared
                 .write_frame(|out| encode_rst_stream(out, self.id, NO_ERROR));
@@ -168,24 +125,8 @@ impl Drop for StreamToken {
     }
 }
 
-/// The two writers that are a *server*'s: a response head, and the credit a
-/// handler's reads hand back.
-///
-/// An inherent impl on a type from another module, which Rust allows within a
-/// crate, so that a handler still writes `shared.write_headers(...)` rather
-/// than reaching for a free function with the connection as its first
-/// argument. Nothing here touches a private field — both go through the
-/// shared writers.
 impl SharedConnection {
-    /// Writes a response head. §8.3: the response pseudo-header comes before
-    /// every ordinary field.
-    ///
-    /// Nothing is added here. RFC 9110 §6.6.1 does want a `Date` on every
-    /// 2xx, 3xx and 4xx from an origin server with a clock, and
-    /// `shared::date::now` is the cheap way to produce one — but it costs
-    /// about a tenth of the request rate, and whether to pay that is the
-    /// handler's call, not the frame writer's. A gateway would relay the
-    /// origin's `Date` rather than stamp its own anyway.
+    /// §8.3: the response pseudo-header comes before every ordinary field.
     pub fn write_response(
         &self,
         stream_id: StreamId,
@@ -203,10 +144,6 @@ impl SharedConnection {
         self.write_headers(stream_id, headers, end_stream);
     }
 
-    /// Gives the peer back whatever credit a gRPC stream was holding, on the
-    /// stream and on the connection both — [`consume`](Self::consume) for
-    /// everything held, with the stream's half announced at once: see
-    /// [`StreamState::release_held`].
     #[cfg(feature = "grpc")]
     pub fn release_held(&self, stream_id: StreamId, stream: &StreamState) {
         let (held, increment) = stream.release_held();
@@ -218,14 +155,7 @@ impl SharedConnection {
         }
     }
 
-    /// Takes `n` body bytes off the stream on the handler's behalf and gives
-    /// the peer back the credit they were holding — on the stream and on the
-    /// connection both, §6.9.1 having debited both when they arrived.
-    ///
-    /// Here rather than on `Stream` because it has to write frames, and the
-    /// stream half cannot. Nothing goes out until a worthwhile amount has
-    /// piled up at either level, so a handler taking a few bytes at a time
-    /// does not answer every DATA frame with a WINDOW_UPDATE of its own.
+    /// Credits both the stream and the connection, §6.9.1 having debited both.
     pub fn consume(&self, stream_id: StreamId, stream: &StreamState, n: usize) {
         let taken = stream.consume(n);
         if taken == 0 {

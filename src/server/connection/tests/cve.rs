@@ -1,23 +1,7 @@
 //! The published HTTP/2 denial-of-service attacks, run against the loop.
-//!
-//! One test per CVE, each named for it, so what is covered and what is not
-//! is a list a reader can check rather than a claim. Every one of these is a
-//! peer that speaks the protocol correctly and costs us far more than it
-//! costs itself — none of them is a malformed frame, which is why the frame
-//! decoder catches none of them and most defences here are budgets.
-//!
-//! Three kinds of defence appear here, and which one catches an attack is the
-//! interesting part. A *budget* counts frames and is cleared by progress,
-//! which is what stops the floods. A *size cap* counts what a header block
-//! expands to rather than the bytes it arrived in, which is what stops the
-//! bombs. A *deadline* measures time, and is the only thing that sees the
-//! slowloris group at the bottom — those peers send almost nothing, so no
-//! budget ever increments and no cap is ever approached.
-//!
-//! The deadline tests come in pairs on purpose: the attack, and the honest
-//! peer that looks like it. A defence that cannot tell a slow upload from a
-//! held stream is not a defence, so `a_slow_but_honest_request_body_is_served`
-//! is as load-bearing as the attack beside it.
+//! Budgets stop the floods, size caps stop the bombs, deadlines stop the
+//! slowloris group. Deadline tests come in pairs: the attack, and the honest
+//! peer that looks like it.
 
 use std::time::Duration;
 
@@ -32,7 +16,6 @@ use crate::shared::codec::types::{
     ENHANCE_YOUR_CALM, NO_ERROR, PROTOCOL_ERROR, REFUSED_STREAM, STREAM_CLOSED,
 };
 
-/// The GOAWAY a connection was closed with, if it was.
 fn goaway(written: &[Frame]) -> Option<(u32, String)> {
     written.iter().find(|f| f.kind == GOAWAY).map(|f| {
         (
@@ -42,7 +25,6 @@ fn goaway(written: &[Frame]) -> Option<(u32, String)> {
     })
 }
 
-/// A client preface and its SETTINGS, with no request behind it.
 fn preface() -> Vec<u8> {
     let mut bytes = PREFACE.to_vec();
     bytes.extend_from_slice(&frame(SETTINGS, 0, 0, &[]));
@@ -77,8 +59,7 @@ fn settings_flood() {
     assert_eq!(code, ENHANCE_YOUR_CALM);
     assert_eq!(reason, "too many control frames");
 
-    // The point of the attack is the answer it forces. Whatever it got, it
-    // stopped at the budget rather than running as long as the peer liked.
+    // The point of the attack is the ACKs it forces: they stop at the budget.
     let acks = written
         .iter()
         .filter(|f| f.kind == SETTINGS && f.flags & 0x1 != 0)
@@ -90,9 +71,7 @@ fn settings_flood() {
     );
 }
 
-/// CVE-2019-9513 — a flood of PRIORITY frames. We implement no priority
-/// scheme, so there is no tree to rebuild; what remains is the decode, and
-/// the control budget is what bounds it.
+/// CVE-2019-9513 — a flood of PRIORITY frames.
 #[test]
 fn priority_flood() {
     let mut bytes = preface();
@@ -108,8 +87,7 @@ fn priority_flood() {
     assert_eq!(code, ENHANCE_YOUR_CALM);
 }
 
-/// CVE-2019-9514 — open a stream, reset it, repeat. Every reset is a stream
-/// error we count, and past `FAULT_LIMIT` the connection goes.
+/// CVE-2019-9514 — open a stream, reset it, repeat.
 #[test]
 fn reset_flood() {
     let mut bytes = preface();
@@ -128,17 +106,14 @@ fn reset_flood() {
     assert_eq!(reason, "too many stream resets");
 }
 
-/// CVE-2023-44487, Rapid Reset — the same open-and-cancel, whose point is
-/// that a cancelled stream stops counting against `MAX_CONCURRENT_STREAMS`,
-/// so the limit that looks like the defence never fires. `FAULT_LIMIT` is
-/// what actually stops it, and it stops it long before the 100 concurrent
-/// streams the peer never got to hold.
+/// CVE-2023-44487, Rapid Reset — open-and-cancel, so no stream ever counts
+/// against `MAX_CONCURRENT_STREAMS` for long. `FAULT_LIMIT` is what stops it.
 #[test]
 fn rapid_reset() {
     let mut bytes = preface();
     let mut id = 1u32;
-    // Ten times the concurrency limit, which on its own would refuse
-    // nothing: each stream is gone before the next arrives.
+    // Each stream is gone before the next arrives, so the concurrency limit
+    // alone would refuse nothing.
     for _ in 0..super::super::MAX_CONCURRENT_STREAMS * 10 {
         bytes.extend_from_slice(&frame(
             HEADERS,
@@ -157,10 +132,8 @@ fn rapid_reset() {
     assert_eq!(code, ENHANCE_YOUR_CALM);
     assert_eq!(reason, "too many stream resets");
 
-    // Nothing was refused *before* the GOAWAY. A REFUSED_STREAM after it is
-    // §6.8 — every id above the one the GOAWAY named is refused from then on
-    // — where one before it would have been the concurrency limit catching
-    // the attack, which is precisely what this attack evades.
+    // Nothing refused before the GOAWAY (after it is §6.8): that would be the
+    // concurrency limit catching it, which is what this attack evades.
     let closed_at = written.iter().position(|f| f.kind == GOAWAY).unwrap();
     let refused_early = written[..closed_at].iter().any(|f| {
         f.kind == RST_STREAM && u32::from_be_bytes(f.payload[..4].try_into().unwrap()) == 0x7
@@ -171,18 +144,13 @@ fn rapid_reset() {
     );
 }
 
-/// CVE-2019-9518 — a flood of empty frames on an open stream.
-///
-/// An empty DATA frame costs the peer nothing: §6.9 accounts zero bytes
-/// against both windows, so no credit is spent and no WINDOW_UPDATE is ever
-/// owed. It costs us a decode, a dispatch and a wake of the handler task,
-/// which finds nothing to read and parks again. Flow control cannot see it,
-/// so the control budget is what has to.
+/// CVE-2019-9518 — a flood of empty DATA frames on an open stream. They spend
+/// no credit (§6.9), so flow control cannot see them.
 #[test]
 fn empty_data_flood() {
     let mut bytes = PREFACE.to_vec();
     bytes.extend_from_slice(&frame(SETTINGS, 0, 0, &[]));
-    // A stream left open: no END_STREAM, so DATA may keep arriving.
+    // No END_STREAM, so DATA may keep arriving.
     bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, GET_BLOCK));
     for _ in 0..super::super::protocol::ODD_FRAME_BURST + 1 {
         bytes.extend_from_slice(&frame(0x0, 0, 1, &[]));
@@ -197,15 +165,8 @@ fn empty_data_flood() {
 }
 
 /// CVE-2024-27316 — the CONTINUATION flood, with empty fragments.
-///
-/// `MAX_HEADER_BLOCK_SIZE` already bounds this attack in its usual form: a
-/// header block that keeps growing without END_HEADERS is cut off at twice
-/// the decoded limit. But that cap counts *bytes*, and a zero-length
-/// fragment adds none — so an endless stream of empty CONTINUATIONs never
-/// reaches it, while costing a decode and a dispatch each.
-///
-/// A fragment that carries nothing is not progress, so the control budget
-/// is what catches this form — the byte cap catches the other.
+/// `MAX_HEADER_BLOCK_SIZE` counts bytes and an empty fragment adds none, so
+/// the budget is what catches this form.
 #[test]
 fn continuation_flood_with_empty_fragments() {
     let mut bytes = preface();
@@ -223,20 +184,9 @@ fn continuation_flood_with_empty_fragments() {
     assert_eq!(reason, "too many pointless frames");
 }
 
-/// Not a CVE: the cost of the budget, stated as a test.
-///
-/// A download is the one legitimate exchange where the peer sends nothing
-/// but control frames — it receives DATA and answers WINDOW_UPDATE, over and
-/// over, and nothing it sends ever counts as progress. A client that leaves
-/// its stream window at the §6.9.2 default of 65535 and credits it back half
-/// a window at a time therefore spends one budget unit per 32 KiB received,
-/// and trips `CONTROL_FRAME_BURST` somewhere past 300 MB.
-///
-/// The clients that matter avoid it by announcing a large window instead of
-/// a chatty one — curl and nghttp2 both do — so this is a bound on the
-/// conservative client, not a common case. It is recorded here because the
-/// budget cannot tell it apart from a flood, and a reader deserves the
-/// number rather than the reassurance.
+/// Not a CVE: the known cost of the budget. A download credits back half a
+/// §6.9.2 default window at a time and trips `CONTROL_FRAME_BURST` past
+/// ~300 MB; the budget cannot tell it from a flood.
 #[test]
 fn a_download_that_only_ever_sends_window_updates_trips_the_budget() {
     let mut bytes = preface();
@@ -251,16 +201,11 @@ fn a_download_that_only_ever_sends_window_updates_trips_the_budget() {
     assert_eq!(code, ENHANCE_YOUR_CALM);
 }
 
-/// The cost the strict budget must not have: a client still speaking the
-/// RFC 7540 priority scheme sends a PRIORITY frame with every request, and
-/// Firefox did exactly that for years. Ten times `ODD_FRAME_BURST` of them
-/// is fine, because each request clears the count — which is the whole
-/// reason the budget is a burst rather than a lifetime total.
+/// The strict budget must not trip on an RFC 7540 client sending a PRIORITY
+/// with every request: each request clears the count.
 ///
-/// Delivered in batches under `MAX_CONCURRENT_STREAMS`, because a
-/// conforming client respects the limit we advertised (§5.1.2) and because
-/// the map only drains between chunks: the tasks that answer a request run
-/// when the loop yields, which is once per inbound chunk.
+/// Batched under `MAX_CONCURRENT_STREAMS` (§5.1.2): the map only drains
+/// between chunks.
 #[test]
 fn a_priority_frame_per_request_is_not_a_flood() {
     let mut inbound = deliveries(&preface());
@@ -293,14 +238,9 @@ fn a_priority_frame_per_request_is_not_a_flood() {
     );
 }
 
-/// §5.1.2 — a peer that fills the stream map and keeps asking.
-///
-/// A HEADERS frame refused for want of a slot still carries a header block,
-/// so `FrameWorth` reads it as progress and it clears both budgets. Left
-/// uncounted, that is a peer holding every defence at zero for as long as it
-/// likes while paying an HPACK decode and a RST_STREAM of ours per attempt.
-/// §5.1.2 makes exceeding the advertised limit a stream error, so the fault
-/// budget is what counts it.
+/// §5.1.2 — a peer that fills the stream map and keeps asking. A refused
+/// HEADERS still reads as progress and clears both burst budgets, so the
+/// fault budget has to count it.
 #[test]
 fn a_peer_that_keeps_asking_past_the_stream_limit_is_closed() {
     let mut bytes = preface();
@@ -310,8 +250,7 @@ fn a_peer_that_keeps_asking_past_the_stream_limit_is_closed() {
         bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, id, GET_BLOCK));
         id += 2;
     }
-    // Every one of these can only be refused, and pings between them no
-    // longer buy the peer a reset of the count.
+    // Pings between them no longer buy the peer a reset of the count.
     for _ in 0..super::super::protocol::FAULT_LIMIT + 1 {
         bytes.extend_from_slice(&frame(PING, 0, 0, b"reset_me"));
         bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, id, GET_BLOCK));
@@ -326,14 +265,8 @@ fn a_peer_that_keeps_asking_past_the_stream_limit_is_closed() {
     assert_eq!(reason, "too many refused streams");
 }
 
-/// CVE-2019-9516, the 0-length headers leak — a header block whose fields have
-/// empty names and empty values, three bytes each to send.
-///
-/// It never reaches a size cap: HTTP has no empty field names, so every one of
-/// them is refused and none is kept. HPACK has nothing against an empty
-/// string, though, so the block decodes to its end and the tables agree: the
-/// request is malformed (§8.1.1), which is its stream's problem and a fault
-/// against the budget, not the connection's.
+/// CVE-2019-9516, the 0-length headers leak — fields with empty names and
+/// values. A malformed request (§8.1.1): a stream error, not a connection one.
 #[test]
 fn zero_length_headers_leak() {
     let mut block = GET_BLOCK.to_vec();
@@ -369,16 +302,9 @@ fn zero_length_headers_leak() {
     assert_eq!(goaway(&written), None);
 }
 
-/// The other half of CVE-2019-9516: fields that are legal, tiny, and many.
-///
-/// A one-byte name and an empty value is four bytes on the wire, and §6.5.2
-/// charges it `1 + 0 + 32`. 600 of them are 2400 bytes in and 19 800 against
-/// `DECODE_MAX_HEADER_LIST_SIZE` — an eightfold amplification, and the reason
-/// the 32 in `decoded_header_size` is not a rounding detail. Without it this
-/// block would count 600 bytes and there would be no cap to reach.
-///
-/// Refused as a stream error, not a connection one: the block decoded, so the
-/// HPACK tables agree and only this request is unusable.
+/// The other half of CVE-2019-9516: many tiny legal fields. §6.5.2 charges
+/// each `1 + 0 + 32`, an eightfold amplification — the reason for the 32 in
+/// `decoded_header_size`. A stream error: the HPACK tables still agree.
 #[test]
 fn a_header_list_of_tiny_fields_is_refused_by_the_size_cap() {
     let mut block = GET_BLOCK.to_vec();
@@ -412,10 +338,8 @@ fn a_header_list_of_tiny_fields_is_refused_by_the_size_cap() {
     assert_eq!(goaway(&written), None, "the connection survives it");
 }
 
-/// The same block, over and over. Each one is refused, and each one made us
-/// decode 600 fields to find that out — while `FrameWorth` reads a full
-/// header block and calls it progress, so neither burst budget ever sees it.
-/// `FAULT_LIMIT` has to, or refusing is all we ever do about it.
+/// Each refusal cost a full decode while `FrameWorth` calls the block
+/// progress, so `FAULT_LIMIT` has to count it.
 #[test]
 fn a_flood_of_over_sized_header_lists_ends_the_connection() {
     let mut block = GET_BLOCK.to_vec();
@@ -440,19 +364,11 @@ fn a_flood_of_over_sized_header_lists_ends_the_connection() {
     assert_eq!(reason, "too many over-sized header lists");
 }
 
-/// An HPACK bomb: one large value entered into the dynamic table, then named
-/// again by one-byte references.
+/// An HPACK bomb: one large value in the dynamic table, then one-byte
+/// references to it. Caught by the decoded size, not `MAX_HEADER_BLOCK_SIZE`.
 ///
-/// The block is ~4 KiB and the list it expands to is ~24 KiB, so
-/// `MAX_HEADER_BLOCK_SIZE`, which bounds what arrives, never sees a problem.
-/// What stops it is that the decoder counts what the block *decodes to*
-/// against `DECODE_MAX_HEADER_LIST_SIZE` rather than the bytes it read.
-///
-/// The value is 4000 bytes and not 4096 on purpose: an entry costs its name,
-/// its value and 32, and §4.4 says one larger than the table's maximum empties
-/// the table instead of being added. At 4096 the entry would never exist,
-/// index 62 would be undefined, and this would test a decode failure rather
-/// than the cap.
+/// 4000 bytes, not 4096: §4.4 empties the table instead of adding an entry
+/// larger than it, so index 62 would not exist.
 #[test]
 fn an_hpack_bomb_is_refused_by_the_decoded_size() {
     let mut block = GET_BLOCK.to_vec();
@@ -497,15 +413,8 @@ fn an_hpack_bomb_is_refused_by_the_decoded_size() {
     );
 }
 
-/// CVE-2025-8671, MadeYouReset — the reset flood with the resets sent by *us*.
-///
-/// Rapid Reset is bounded by counting the peer's RST_STREAMs, so the variant
-/// stops sending them: each stream is opened, ended, and then given a DATA
-/// frame it may not have (§5.1), which is a stream error *we* answer with a
-/// reset. The stream slot frees either way, so `MAX_CONCURRENT_STREAMS` is
-/// never approached — and the budget that catches it has to be one that counts
-/// our own resets too, which is what `fail_stream` calling `count_fault` is
-/// for.
+/// CVE-2025-8671, MadeYouReset — the reset flood with the resets sent by us:
+/// DATA after END_STREAM (§5.1) makes us reset, so our own resets must count.
 #[test]
 fn made_you_reset() {
     let mut bytes = preface();
@@ -517,7 +426,7 @@ fn made_you_reset() {
             id,
             GET_BLOCK,
         ));
-        // DATA after the peer's own END_STREAM: the fault we are made to find.
+        // DATA after the peer's own END_STREAM.
         bytes.extend_from_slice(&frame(DATA, 0, id, b"x"));
     }
 
@@ -527,11 +436,9 @@ fn made_you_reset() {
     assert_eq!(code, ENHANCE_YOUR_CALM);
 }
 
-/// MadeYouReset again, with the triggers the frame decoder finds rather than
-/// the stream: a WINDOW_UPDATE of zero (§6.9), a PRIORITY of the wrong size
-/// (§6.3) or depending on itself (§5.3.1). Each is a stream error found
-/// before any stream sees the frame, and each used to be answered with a
-/// reset that nothing counted.
+/// MadeYouReset with triggers the frame decoder finds: a WINDOW_UPDATE of
+/// zero (§6.9), a PRIORITY of the wrong size (§6.3) or depending on itself
+/// (§5.3.1).
 ///
 /// One test per trigger: a test thread runs one connection.
 fn made_you_reset_by_the_decoder(kind: u8, trigger: impl Fn(u32) -> Vec<u8>) {
@@ -567,11 +474,8 @@ fn made_you_reset_with_a_self_dependent_priority() {
     });
 }
 
-/// DATA on a stream the peer itself closed — here by RST_STREAM — is its
-/// fault, and a stream error (§5.1). Answered once: the reset that answers it
-/// is ours, and what follows it on that stream is ignored like any body in
-/// flight behind a reset of ours. Answering every frame made us a reflector —
-/// one RST_STREAM out per byte in — that no budget saw.
+/// DATA on a stream the peer closed is a stream error (§5.1), answered once:
+/// answering every frame made us a reflector, one RST_STREAM out per byte in.
 #[test]
 fn data_on_a_stream_the_peer_closed_is_answered_once() {
     let mut bytes = preface();
@@ -596,14 +500,12 @@ fn data_on_a_stream_the_peer_closed_is_answered_once() {
     );
 }
 
-/// DATA on a stream that is gone is not progress. It used to be, so one byte
-/// on a dead stream every few thousand PINGs cleared the control budget, and
-/// the PING flood (CVE-2019-9512) ran as long as the peer liked.
+/// DATA on a gone stream is not progress, or one byte every few thousand
+/// PINGs keeps the PING flood (CVE-2019-9512) alive.
 #[test]
 fn data_on_a_dead_stream_does_not_refresh_the_control_budget() {
     let mut bytes = preface();
-    // A stream we reset, so the DATA behind it is ignored rather than
-    // counted: the cheapest thing for the peer to send.
+    // A stream we reset, so the DATA behind it is ignored rather than counted.
     bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, GET_BLOCK));
     bytes.extend_from_slice(&frame(WINDOW_UPDATE, 0, 1, &[0, 0, 0, 0]));
     let burst = super::super::protocol::CONTROL_FRAME_BURST;
@@ -634,24 +536,14 @@ fn data_on_a_dead_stream_does_not_refresh_the_control_budget() {
 // ---------------------------------------------------------------------------
 // Slowloris: the attacks that cost time rather than frames.
 //
-// The budgets above all count frames and are cleared by progress, so none of
-// them sees a peer whose whole method is to send almost nothing. These are the
-// deadlines instead, and each names the state it is measuring.
+// Budgets never see a peer that sends almost nothing; deadlines do.
 // ---------------------------------------------------------------------------
 
-/// Slowloris proper — a preface dribbled a byte at a time, *faster* than the
-/// deadline it is trying to outlast.
+/// Slowloris — a preface dribbled a byte at a time, faster than an
+/// inactivity timer would notice. `PARTIAL_TIMEOUT` runs from when the
+/// half-sent state began, so more of the same does not refill it.
 ///
-/// Five seconds between bytes against a ten-second budget, which is the whole
-/// point: an inactivity timer resets on every byte and would never fire here,
-/// so this peer would hold the connection for the two minutes its preface
-/// takes and then start on a header block. `PARTIAL_TIMEOUT` is spent from the
-/// moment the half-sent state began and sending more of the same does not
-/// refill it.
-///
-/// Nothing is written back: §3.4 answers an unfinished preface with silence,
-/// not a GOAWAY, so the absence of frames *is* the connection being dropped —
-/// a peer that got its preface in would have had our SETTINGS.
+/// §3.4: an unfinished preface is answered with silence, not a GOAWAY.
 #[test]
 fn slowloris_a_dribbled_preface_is_cut_off() {
     let gap = Duration::from_secs(5);
@@ -669,13 +561,6 @@ fn slowloris_a_dribbled_preface_is_cut_off() {
     );
 }
 
-/// The same peer once its preface is in, holding a connection open having
-/// asked for nothing.
-///
-/// Closed after `IDLE_TICKS` with NO_ERROR: an idle connection is not
-/// misbehaving, it is finished, and a client that reconnects on NO_ERROR is
-/// doing the right thing. This is the keepalive policy — HTTP/2 has no header
-/// for it and the RFC sets no deadline, so it is ours to pick.
 #[test]
 fn an_idle_connection_is_closed_when_the_keepalive_runs_out() {
     let written = run_connection_timed(
@@ -690,13 +575,8 @@ fn an_idle_connection_is_closed_when_the_keepalive_runs_out() {
     assert_eq!(code, NO_ERROR);
 }
 
-/// A HEADERS that never ends — worse than idle, because §6.10 forbids any
-/// frame between a HEADERS and its CONTINUATION, so this blocks every *other*
-/// stream on the connection and not just its own.
-///
-/// Caught by the same budget as the dribbled preface, and for the same reason:
-/// `header_pending()` is the predicate, and it was written for this long
-/// before anything called it.
+/// A HEADERS that never ends: §6.10 forbids any frame in between, so it
+/// blocks every other stream on the connection.
 #[test]
 fn an_unfinished_header_block_is_cut_off() {
     let mut bytes = preface();
@@ -715,14 +595,8 @@ fn an_unfinished_header_block_is_cut_off() {
     assert_eq!(code, NO_ERROR);
 }
 
-/// A request body arriving a byte at a time: the upload side of the same idea,
-/// and the one the connection deadlines cannot see, since the peer is sending
-/// constantly and the connection is never idle.
-///
-/// What catches it is the stream's own rate — bytes over age — which is why it
-/// has to be a rate and not a deadline: this peer is indistinguishable from a
-/// large upload by any measure that only asks how long the stream has been
-/// open.
+/// A request body dribbled a byte at a time. The connection is never idle,
+/// so only the stream's rate, not a deadline, can catch it.
 #[test]
 fn a_dribbled_request_body_is_reset() {
     let mut open = preface();
@@ -750,9 +624,8 @@ fn a_dribbled_request_body_is_reset() {
     );
 }
 
-/// The same shape at an honest rate, which must be served: a defence that
-/// cannot tell a slow upload from a held stream is not a defence, it is an
-/// outage. 4 KiB a second against a 256 B/s floor.
+/// A defence that cannot tell a slow upload from a held stream is an outage.
+/// 4 KiB a second against a 256 B/s floor.
 #[test]
 fn a_slow_but_honest_request_body_is_served() {
     let mut open = preface();
@@ -778,8 +651,8 @@ fn a_slow_but_honest_request_body_is_served() {
     );
 }
 
-/// A client preface whose SETTINGS advertise `initial_window_size`, so a
-/// response of any size stalls after that many bytes.
+/// SETTINGS advertising `initial_window_size`, so a response of any size
+/// stalls after that many bytes.
 fn preface_with_window(initial: u32) -> Vec<u8> {
     let mut payload = vec![0x00, 0x04]; // SETTINGS_INITIAL_WINDOW_SIZE
     payload.extend_from_slice(&initial.to_be_bytes());
@@ -789,17 +662,8 @@ fn preface_with_window(initial: u32) -> Vec<u8> {
 }
 
 /// CVE-2019-9511, Data Dribble — ask for a response, then refuse to take it.
-///
-/// The download half of the slowloris family, and the one the other defences
-/// are blind to. Nothing arrives to count, so the body rate never fires; the
-/// writer parks inside `write_data` with no credit, so the send-side check is
-/// never reached either; and with the peer's window at zero nothing is ever
-/// queued, so `FLUSH_TIMEOUT` has no send to time out. A PING every few
-/// seconds keeps the read deadline from expiring and costs one unit of a
-/// budget of ten thousand.
-///
-/// What ends it is the sweep, which runs on the peer's chunks but not on the
-/// peer's cooperation.
+/// No DATA arrives, the writer parks on zero credit and nothing is queued to
+/// time out; only the sweep sees it.
 #[test]
 fn data_dribble_a_response_the_peer_will_not_take() {
     let mut bytes = preface_with_window(1);
@@ -814,7 +678,7 @@ fn data_dribble_a_response_the_peer_will_not_take() {
     let written = run_connection_timed(
         vec![
             ReadEvent::Data(bytes).into(),
-            // Keepalive, and what drives the sweep: legal, cheap, and useless.
+            // Keepalive, and what drives the sweep.
             ReadEvent::Data(frame(PING, 0, 0, b"keepaliv")).after(second * 6),
             ReadEvent::Data(frame(PING, 0, 0, b"keepaliv")).after(second * 12),
             ReadEvent::Eof.after(second * 18),
@@ -833,11 +697,8 @@ fn data_dribble_a_response_the_peer_will_not_take() {
     );
 }
 
-/// The same tiny window, taken properly: a peer with little buffer that keeps
-/// crediting is a peer being served, not an attack.
-///
-/// The pair matters more than the attack beside it. A send-rate floor that
-/// cannot tell a small receive buffer from a held stream is an outage.
+/// A send-rate floor that cannot tell a small receive buffer from a held
+/// stream is an outage.
 #[test]
 fn a_small_window_that_keeps_crediting_is_served() {
     let mut bytes = preface_with_window(1);
@@ -871,12 +732,9 @@ fn a_small_window_that_keeps_crediting_is_served() {
     );
 }
 
-/// A request body that never starts — the inbound case the DATA-driven check
-/// cannot see, since it is only reached by a DATA frame arriving.
-///
-/// Costs the peer one HEADERS and buys a stream slot, its receive window, and
-/// a buffer sized by the `content-length` it declared, for as long as it keeps
-/// the connection awake.
+/// A request body that never starts: the DATA-driven check never runs. One
+/// HEADERS holds a stream slot, its window and a `content-length`-sized
+/// buffer.
 #[test]
 fn a_request_body_that_never_arrives_is_reclaimed() {
     // `content-length` with no END_STREAM: a body is promised and never sent.
@@ -909,15 +767,8 @@ fn a_request_body_that_never_arrives_is_reclaimed() {
     assert_eq!(reset.stream_id, 1);
 }
 
-/// A peer naming a 4 GiB HPACK table is told a number, not obeyed.
-///
-/// §6.5.2 lets it ask for any `u32`, and the value caps the dynamic table this
-/// server encodes *its own* responses against. Taken at face value the table
-/// never evicts: it grows by an entry for every distinct header emitted, for
-/// the life of the connection, times however many connections there are. Six
-/// bytes of SETTINGS buying unbounded growth is the shape of the thing.
-///
-/// §4.2 says an encoder may use less than it is offered, so this one does.
+/// §6.5.2 lets a peer ask for any `u32`; obeyed, our encoder's table would
+/// grow without bound. §4.2 lets an encoder use less than it is offered.
 #[test]
 fn a_peer_cannot_name_an_unbounded_hpack_table() {
     use crate::shared::codec::types::Setting;
@@ -928,8 +779,7 @@ fn a_peer_cannot_name_an_unbounded_hpack_table() {
     assert!(settings.apply(Setting::HeaderTableSize(u32::MAX)).is_ok());
     assert_eq!(settings.header_table_size, MAX_ENCODER_TABLE_SIZE);
 
-    // And a modest one is still honoured, so the clamp is a ceiling rather
-    // than a constant.
+    // The clamp is a ceiling rather than a constant.
     assert!(settings.apply(Setting::HeaderTableSize(512)).is_ok());
     assert_eq!(settings.header_table_size, 512);
 }

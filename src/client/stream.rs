@@ -1,16 +1,3 @@
-//! One request and the response it is waiting for.
-//!
-//! Two halves of the same thing. [`StreamState`] is what the connection loop
-//! writes into as frames arrive — it lives in the connection's stream map and
-//! is reached through an `Rc`, so everything the loop touches is behind a
-//! `Cell`. [`Stream`] is what the application holds: the handle that writes a
-//! body, takes the response, and closes the stream when it is dropped.
-//!
-//! They are separate because they are owned by different tasks. The loop must
-//! be able to deliver a DATA frame whether or not anyone is currently reading,
-//! and the application must be able to let its handle go without the loop
-//! losing the map entry it is decoding into.
-
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::io;
@@ -32,26 +19,14 @@ use crate::shared::connection::{
     DEADLINE_TICK, SendSide, settings::Settings, stream_window::StreamWindow,
 };
 
-/// Why a stream ended before it was done.
-///
-/// Kept as a value rather than an `io::Error` because it is set from the
-/// connection loop, where an allocation per reset stream is a cost a peer
-/// controls, and read at most once by whoever was waiting.
+/// A value rather than an `io::Error`: set from the connection loop, where an
+/// allocation per reset stream is a cost a peer controls.
 #[derive(Clone, Copy)]
 pub(crate) enum Failure {
-    /// §6.4: the peer reset the stream, with this error code.
+    /// §6.4.
     Reset(u32),
-    /// The stream ended without a reset from the peer: the connection went,
-    /// a GOAWAY said this request was never processed (§6.8), or this client
-    /// cancelled it.
     Gone(&'static str),
-    /// The deadline this request was given ran out, and the stream was
-    /// cancelled for it.
-    ///
-    /// Its own variant rather than a [`Gone`](Self::Gone) with a good message,
-    /// because it is the one failure a caller acts on differently: a timeout
-    /// is `ErrorKind::TimedOut`, which is what a retry decides on without
-    /// reading prose.
+    /// Must map to `ErrorKind::TimedOut`, which retries decide on.
     Expired,
 }
 
@@ -68,80 +43,43 @@ impl Failure {
     }
 }
 
-/// The connection's half of a stream: what frames do to it.
 pub(crate) struct StreamState {
-    /// §5.1.1: the id this request went out on. Kept here because the map
-    /// that holds the state is keyed by it but does not carry it, and a walk
-    /// of the live streams sometimes needs to name one.
     id: StreamId,
     window: StreamWindow,
-    /// The response head, converted where it arrived because that is where a
-    /// malformed one can still be answered with a RST_STREAM. Taken by the
-    /// handle, which is why arriving is tracked separately.
     response: RefCell<Option<http::Response<()>>>,
-    /// The response head has arrived, whether or not anyone has taken it yet.
-    ///
-    /// Not the same question as `response.is_some()`, and the difference is
-    /// what tells a trailer section from a response: §8.1 makes the second
-    /// HEADERS on a stream its trailers, and if this were read off the slot
-    /// the head was taken from, an application that had read its response
-    /// would have its trailers delivered as a second one.
+    /// Not `response.is_some()`: the head is taken by the handle, and reading
+    /// it off that slot would deliver the trailers (§8.1) as a second
+    /// response.
     response_seen: Cell<bool>,
-    /// Body bytes, one entry per DATA frame.
-    ///
-    /// Bounded without a limit of its own: nothing is credited back to the
-    /// peer until the application takes a chunk, so what can pile up here is
-    /// exactly the receive window — [`STREAM_RECV_WINDOW`] a stream — and that
-    /// is the whole argument for buffering at all rather than pushing back on
-    /// the loop.
+    /// Bounded by the receive window: no credit goes back until the
+    /// application takes a chunk.
     chunks: RefCell<VecDeque<Vec<u8>>>,
-    /// §8.1: the trailers, if the response had any.
     trailers: RefCell<Option<HeaderMap>>,
-    /// The request was a HEAD, whose response declares the length the GET
-    /// would have had and carries no body (RFC 9110 §9.3.2) — so its
-    /// `content-length` is not a promise about this stream.
+    /// RFC 9110 §9.3.2: a HEAD response's `content-length` is not a promise
+    /// about this stream.
     head_request: bool,
-    /// §8.1.1: what the response's `content-length` promised, if it made a
-    /// promise this stream has to keep.
+    /// §8.1.1.
     declared_len: Cell<Option<u64>>,
-    /// Body bytes received so far, padding excluded — what the promise is
-    /// held to.
+    /// Padding excluded.
     received_len: Cell<u64>,
-    /// The peer's half is done: its END_STREAM arrived, on the response head,
-    /// a DATA frame or the trailers.
     no_more_input: Cell<bool>,
-    /// Our half is done: the request is written, END_STREAM included.
     no_more_output: Cell<bool>,
-    /// Why the peer's half ended short, if it did — what the reading side
-    /// reports.
-    ///
-    /// Never set once the peer's END_STREAM has arrived. A response that
-    /// ended is complete, whatever comes after it: §8.1 has a server stop an
-    /// upload with RST_STREAM(NO_ERROR) after a complete response, and
-    /// clients MUST NOT discard the response for it.
+    /// Never set once the peer's END_STREAM has arrived: §8.1 has a server
+    /// stop an upload with RST_STREAM(NO_ERROR) after a complete response,
+    /// and clients MUST NOT discard the response for it.
     input_failure: Cell<Option<Failure>>,
-    /// Why our half cannot be written any more — what the writing side
-    /// reports. Set by the same failure, for the same reason, while the
-    /// request is still going: that is what stops the upload.
     output_failure: Cell<Option<Failure>>,
-    /// Received body bytes still holding flow-control credit — the peer's
-    /// until the application reads them.
+    /// Received bytes still holding flow-control credit.
     unreleased: Cell<u32>,
-    /// Request body bytes handed to the peer. Nothing reads it yet; it is the
-    /// counter a send-rate check would run on, and the server keeps the same
-    /// one.
     sent: Cell<u64>,
-    /// Whoever waits for the response, or for body bytes.
     recv_waker: RefCell<Option<Waker>>,
-    /// Whoever waits for credit to write a body with. A second slot rather
-    /// than the server's one, because both halves of a client stream can be
-    /// in flight at once: a request body goes up while the response comes
-    /// down, and a single slot would let one park overwrite the other.
+    /// A separate slot: both halves can be parked at once, and a single slot
+    /// would let one park overwrite the other.
     send_waker: RefCell<Option<Waker>>,
 }
 
 impl StreamState {
-    /// `settings` are the peer's: they credit the send window.
+    /// `settings` are the peer's.
     pub(crate) fn new(
         id: StreamId,
         settings: &Settings,
@@ -159,8 +97,6 @@ impl StreamState {
             declared_len: Cell::new(None),
             received_len: Cell::new(0),
             no_more_input: Cell::new(false),
-            // END_STREAM already on the request head: the stream is born
-            // half-closed(local).
             no_more_output: Cell::new(end_stream),
             input_failure: Cell::new(None),
             output_failure: Cell::new(None),
@@ -175,29 +111,17 @@ impl StreamState {
         self.id
     }
 
-    /// Both halves done (§5.1), which is what lets the connection take the
-    /// stream out of its map.
+    /// §5.1.
     pub(crate) fn is_closed(&self) -> bool {
         self.no_more_input.get() && self.no_more_output.get()
     }
 
-    /// Our half is done: END_STREAM is written. Says nothing about the peer's
-    /// — §5.1 leaves us half-closed(local) and still owed a response.
     pub(crate) fn end_output(&self) {
         self.no_more_output.set(true);
     }
 
-    /// §8.1.2.4: the response head. `Err` is a head that is not one — an
-    /// informational response with END_STREAM, or a `content-length` that is
-    /// not a length or that the head already breaks.
-    ///
-    /// §8.1 lets any number of informational responses precede the final one;
-    /// they are dropped here rather than delivered, so `response()` resolves
-    /// on the response the application asked about. Nothing is lost that this
-    /// client can currently act on: it never sends `expect: 100-continue`.
-    ///
-    /// Judged before it is stored, so a head that fails is never handed to
-    /// the application as a response.
+    /// §8.1.2.4. Judged before it is stored, so a failing head never reaches
+    /// the application. Informational responses (§8.1) are dropped.
     pub(crate) fn recv_response(
         &self,
         response: http::Response<()>,
@@ -211,9 +135,8 @@ impl StreamState {
             };
         }
 
-        // §8.1.1: a declared length the DATA does not add up to makes the
-        // response malformed. Not for a HEAD's response or a 304 (RFC 9110
-        // §8.6): both declare the length of a body they do not carry.
+        // §8.1.1. Not for a HEAD's response or a 304 (RFC 9110 §8.6): both
+        // declare the length of a body they do not carry.
         let declared =
             content_length(response.headers()).map_err(|()| StreamViolation::MalformedResponse)?;
         let bodiless = self.head_request || response.status() == http::StatusCode::NOT_MODIFIED;
@@ -232,11 +155,9 @@ impl StreamState {
         Ok(())
     }
 
-    /// §8.1: the trailers — a second HEADERS, after the body, carrying
-    /// END_STREAM and no pseudo-header. Ends the peer's half exactly as a
-    /// final DATA frame does.
+    /// §8.1.
     pub(crate) fn recv_trailers(&self, fields: HeaderMap) -> Result<(), StreamViolation> {
-        // §8.1.1: the body is over, so it has to be the length it said.
+        // §8.1.1.
         if self
             .declared_len
             .get()
@@ -250,35 +171,26 @@ impl StreamState {
         Ok(())
     }
 
-    /// Whether a HEADERS frame on this stream is the response or its
-    /// trailers.
     pub(crate) fn has_response(&self) -> bool {
         self.response_seen.get()
     }
 
-    /// The peer's half is done: its END_STREAM arrived, or the stream failed.
     pub(crate) fn input_ended(&self) -> bool {
         self.no_more_input.get()
     }
 
-    /// One DATA payload, already stripped of its padding. The bytes are
-    /// copied out of the decoder's buffer, which is owed back to the ring the
-    /// moment this returns.
-    ///
-    /// Judged before anything is kept: a payload that breaks the declared
-    /// length is not delivered, and what came before it already was.
+    /// The payload is copied: the decoder's buffer is owed back to the ring
+    /// the moment this returns. Judged before anything is kept.
     pub(crate) fn recv_data(
         &self,
         payload: &[u8],
         end_stream: bool,
     ) -> Result<(), StreamViolation> {
         if self.no_more_input.get() {
-            // §5.1: the peer's half was already closed by its END_STREAM.
+            // §5.1.
             return Err(StreamViolation::DataAfterEndStream);
         }
-        // §8.1: a response is a head, then its body. DATA with no head in
-        // front of it — or behind only an informational one — is not a body
-        // of anything.
+        // §8.1: DATA before a final response head is malformed.
         if !self.response_seen.get() {
             return Err(StreamViolation::MalformedResponse);
         }
@@ -304,30 +216,25 @@ impl StreamState {
         Ok(())
     }
 
-    /// §6.9.1: debits the receive window. Split from `recv_data` because an
-    /// overrun here is a connection error, not a stream one.
+    /// §6.9.1. Split from `recv_data` because an overrun here is a connection
+    /// error, not a stream one.
     pub(crate) fn recv_window(&self, padded_len: u32) -> Result<(), ()> {
         self.window.recv(padded_len)
     }
 
-    /// Hands receive credit back on this stream, answering with the
-    /// WINDOW_UPDATE increment once enough has piled up to be worth one.
-    /// For bytes that never reach the application — padding — and so will
-    /// never be released by a read.
+    /// For bytes no read will ever release, i.e. padding.
     pub(crate) fn release_recv(&self, len: u32) -> Option<u32> {
         self.window.release_recv(len)
     }
 
-    /// §6.9.1: a WINDOW_UPDATE on this stream. The writer may be waiting on
-    /// exactly this; it re-checks the window itself.
+    /// §6.9.1.
     pub(crate) fn credit_send(&self, increment: u32) -> Result<(), ()> {
         self.window.credit_send(increment)?;
         self.wake_send();
         Ok(())
     }
 
-    /// §6.9.2: the peer's initial window changed. Woken only when the change
-    /// opens room — a shrink has nothing to offer a waiting writer.
+    /// §6.9.2.
     pub(crate) fn adjust_send(&self, delta: i32) -> Result<(), ()> {
         self.window.adjust_send(delta)?;
         if delta > 0 {
@@ -336,18 +243,9 @@ impl StreamState {
         Ok(())
     }
 
-    /// The stream is over for a reason that is not its END_STREAM. Both
-    /// wakers fire: a reader waiting for a response it will never get and a
-    /// writer parked on credit that will never come are the same casualty.
-    ///
-    /// It fails only the halves still open. A half that already ended
-    /// cleanly keeps its ending: a response the peer finished is still
-    /// read to its end, trailers and all, and the failure is reported to
-    /// whoever is still writing.
-    ///
-    /// The first failure is the one kept — a stream reset by the peer and
-    /// then caught by the connection closing was reset by the peer. It closes
-    /// both halves, so a later one finds none open to fail.
+    /// Fails only the halves still open: a response the peer finished is
+    /// still read to its end. The first failure is the one kept, since it
+    /// closes both halves.
     pub(crate) fn fail(&self, failure: Failure) {
         if !self.no_more_input.get() {
             self.input_failure.set(Some(failure));
@@ -355,24 +253,20 @@ impl StreamState {
         if !self.no_more_output.get() {
             self.output_failure.set(Some(failure));
         }
-        // Nothing more will arrive and nothing more may be written, which is
-        // what stops a reader parking again on the next poll.
+        // Stops a reader parking again on the next poll.
         self.no_more_input.set(true);
         self.no_more_output.set(true);
         self.wake_recv();
         self.wake_send();
     }
 
-    /// Connection credit this stream still holds, zeroed on the way out so it
-    /// can only be given back once — by the connection retiring the stream,
-    /// or by the application reading the bytes, whichever comes first.
+    /// Zeroed on the way out so the credit can only be given back once.
     pub(crate) fn take_unreleased(&self) -> u32 {
         self.unreleased.replace(0)
     }
 
-    /// Takes `len` off what this stream still owes, answering how much of it
-    /// was actually still owed. Zero after the stream has been retired, which
-    /// is what keeps a late read from crediting the peer twice.
+    /// Zero after the stream has been retired, which keeps a late read from
+    /// crediting the peer twice.
     fn release(&self, len: u32) -> u32 {
         let taken = len.min(self.unreleased.get());
         self.unreleased.set(self.unreleased.get() - taken);
@@ -420,28 +314,13 @@ impl SendSide for StreamState {
     }
 }
 
-/// One request on a connection: write its body, read its response, close it.
-///
-/// The handle is the stream's lifetime as far as the application is
-/// concerned. Dropping it closes the stream — with a RST_STREAM if the
-/// exchange was not finished, which is what §8.1 expects of a client that
-/// abandons a request rather than one that completes it.
-///
-/// Not `Clone`, and not `Send`: a stream belongs to one task on one thread,
-/// like everything else on this runtime.
+/// Dropping it closes the stream, with a RST_STREAM if the exchange was not
+/// finished (§8.1).
 pub struct Stream {
     id: StreamId,
     state: Rc<StreamState>,
     shared: Rc<ClientShared>,
-    /// When this request runs out of time, if it was given a deadline.
-    ///
-    /// Held by the handle rather than the state, because it is the handle that
-    /// waits: the connection loop has no opinion about how long a request may
-    /// take, and a deadline it enforced would be a timer per stream armed on
-    /// the loop's behalf for something only the application asked for.
     deadline: Option<SystemTime>,
-    /// Set by [`Stream::close`], so that the drop that follows does nothing a
-    /// second time.
     closed: Cell<bool>,
 }
 
@@ -456,51 +335,17 @@ impl Stream {
         }
     }
 
-    /// Gives this request `within` to finish, from now.
-    ///
-    /// The deadline covers the whole exchange rather than one call on it —
-    /// writing the body, waiting for the head, reading to the end of it — so
-    /// what it bounds is the thing a caller actually cares about. When it
-    /// passes, the stream is cancelled the way [`close`](Self::close) cancels
-    /// it (§8.1: RST_STREAM CANCEL, so the peer stops working and stops
-    /// sending), and every call on the handle answers `ErrorKind::TimedOut`
-    /// from then on — the one that timed out and the ones after it alike.
-    ///
-    /// It is enforced where the application waits, which is the whole of it: a
-    /// deadline on a handle nobody is awaiting passes unnoticed until the next
-    /// call, and a handle nobody awaits *at all* cancels the stream when it is
-    /// dropped anyway. What this is not is a bound the connection keeps on the
-    /// peer's behalf — see [`Connection::run`].
-    ///
-    /// Without one, a request waits as long as the exchange takes. That is
-    /// often right: a server-streaming call has no natural deadline, and the
-    /// keepalive is what notices a peer that has gone rather than one that is
-    /// slow.
-    ///
-    /// [`Connection::run`]: crate::client::Connection::run
+    /// Enforced only where the application waits, not by the connection loop.
     pub fn with_deadline(mut self, within: Duration) -> Self {
         self.deadline = Some(runtime::runtime::now() + within);
         self
     }
 
-    /// The id this request went out on (§5.1.1: odd, and never reused).
     pub fn id(&self) -> StreamId {
         self.id
     }
 
-    /// Writes `data` as the next of the request body, `end_stream` marking it
-    /// as the last.
-    ///
-    /// §6.9.1: the payload is cut into DATA frames by what the stream's send
-    /// window, the connection's and the peer's `max_frame_size` allow, and by
-    /// the room left in the connection's output. With none of it, this waits
-    /// — for a WINDOW_UPDATE, or for the loop to flush — so a body larger
-    /// than the peer will take does not have to be held anywhere but where
-    /// the caller already has it.
-    ///
-    /// Resolves once the last byte is *written*, which is not the same as
-    /// sent: the connection loop owns the send, and an error there ends the
-    /// connection rather than this call.
+    /// §6.9.1.
     pub async fn write(&self, data: &[u8], end_stream: bool) -> io::Result<()> {
         self.within(self.write_body(data, end_stream)).await
     }
@@ -519,10 +364,9 @@ impl Stream {
             data,
             end_stream
         ));
-        // The write parks on flow control, and a stream that is reset while
-        // parked is credited by nothing — so the failure has to be checked
-        // beside it rather than after it. `fail` wakes the send waker the
-        // write registered, which is what brings us back here to see it.
+        // A stream reset while the write is parked on flow control is credited
+        // by nothing, so the failure must be checked beside it; `fail` wakes
+        // the send waker the write registered.
         std::future::poll_fn(|cx| {
             if let Some(failure) = self.state.output_failure.get() {
                 return Poll::Ready(Err(failure.error()));
@@ -538,15 +382,7 @@ impl Stream {
         Ok(())
     }
 
-    /// The response head, once the peer has sent it.
-    ///
-    /// §8.1 lets informational responses precede it; they are dropped, so
-    /// this resolves on the response proper. An error is the stream ending
-    /// without one — reset by the peer, or carried away by the connection.
-    ///
-    /// The head is handed over rather than lent, so this answers once. A
-    /// second call is an error and not a wait, which is the difference
-    /// between a mistake that is reported and one that hangs.
+    /// Answers once; a second call must error rather than hang.
     pub async fn response(&self) -> io::Result<http::Response<()>> {
         self.within(self.await_response()).await
     }
@@ -571,16 +407,9 @@ impl Stream {
         .await
     }
 
-    /// The next of the response body, or `None` at its end.
-    ///
-    /// One chunk per DATA frame, in the order they arrived. Taking a chunk is
-    /// what hands the peer back the flow-control credit it was holding
-    /// (§6.9.1), so an application that stops reading stops the download —
-    /// which is the point: nothing is buffered here beyond one receive
-    /// window.
-    ///
-    /// Whatever arrived is delivered before any failure is reported: a body
-    /// cut short by a reset is still a body as far as it goes.
+    /// Taking a chunk is what returns its credit (§6.9.1), so nothing is
+    /// buffered beyond one receive window. Whatever arrived is delivered
+    /// before any failure is reported.
     pub async fn read(&self) -> io::Result<Option<Vec<u8>>> {
         self.within(self.next_chunk()).await
     }
@@ -607,29 +436,13 @@ impl Stream {
         Ok(chunk)
     }
 
-    /// §8.1: the trailers, if the response carried any. `None` until the body
-    /// has ended, since that is what a trailer section follows.
+    /// §8.1.
     pub fn trailers(&self) -> Option<HeaderMap> {
         self.state.trailers.borrow_mut().take()
     }
 
-    /// Ends the request with a trailer section: §8.1's second HEADERS, after
-    /// the body, carrying END_STREAM.
-    ///
-    /// This is what `write(.., true)` would otherwise have done, so it is one
-    /// or the other — a request whose body already ended has nothing left to
-    /// put trailers on, and says so rather than sending a frame the peer would
-    /// answer with a stream error.
-    ///
-    /// §8.3 forbids a pseudo-header anywhere in a trailer section, which
-    /// `HeaderMap` already makes impossible: `:` is not a character a
-    /// `HeaderName` may contain. What it does not check is whether the peer
-    /// wants trailers at all — a server is free to ignore them, and §8.1 only
-    /// asks that a sender not put anything essential there.
-    ///
-    /// Not `async`: a trailer section is one small frame, written to the
-    /// output for the loop to send, with no window to wait on (§6.9 meters
-    /// DATA and nothing else).
+    /// §8.3's no-pseudo-header rule holds by construction: `:` cannot appear
+    /// in a `HeaderName`. No window to wait on (§6.9 meters DATA only).
     pub fn send_trailers(&self, fields: &HeaderMap) -> io::Result<()> {
         if let Some(failure) = self.state.output_failure.get() {
             return Err(failure.error());
@@ -644,38 +457,20 @@ impl Stream {
         Ok(())
     }
 
-    /// Ends this stream now.
-    ///
-    /// A stream that has finished both halves is merely forgotten. One that
-    /// has not is reset with CANCEL (§8.1): the peer is told to stop, which
-    /// it cannot infer from a client that simply stops reading — its own
-    /// half-closed state would keep it sending until the window ran out.
-    ///
-    /// Idempotent, and what dropping the handle does.
+    /// An unfinished stream is reset with CANCEL (§8.1). Idempotent.
     pub fn close(&self) {
         if self.closed.replace(true) {
             return;
         }
         self.shared.reset_stream(self.id, CANCEL);
-        // Even when that wrote nothing: this may have been the last handle on
-        // the connection, and the loop is parked waiting to be told something
-        // changed. Letting go is the one change nothing else reports.
+        // Even when that wrote nothing: this may have been the last handle,
+        // and the parked loop would not otherwise notice.
         self.shared.core.wake_flusher();
     }
 
-    /// Runs `op` under this stream's deadline, if it has one.
-    ///
-    /// The wait is taken in slices rather than armed once, for a reason that
-    /// is the runtime's: it serves [`DEADLINE_TICK`] from a store of its own
-    /// and anything else from a timewheel that holds a minute at most, so a
-    /// deadline of five minutes has no timer that fits it. Slicing gives
-    /// arbitrary deadlines the cheap store for the long stretch and the wheel
-    /// only for the last, sub-tick part of the wait — and the precision is the
-    /// wheel's, not the tick's, since the final slice is exactly what is left.
-    ///
-    /// `op` is held across slices rather than restarted: it is polled through
-    /// a `Pin`, so a timed-out slice drops the borrow and not the future, and
-    /// a half-written body stays half-written.
+    /// Waited in slices of at most [`DEADLINE_TICK`] because the runtime's
+    /// timewheel holds a minute at most. `op` must be held across slices, not
+    /// restarted, so a half-written body stays half-written.
     async fn within<T>(&self, op: impl Future<Output = io::Result<T>>) -> io::Result<T> {
         let Some(deadline) = self.deadline else {
             return op.await;
@@ -696,27 +491,15 @@ impl Stream {
         }
     }
 
-    /// The deadline passed: the stream is failed with the reason, and then
-    /// cancelled.
-    ///
-    /// In that order, because [`StreamState::fail`] keeps the first failure it
-    /// is given and the cancel brings one of its own. This way everything
-    /// waiting on the stream reports the timeout rather than the reset that
-    /// carried it out.
-    ///
-    /// A half that had already ended keeps its ending, as it does for any
-    /// failure. Every later call on the handle still answers `TimedOut`:
-    /// [`within`](Self::within) says so before it looks at the stream.
+    /// Fail before close: [`StreamState::fail`] keeps the first failure, so
+    /// waiters report the timeout rather than the cancel.
     fn expire(&self) -> io::Error {
         self.state.fail(Failure::Expired);
         self.close();
         Failure::Expired.error()
     }
 
-    /// Hands the peer back the credit `len` received bytes were holding, on
-    /// this stream and on the connection both — §6.9.1 debited both when they
-    /// arrived. Nothing goes out until a worthwhile amount has piled up at
-    /// either level.
+    /// §6.9.1: credit goes back on the stream and the connection both.
     fn release(&self, len: u32) {
         let taken = self.state.release(len);
         if taken == 0 {

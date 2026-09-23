@@ -1,26 +1,18 @@
-/// Length of gRPC's Length-Prefixed-Message header: one byte of
-/// Compressed-Flag, then the message length, big-endian.
+/// gRPC's Length-Prefixed-Message header: one byte of Compressed-Flag, then
+/// the message length, big-endian.
 pub const PREFIX_LEN: usize = 5;
 
-/// A message prefix whose five bytes are arriving — across DATA frames if that
-/// is how they were cut.
-///
-/// The same three steps as [`Accumulating`](super::Accumulating), which is
-/// what it turns into: `missing`, `push`, `finish`.
 pub struct Prefix {
     bytes: [u8; PREFIX_LEN],
     filled: usize,
 }
 
-/// What a whole prefix says, as the wire said it: neither field is judged
-/// here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrefixRead {
     pub compressed_flag: u8,
     pub length: u32,
 }
 
-/// More bytes than a prefix has left to take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrefixOverflow {
     pub missing: usize,
@@ -45,9 +37,8 @@ impl Prefix {
         self.filled == 0
     }
 
-    /// Appends `payload`, all of it or none of it. Cutting it at
-    /// [`missing`](Self::missing) is the caller's: what is past the cut is the
-    /// message's.
+    /// All of `payload` or none of it: cutting it at
+    /// [`missing`](Self::missing) is the caller's.
     pub fn push(&mut self, payload: &[u8]) -> Result<(), PrefixOverflow> {
         if payload.len() > self.missing() {
             return Err(PrefixOverflow {
@@ -60,7 +51,6 @@ impl Prefix {
         Ok(())
     }
 
-    /// `Err(self)` while bytes are missing: nothing is lost.
     pub fn finish(self) -> Result<PrefixRead, Self> {
         if self.missing() > 0 {
             return Err(self);

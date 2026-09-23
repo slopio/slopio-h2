@@ -1,13 +1,5 @@
 use super::prefix::PREFIX_LEN;
 
-/// Frames a message the way the wire wants it: the Compressed-Flag, the
-/// length, then the message.
-///
-/// One allocation, of exactly the right size, and nothing copied into it
-/// twice: `encoded_len` is asked first so the prefix can be written in front
-/// and the message encoded after it, in place. Encoding into a `Vec` cannot
-/// fail — it grows — so there is no error to return.
-///
 /// The flag is always 0. Compressing a response would mean agreeing an
 /// encoding with the peer first, through `grpc-accept-encoding`, and this end
 /// announces none.
@@ -40,14 +32,12 @@ mod tests {
         assert_eq!(framed.capacity(), framed.len(), "reserved exactly");
     }
 
-    /// A value with every field at its default: five bytes, and a message.
     #[test]
     fn a_message_of_all_defaults_frames_to_its_prefix_alone() {
         let framed = frame_message(&HealthCheckResponse { status: 0 });
         assert_eq!(framed, [0, 0, 0, 0, 0]);
     }
 
-    /// What we write is what our own reader reads.
     #[test]
     fn what_is_framed_here_reads_back_through_the_frame_reader() {
         let response = HealthCheckResponse { status: 7 };

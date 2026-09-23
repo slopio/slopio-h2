@@ -1,11 +1,3 @@
-//! Making gRPC calls, against a scripted server.
-//!
-//! The mirror of the server's gRPC tests: there, a scripted *client* sends
-//! framed messages and the handler answers; here, a scripted *server* answers
-//! and the call handle is what is under test. What that handle owes its
-//! caller is a decoded message and a status — never a `200` with bytes in it
-//! that the caller has to interpret.
-
 use std::time::Duration;
 
 use runtime_core::deterministic_testing::ReadEvent;
@@ -16,14 +8,12 @@ use super::{
 };
 use crate::grpc::{Code, GrpcClient};
 
-/// `helloworld.HelloRequest`, near enough: one string field.
 #[derive(Clone, PartialEq, prost::Message)]
 struct HelloRequest {
     #[prost(string, tag = "1")]
     name: String,
 }
 
-/// Its answer.
 #[derive(Clone, PartialEq, prost::Message)]
 struct HelloReply {
     #[prost(string, tag = "1")]
@@ -32,7 +22,6 @@ struct HelloReply {
 
 const PATH: &str = "/helloworld.Greeter/SayHello";
 
-/// One Length-Prefixed-Message as a server would put it on the wire.
 fn framed<M: prost::Message>(message: &M) -> Vec<u8> {
     let body = message.encode_to_vec();
     let mut out = vec![0];
@@ -41,14 +30,12 @@ fn framed<M: prost::Message>(message: &M) -> Vec<u8> {
     out
 }
 
-/// A gRPC response head: `200` and the content-type that makes it gRPC.
 fn grpc_head() -> Vec<u8> {
     let mut block = STATUS_200.to_vec();
     block.extend_from_slice(&literal("content-type", "application/grpc+proto"));
     frame(HEADERS, FLAG_END_HEADERS, 1, &block)
 }
 
-/// A trailer section carrying a status, as §4.1 puts it after the body.
 fn status_trailers(code: &str, message: Option<&str>) -> Vec<u8> {
     let mut block = literal("grpc-status", code);
     if let Some(message) = message {
@@ -57,8 +44,6 @@ fn status_trailers(code: &str, message: Option<&str>) -> Vec<u8> {
     frame(HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, &block)
 }
 
-/// The shape nearly every call has, and what the handle is for: a message in,
-/// a message out, and a status that decides which of the two the caller sees.
 #[test]
 fn a_unary_call_sends_a_message_and_reads_one_back() {
     let reply = HelloReply {
@@ -88,7 +73,7 @@ fn a_unary_call_sends_a_message_and_reads_one_back() {
     let reply = outcome.expect("the call succeeded");
     assert_eq!(reply.message, "hello, world");
 
-    // §4.1: what a gRPC request must look like on the wire.
+    // §4.1.
     let head = super::frames(&written)
         .into_iter()
         .find(|f| f.kind == HEADERS && f.stream_id == 1)
@@ -107,7 +92,6 @@ fn a_unary_call_sends_a_message_and_reads_one_back() {
         "the head never ends a gRPC request: the messages are the body"
     );
 
-    // The request message, framed: flag 0, then its length.
     let data = super::frames(&written)
         .into_iter()
         .find(|f| f.kind == DATA && f.stream_id == 1)
@@ -122,9 +106,7 @@ fn a_unary_call_sends_a_message_and_reads_one_back() {
     );
 }
 
-/// §9.1's Trailers-Only: a status in the head, with no body behind it. What a
-/// server sends for a method it does not have, which is the failure a caller
-/// meets most often.
+/// §9.1's Trailers-Only.
 #[test]
 fn a_trailers_only_response_is_the_whole_answer() {
     let mut block = STATUS_200.to_vec();
@@ -154,9 +136,6 @@ fn a_trailers_only_response_is_the_whole_answer() {
     assert_eq!(status.message, "unknown method");
 }
 
-/// A call that ran and failed. The status is in the trailers, after a body
-/// that may have carried nothing — and `grpc-message` is percent-encoded, so
-/// what the caller reads is what the handler wrote.
 #[test]
 fn a_failed_call_carries_its_code_and_message_back() {
     let mut response = grpc_head();
@@ -186,9 +165,6 @@ fn a_failed_call_carries_its_code_and_message_back() {
     );
 }
 
-/// A server-streaming call: many messages, then the status. The handle hands
-/// them over one at a time and `None` is the end — not an error, whatever the
-/// status turns out to be.
 #[test]
 fn a_streaming_response_arrives_message_by_message() {
     let mut response = grpc_head();
@@ -227,9 +203,6 @@ fn a_streaming_response_arrives_message_by_message() {
     assert!(outcome.1.is_ok(), "and then the status: {:?}", outcome.1);
 }
 
-/// A response that ends without a status at all. Not something a conforming
-/// server does — which is the point: the caller gets a status rather than an
-/// `Ok` it would have to know not to trust.
 #[test]
 fn a_response_with_no_status_is_not_a_success() {
     let mut response = grpc_head();
@@ -260,8 +233,7 @@ fn a_response_with_no_status_is_not_a_success() {
     assert_eq!(status.code, Code::Internal);
 }
 
-/// §9.1: an intermediary answering instead of the server. There is no
-/// `grpc-status` anywhere, and the HTTP status is all there is to go on.
+/// §9.1.
 #[test]
 fn an_http_error_from_a_proxy_becomes_a_status() {
     // `503` is entry 63 of the static table, so it needs no literal.
@@ -292,22 +264,13 @@ fn an_http_error_from_a_proxy_becomes_a_status() {
     );
 }
 
-/// A gRPC connection asks for the same handful of paths for its whole life,
-/// so the second call to one should not spell it out again.
-///
-/// HPACK leaves `:path` out of its dynamic table by default — right for a
-/// browser, whose paths are nearly all distinct, and wrong here. `GrpcClient`
-/// turns that off, and this is where the difference is visible: on the wire.
 #[test]
 fn the_second_call_to_a_path_does_not_spell_it_out_again() {
     let reply = HelloReply {
         message: "hi".into(),
     };
-    // The same exchange twice, on the two stream ids a client opens first.
-    // Separately in time, and not as one chunk: the second stream does not
-    // exist until the first call has been answered, and a response on a
-    // stream this client never opened is a connection error (§5.1) — which
-    // is the client being right and the script being wrong.
+    // Sent separately in time: stream 3 does not exist until the first call
+    // is answered, and a response on it earlier is a connection error (§5.1).
     let exchange = |id: u32| {
         let mut block = STATUS_200.to_vec();
         block.extend_from_slice(&literal("content-type", "application/grpc+proto"));
@@ -346,7 +309,6 @@ fn the_second_call_to_a_path_does_not_spell_it_out_again() {
         .collect();
     assert_eq!(heads.len(), 2, "two calls, two request heads");
 
-    // The path is 28 characters; the first head carries it, Huffman-coded.
     assert!(
         heads[0].payload.len() > 20,
         "the first spells everything out: {} bytes",
@@ -359,8 +321,6 @@ fn the_second_call_to_a_path_does_not_spell_it_out_again() {
         heads[1].payload
     );
 
-    // And it still decodes to the same request, which is the point of doing
-    // it this way rather than sending less and meaning less.
     let decoded = super::decode_block(&heads[0].payload);
     assert_eq!(decoded.get(":path").map(String::as_str), Some(PATH));
 }

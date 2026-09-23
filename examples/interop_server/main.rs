@@ -1,23 +1,10 @@
 //! `grpc.testing.TestService`, which is what the gRPC project's own interop
-//! suite calls. Its client is the one every language implementation is
-//! validated against, so this is conformance measured by somebody else's
-//! judgement rather than by our tests.
+//! suite calls.
 //!
 //!     cargo run --release --example interop_server
 //!
 //!     go install google.golang.org/grpc/interop/client@latest
 //!     client -server_host localhost -server_port 8080 -test_case empty_unary
-//!
-//! `bench/interop.sh` runs the whole list.
-//!
-//! The service is a programmable echo: the request says how large a response
-//! to send, how many of them, and what status to end on, and the server obeys.
-//! Which is what makes it a conformance test — the client knows exactly what
-//! it asked for and checks it got it.
-//!
-//! Not implemented, and refused rather than faked: compression. A request that
-//! asks for a compressed response, or arrives compressed, is answered
-//! UNIMPLEMENTED. `TryFrom<CompressedGrpcFrame>` is where that would go.
 
 use http::{HeaderMap, StatusCode};
 use popple_h2::grpc::{Code, GrpcCall, Status, service};
@@ -38,8 +25,6 @@ runtime::define_buf_ring!(
     pool_size = 512
 );
 
-/// §9.1's `custom_metadata` case: the client sends these two and expects them
-/// back, one in the head and one in the trailers.
 const ECHO_INITIAL: &str = "x-grpc-test-echo-initial";
 const ECHO_TRAILING: &str = "x-grpc-test-echo-trailing-bin";
 
@@ -69,8 +54,7 @@ async fn serve(port: u16) {
 }
 
 async fn route(call: &GrpcCall) -> Status {
-    // Whatever the method, `custom_metadata` expects these echoed — so it is
-    // done once, here, before anything writes.
+    // Done once, here, before anything writes.
     echo_metadata(call);
 
     match call.path() {
@@ -79,14 +63,8 @@ async fn route(call: &GrpcCall) -> Status {
         | Some("/grpc.testing.TestService/CacheableUnaryCall") => unary_call(call).await,
         Some("/grpc.testing.TestService/StreamingInputCall") => streaming_input(call).await,
         Some("/grpc.testing.TestService/StreamingOutputCall") => streaming_output(call).await,
-        // Both are a stream in each direction. The difference is only when the
-        // client sends, so one handler serves them: read one, answer it, read
-        // the next — which is what `ping_pong` does, and `half_duplex` does
-        // the same with everything already in flight.
         Some("/grpc.testing.TestService/FullDuplexCall")
         | Some("/grpc.testing.TestService/HalfDuplexCall") => full_duplex(call).await,
-        // The case is named for it: a method the service declares and does not
-        // have, answered UNIMPLEMENTED rather than 404.
         Some("/grpc.testing.TestService/UnimplementedCall") => {
             Status::unimplemented("UnimplementedCall")
         }
@@ -94,9 +72,7 @@ async fn route(call: &GrpcCall) -> Status {
     }
 }
 
-/// `custom_metadata`: the initial one goes in the head, the trailing one in
-/// the trailers. Names ending `-bin` carry base64, which is passed through as
-/// it came — decoding it would only mean encoding it again.
+/// Names ending `-bin` carry base64, which is passed through as it came.
 fn echo_metadata(call: &GrpcCall) {
     if let Some(value) = call.fields().get(ECHO_INITIAL) {
         let mut head = HeaderMap::new();
@@ -121,8 +97,6 @@ async fn empty_call(call: &GrpcCall) -> Status {
     }
 }
 
-/// `large_unary`, `status_code_and_message`, `special_status_message`: a
-/// payload of the size asked for, or the status asked for instead.
 async fn unary_call(call: &GrpcCall) -> Status {
     let request: SimpleRequest = match call.message().await {
         Ok(Some(request)) => request,
@@ -148,7 +122,6 @@ async fn unary_call(call: &GrpcCall) -> Status {
     Status::ok()
 }
 
-/// `client_streaming`: read every message, answer with how much arrived.
 async fn streaming_input(call: &GrpcCall) -> Status {
     let mut total = 0i32;
     loop {
@@ -171,7 +144,6 @@ async fn streaming_input(call: &GrpcCall) -> Status {
     Status::ok()
 }
 
-/// `server_streaming`: one request naming a list of sizes, one response each.
 async fn streaming_output(call: &GrpcCall) -> Status {
     let request: StreamingOutputCallRequest = match call.message().await {
         Ok(Some(request)) => request,
@@ -181,13 +153,10 @@ async fn streaming_output(call: &GrpcCall) -> Status {
     write_responses(call, &request).await
 }
 
-/// `ping_pong`, `empty_stream`, `half_duplex`: a stream in both directions,
-/// answered one for one as each arrives.
 async fn full_duplex(call: &GrpcCall) -> Status {
     loop {
         let request: StreamingOutputCallRequest = match call.message().await {
             Ok(Some(request)) => request,
-            // `empty_stream` is exactly this, with nothing before it.
             Ok(None) => return Status::ok(),
             Err(status) => return status,
         };
@@ -198,7 +167,6 @@ async fn full_duplex(call: &GrpcCall) -> Status {
     }
 }
 
-/// One response per `ResponseParameters`, each of the size it names.
 async fn write_responses(call: &GrpcCall, request: &StreamingOutputCallRequest) -> Status {
     for parameters in &request.response_parameters {
         if let Some(refusal) = refuse_compression(parameters.compressed.map(|b| b.value), None) {
@@ -218,8 +186,6 @@ async fn write_responses(call: &GrpcCall, request: &StreamingOutputCallRequest) 
     Status::ok()
 }
 
-/// A payload of `size` bytes, zeroed. The client checks the length and not
-/// what is in it.
 fn payload_of(size: i32) -> Payload {
     Payload {
         r#type: 0,
@@ -227,9 +193,6 @@ fn payload_of(size: i32) -> Payload {
     }
 }
 
-/// The status a request asked the server to end on, `None` for a request that
-/// asked for none. An `EchoStatus` of code 0 is a request for `OK`, which is
-/// not the same as not asking.
 fn asked_for(status: Option<testing::EchoStatus>) -> Option<Status> {
     let status = status?;
     let code = match status.code {
@@ -255,8 +218,6 @@ fn asked_for(status: Option<testing::EchoStatus>) -> Option<Status> {
     Some(Status::new(code, status.message))
 }
 
-/// Compression is not implemented, and a request that turns on either side of
-/// it is told so rather than served something it did not ask for.
 fn refuse_compression(response: Option<bool>, expect: Option<bool>) -> Option<Status> {
     (response == Some(true) || expect == Some(true))
         .then(|| Status::unimplemented("message compression is not implemented"))

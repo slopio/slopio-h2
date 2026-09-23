@@ -24,20 +24,11 @@ impl Encoder {
         }
     }
 
-    /// Lets `:path` values into the dynamic table.
-    ///
-    /// For a connection that sends a small set of paths over and over — a
-    /// gRPC client, where the path is the method name — this turns a literal
-    /// and its Huffman coding into one index byte per request. For one whose
-    /// paths are nearly all distinct it is the wrong trade, which is why it
-    /// is off until something that knows the workload says otherwise.
     pub fn index_paths(&mut self, on: bool) {
         self.table.index_paths(on);
     }
 
-    /// Queues a max size update.
-    ///
-    /// The next call to `encode` will include a dynamic size update frame.
+    /// The next call to `encode` will include a dynamic size update.
     pub fn update_max_size(&mut self, val: usize) {
         match self.size_update {
             Some(SizeUpdate::One(old)) => {
@@ -60,15 +51,12 @@ impl Encoder {
             }
             None => {
                 if val != self.table.max_size() {
-                    // Don't bother writing a frame if the value already matches
-                    // the table's max size.
                     self.size_update = Some(SizeUpdate::One(val));
                 }
             }
         }
     }
 
-    /// Encode a set of headers into the provide buffer
     pub fn encode<I>(&mut self, headers: I, dst: &mut Vec<u8>)
     where
         I: IntoIterator<Item = Header<Option<HeaderName>>>,
@@ -79,18 +67,13 @@ impl Encoder {
 
         for header in headers {
             match header.reify() {
-                // The header has an associated name. In which case, try to
-                // index it in the table.
                 Ok(header) => {
                     let index = self.table.index(header);
                     self.encode_header(&index, dst);
 
                     last_index = Some(index);
                 }
-                // The header does not have an associated name. This means that
-                // the name is the same as the previously yielded header. In
-                // which case, we skip table lookup and just use the same index
-                // as the previous entry.
+                // No name: same as the previous header's, so reuse its index.
                 Err(value) => {
                     self.encode_header_without_name(
                         last_index.as_ref().unwrap_or_else(|| {
@@ -225,19 +208,15 @@ fn encode_str(val: &[u8], dst: &mut Vec<u8>) {
     if !val.is_empty() {
         let idx = position(dst);
 
-        // Push a placeholder byte for the length header
         dst.put_u8(0);
 
-        // Encode with huffman
         huffman::encode(val, dst);
 
         let huff_len = position(dst) - (idx + 1);
 
         if encode_int_one_byte(huff_len, 7) {
-            // Write the string head
             dst[idx] = 0x80 | huff_len as u8;
         } else {
-            // Write the head to a placeholder
             const PLACEHOLDER_LEN: usize = 8;
             let mut buf = [0u8; PLACEHOLDER_LEN];
 
@@ -247,34 +226,24 @@ fn encode_str(val: &[u8], dst: &mut Vec<u8>) {
                 PLACEHOLDER_LEN - head_dst.remaining_mut()
             };
 
-            // This is just done to reserve space in the destination
             dst.put_slice(&buf[1..head_len]);
 
-            // Shift the header forward
             for i in 0..huff_len {
                 let src_i = idx + 1 + (huff_len - (i + 1));
                 let dst_i = idx + head_len + (huff_len - (i + 1));
                 dst[dst_i] = dst[src_i];
             }
 
-            // Copy in the head
             for i in 0..head_len {
                 dst[idx + i] = buf[i];
             }
         }
     } else {
-        // Write an empty string
         dst.put_u8(0);
     }
 }
 
-/// Encode an integer into the given destination buffer
-fn encode_int<B: BufMut>(
-    mut value: usize,   // The integer to encode
-    prefix_bits: usize, // The number of bits in the prefix
-    first_byte: u8,     // The base upon which to start encoding the int
-    dst: &mut B,
-) {
+fn encode_int<B: BufMut>(mut value: usize, prefix_bits: usize, first_byte: u8, dst: &mut B) {
     if encode_int_one_byte(value, prefix_bits) {
         dst.put_u8(first_byte | value as u8);
         return;
@@ -295,7 +264,6 @@ fn encode_int<B: BufMut>(
     dst.put_u8(value as u8);
 }
 
-/// Returns true if the in the int can be fully encoded in the first byte.
 fn encode_int_one_byte(value: usize, prefix_bits: usize) -> bool {
     value < (1 << prefix_bits) - 1
 }
@@ -353,7 +321,6 @@ mod test {
 
         assert_eq!("foo", huff_decode(&res[2..4]));
 
-        // Same name, new value should still use incremental
         let res = encode(&mut encoder, vec![header("content-language", "bar")]);
         assert_eq!(res[0], 0b01000000 | 27); // Indexed name
         assert_eq!(res[1], 0x80 | 3); // header value w/ huffman coding
@@ -383,7 +350,6 @@ mod test {
     fn test_evicting_headers() {
         let mut encoder = Encoder::default();
 
-        // Fill the table
         for i in 0..64 {
             let key = format!("x-hello-world-{:02}", i);
             let res = encode(&mut encoder, vec![header(&key, &key)]);
@@ -394,24 +360,20 @@ mod test {
             assert_eq!(key, huff_decode(&res[15..]));
             assert_eq!(27, res.len());
 
-            // Make sure the header can be found...
             let res = encode(&mut encoder, vec![header(&key, &key)]);
 
-            // Only check that it is found
             assert_eq!(0x80, res[0] & 0x80);
         }
 
         assert_eq!(4096, encoder.table.size());
         assert_eq!(64, encoder.table.len());
 
-        // Find existing headers
         for i in 0..64 {
             let key = format!("x-hello-world-{:02}", i);
             let res = encode(&mut encoder, vec![header(&key, &key)]);
             assert_eq!(0x80, res[0] & 0x80);
         }
 
-        // Insert a new header
         let key = "x-hello-world-64";
         let res = encode(&mut encoder, vec![header(key, key)]);
 
@@ -423,7 +385,6 @@ mod test {
 
         assert_eq!(64, encoder.table.len());
 
-        // Now try encoding entries that should exist in the table
         for i in 1..65 {
             let key = format!("x-hello-world-{:02}", i);
             let res = encode(&mut encoder, vec![header(&key, &key)]);
@@ -457,8 +418,6 @@ mod test {
             value,
         };
 
-        // Now, try to encode the sensitive header
-
         let mut encoder = Encoder::default();
         let res = encode(&mut encoder, vec![header]);
 
@@ -467,7 +426,7 @@ mod test {
         assert_eq!(0x80 | 4, res[10]);
         assert_eq!("12345", huff_decode(&res[11..]));
 
-        // Now, try to encode a sensitive header w/ a name in the static table
+        // A sensitive header with a name in the static table.
         let name = "authorization".parse().unwrap();
         let mut value = HeaderValue::from_bytes(b"12345").unwrap();
         value.set_sensitive(true);
@@ -484,9 +443,7 @@ mod test {
         assert_eq!(0x80 | 4, res[2]);
         assert_eq!("12345", huff_decode(&res[3..]));
 
-        // Using the name component of a previously indexed header (without
-        // sensitive flag set)
-
+        // The name of a previously indexed header, without the sensitive flag.
         let _ = encode(
             &mut encoder,
             vec![self::header("my-password", "not-so-secret")],
@@ -522,20 +479,16 @@ mod test {
         let mut encoder = Encoder::default();
         let name = "hello";
 
-        // Encode first one
         let _ = encode(&mut encoder, vec![header(name, "one")]);
 
-        // Encode second one
         let res = encode(&mut encoder, vec![header(name, "two")]);
         assert_eq!(&[0x40 | 62, 0x80 | 3], &res[0..2]);
         assert_eq!("two", huff_decode(&res[2..]));
         assert_eq!(5, res.len());
 
-        // Encode the first one again
         let res = encode(&mut encoder, vec![header(name, "one")]);
         assert_eq!(&[0x80 | 63], &res[..]);
 
-        // Now the second one
         let res = encode(&mut encoder, vec![header(name, "two")]);
         assert_eq!(&[0x80 | 62], &res[..]);
     }
@@ -557,7 +510,6 @@ mod test {
         assert_eq!(&[0x40 | 63, 0, 0x80 | 3], &res[..3]);
         assert_eq!(2, encoder.table.len());
 
-        // Try adding the same header again
         let res = encode(&mut encoder, vec![header("foo", "baz")]);
         assert_eq!(&[0x80 | 62], &res[..]);
         assert_eq!(2, encoder.table.len());
@@ -565,7 +517,6 @@ mod test {
 
     #[test]
     fn test_max_size_zero() {
-        // Static table only
         let mut encoder = Encoder::new(0, 0);
         let res = encode(&mut encoder, vec![method("GET")]);
         assert_eq!(*res, [0x80 | 2]);
@@ -578,7 +529,6 @@ mod test {
         assert_eq!("bar", huff_decode(&res[5..8]));
         assert_eq!(0, encoder.table.len());
 
-        // Encode a custom value
         let res = encode(&mut encoder, vec![header("transfer-encoding", "chunked")]);
         assert_eq!(&[15, 42, 0x80 | 6], &res[..3]);
         assert_eq!("chunked", huff_decode(&res[3..]));
@@ -590,7 +540,7 @@ mod test {
         assert!(encoder.size_update.is_none());
         assert_eq!(4096, encoder.table.max_size());
 
-        encoder.update_max_size(4096); // Default size
+        encoder.update_max_size(4096);
         assert!(encoder.size_update.is_none());
 
         encoder.update_max_size(0);
@@ -620,7 +570,6 @@ mod test {
     fn test_resizing_table() {
         let mut encoder = Encoder::default();
 
-        // Add a header
         let _ = encode(&mut encoder, vec![header("foo", "bar")]);
 
         encoder.update_max_size(1);
@@ -646,7 +595,6 @@ mod test {
     fn test_decreasing_table_size_without_eviction() {
         let mut encoder = Encoder::default();
 
-        // Add a header
         let _ = encode(&mut encoder, vec![header("foo", "bar")]);
 
         encoder.update_max_size(100);
@@ -704,9 +652,6 @@ mod test {
 
     use crate::shared::hpack::BytesStr;
 
-    /// The default: a `:path` stays a literal, however often it is sent. The
-    /// browser case, where indexing near-unique paths would evict the entries
-    /// that were worth keeping.
     #[test]
     fn a_path_is_not_indexed_by_default() {
         let mut encoder = Encoder::new(4096, 4096);
@@ -721,8 +666,6 @@ mod test {
         assert!(second.len() > 20, "the whole string is on the wire: {second:?}");
     }
 
-    /// Told that the paths repeat, the second one costs an index byte. What a
-    /// gRPC client gets, where the path is the method name.
     #[test]
     fn a_repeated_path_is_indexed_when_the_caller_says_they_repeat() {
         let mut encoder = Encoder::new(4096, 4096);
@@ -732,8 +675,7 @@ mod test {
         let first = encode(&mut encoder, path());
         let second = encode(&mut encoder, path());
 
-        // §6.2.1: the first goes out as a literal *with* incremental indexing,
-        // which is the instruction that puts it in both tables.
+        // §6.2.1: the first goes out as a literal *with* incremental indexing.
         assert!(first.len() > 20, "the first still carries the string");
         assert_eq!(
             second.len(),
@@ -743,8 +685,7 @@ mod test {
         assert_eq!(second[0] & 0x80, 0x80, "§6.1: an indexed field");
     }
 
-    /// The saving is only worth having if a *different* path still works —
-    /// the table holds both rather than one replacing the other.
+    /// The table holds both rather than one replacing the other.
     #[test]
     fn two_repeated_paths_are_both_kept() {
         let mut encoder = Encoder::new(4096, 4096);

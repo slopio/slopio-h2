@@ -2,19 +2,6 @@
 //!
 //!     taskset -c 0 cargo run --release --example helloworld_server
 //!     taskset -c 1 cargo run --release --example grpc_load
-//!
-//! Two cores, two processes: a server sharing a core with the client that is
-//! measuring it measures the pair of them, and the number means nothing. The
-//! `taskset` mask is what the runtime builds its workers from, so `-c 0` is
-//! one worker on core 0 whether or not `PER_CORE` is set.
-//!
-//! `PORT` moves it, `PER_CORE=1` runs one worker per core of the mask — for
-//! `taskset -c 0-3`, four workers sharing the listening socket.
-//!
-//! `helloworld.Greeter/SayHello` rather than an invention of our own, because
-//! it is the one service every gRPC toolchain already has a `.proto` for:
-//! `ghz`, `grpcurl` and tonic's own examples can all drive this without being
-//! told anything about us.
 
 use http::{HeaderMap, StatusCode};
 use popple_h2::grpc::{GrpcCall, Status, service};
@@ -64,8 +51,7 @@ async fn serve(port: u16) {
     }
 }
 
-/// §9.1: the path is `/package.Service/Method`, and one this server does not
-/// have is UNIMPLEMENTED rather than a 404 — the HTTP exchange went perfectly.
+/// §9.1: a method this server does not have is UNIMPLEMENTED rather than a 404.
 async fn route(call: &GrpcCall) -> Status {
     match call.path() {
         Some("/helloworld.Greeter/SayHello") => say_hello(call).await,
@@ -73,8 +59,6 @@ async fn route(call: &GrpcCall) -> Status {
     }
 }
 
-/// One message in, one out. Everything the request can fail to be is already
-/// a `Status`, so there is nothing here to invent.
 async fn say_hello(call: &GrpcCall) -> Status {
     let request = match call.message::<HelloRequest>().await {
         Ok(Some(request)) => request,
@@ -89,8 +73,6 @@ async fn say_hello(call: &GrpcCall) -> Status {
     Status::ok()
 }
 
-/// Anything that is not gRPC. A load generator sends none, but a stray
-/// health check from a browser deserves an answer rather than a hang.
 async fn plain_http(stream: Stream) {
     stream.write_headers(StatusCode::NOT_FOUND, &HeaderMap::new());
     stream.write_data_final(b"this port speaks gRPC\n").await;

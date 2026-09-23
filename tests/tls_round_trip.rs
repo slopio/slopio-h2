@@ -1,15 +1,9 @@
-//! HTTP/2 over TLS, both ends ours, against a real kernel.
+//! HTTP/2 over TLS, both ends ours, against a real kernel: kTLS cannot be
+//! simulated. Skips itself on a kernel without the `tls` ULP.
 //!
-//! The unit suites run on the simulated ring, which cannot carry this: kTLS
-//! is a socket option the kernel acts on, so there is nothing to simulate and
-//! nothing to assert about unless real bytes are really encrypted. So this is
-//! an integration test, it wants `--features tls`, and it skips itself on a
-//! kernel without the `tls` ULP rather than failing on someone's laptop.
-//!
-//! What it is here to catch is the seam, not the protocol: that ALPN settles
-//! on `h2`, that the preface a client writes immediately after its Finished
-//! record arrives as the first thing the server decodes, and that a response
-//! comes back through the same ring a plain connection would have used.
+//! What it catches is the seam: that ALPN settles on `h2`, and that the
+//! preface a client writes immediately after its Finished record arrives as
+//! the first thing the server decodes.
 
 #![cfg(feature = "tls")]
 
@@ -34,7 +28,6 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 runtime::define_buf_ring!(ServerRing, bgid = 0, buffer_size = 16384, ring_size = 256);
 runtime::define_buf_ring!(ClientRing, bgid = 1, buffer_size = 16384, ring_size = 64);
 
-/// §3.3: what both ends must agree on, and what each offers to get there.
 const H2: &[&[u8]] = &[b"h2"];
 
 const BODY: &[u8] = b"hello over tls\n";
@@ -56,8 +49,7 @@ fn pick_port() -> u16 {
     port
 }
 
-/// A self-signed certificate for `localhost`. The client does not check it —
-/// see the connector below — so this only has to be well-formed.
+/// The client does not check it, so this only has to be well-formed.
 fn make_server_config() -> Config {
     let params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     let key = KeyPair::generate().unwrap();
@@ -86,8 +78,7 @@ fn a_request_and_its_response_cross_a_tls_connection() {
     let port = pick_port();
     let (done_tx, done_rx) = mpsc::channel::<Result<(u16, Vec<u8>), String>>();
 
-    // Detached on purpose: `Server::run` accepts for ever, and the test ends
-    // when the client has its answer.
+    // Detached on purpose: `Server::run` accepts for ever.
     thread::spawn(move || {
         main_thread_with::<ServerRing, _>(async move {
             let settings = ServerSettings {
