@@ -5,7 +5,7 @@ use crate::server::connection::{
     STREAM_RECV_WINDOW,
     shared_with_streams::{LiveStreams, StreamToken, retire_if_closed},
 };
-use crate::server::stream::StreamState;
+use crate::server::stream::{Lifecycle, StreamState};
 use crate::server::{Handler, Stream};
 use crate::shared::codec::{
     frames::{
@@ -238,14 +238,15 @@ impl<H: Handler> Streams<H> {
     /// `kill` takes the handle by value, so the entry has to come out first.
     /// Safe because the task is not running now — we are — so it holds no
     /// borrow and `write_frame` left no half-written frame behind.
-    fn remove(&mut self, id: STREAM_ID, shared: &SharedConnection) -> Option<Rc<StreamState>> {
+    /// Returns the state the stream was in.
+    fn remove(&mut self, id: STREAM_ID, shared: &SharedConnection) -> Option<Lifecycle> {
         let (stream, handle) = self.streams.remove(id)?;
         // Its task is about to be killed: it must not try to write.
-        stream.note_retired();
+        let before = stream.retire();
         handle.kill();
         // Body bytes the task never consumed still hold connection credit.
         shared.release_stream_credit(stream.take_unreleased());
-        Some(stream)
+        Some(before)
     }
 
     /// §6.9.2. The first overflow stops the walk: the connection is over.
@@ -284,7 +285,7 @@ impl<H: Handler> Drop for Streams<H> {
     /// half-written frame.
     fn drop(&mut self) {
         for (stream, handle) in self.streams.take_all() {
-            stream.note_retired();
+            stream.retire();
             handle.kill();
         }
     }
@@ -416,7 +417,7 @@ impl<H: Handler> Protocol<H> {
         let peer_done = self
             .streams
             .remove(raw, &self.shared)
-            .is_some_and(|stream| stream.input_ended());
+            .is_some_and(Lifecycle::input_ended);
         if !peer_done && raw <= self.streams.last_client_stream_id {
             self.shared.note_reset(raw);
         }

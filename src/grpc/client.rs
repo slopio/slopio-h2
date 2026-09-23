@@ -232,7 +232,7 @@ impl Call {
         } else if !http_status.is_success() {
             self.settle(Status::of_http(http_status));
         } else if let Some(format) = GrpcFormat::of_response(&fields) {
-            *self.input.borrow_mut() = Some(GrpcInput::new(format, &fields, None));
+            *self.input.borrow_mut() = Some(GrpcInput::new(format, &fields));
         }
 
         *self.head.borrow_mut() = Some(fields);

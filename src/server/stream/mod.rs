@@ -4,10 +4,10 @@ use std::time::{Duration, SystemTime};
 
 use http::StatusCode;
 
-use crate::server::connection::shared_with_streams::StreamToken;
-use crate::shared::codec::frames::stream_id::StreamId;
 #[cfg(feature = "grpc")]
 use crate::grpc::{GrpcError, GrpcFormat, GrpcFrame, GrpcInput};
+use crate::server::connection::shared_with_streams::StreamToken;
+use crate::shared::codec::frames::stream_id::StreamId;
 use crate::{
     server::stream::input_data::InputData,
     shared::{
@@ -20,6 +20,10 @@ use crate::{
 };
 
 mod input_data;
+mod lifecycle;
+
+pub(crate) use lifecycle::{Farewell, Lifecycle};
+use lifecycle::{Inbound, Outbound};
 
 enum Input {
     None,
@@ -63,26 +67,15 @@ const MIN_SEND_RATE: u64 = 256;
 
 /// Reached only through an `Rc` shared with the stream task, so everything the
 /// connection mutates while a frame is being decoded lives behind a `Cell`.
-///
-/// The two halves close independently (§5.1); both `no_more_input` and
-/// `no_more_output` set is the closed state that lets the connection take the
-/// stream out of its map.
 pub struct StreamState {
     created_at: SystemTime,
     header: Box<Headers>,
     trailers: Cell<Option<Box<Headers>>>,
-    /// Half-closed(remote) once set: DATA or HEADERS after it is a stream
-    /// error.
-    no_more_input: Cell<bool>,
-    /// Says nothing about the peer's half: §5.1 still lets the peer send its
-    /// body.
-    no_more_output: Cell<bool>,
+    lifecycle: Cell<Lifecycle>,
+    /// Outlives the peer's half: a body stays readable after END_STREAM.
     input: RefCell<Input>,
     #[cfg(feature = "grpc")]
     grpc: Option<GrpcFormat>,
-    /// Padding excluded. Doubles as the write cursor of a pre-allocated
-    /// buffer.
-    received: Cell<u64>,
     sent: Cell<u64>,
     send_blocked_since: Cell<Option<SystemTime>>,
     /// Only time the peer made us wait accrues here, so a slow handler is
@@ -91,12 +84,6 @@ pub struct StreamState {
     /// Connection credit still held. Whatever is left when the stream goes
     /// must be given back, or the connection window shrinks for good.
     unreleased: Cell<u32>,
-    /// Not the same as `no_more_output`, which the token sets on the way out
-    /// whether or not anything was said.
-    responded: Cell<bool>,
-    /// Out of the connection's live table: nothing its task writes from here
-    /// reaches anyone.
-    retired: Cell<bool>,
     window: StreamWindow,
     waker: RefCell<Option<Waker>>,
 }
@@ -107,12 +94,7 @@ impl StreamState {
             content_length(header.fields()).map_err(|()| StreamViolation::MalformedRequest)?;
 
         let end_stream = header.is_end_stream();
-
-        // §8.1.1: with END_STREAM on the HEADERS no DATA can follow, so a
-        // declared length that is not zero already fails to add up.
-        if end_stream && content_length.is_some_and(|len| len != 0) {
-            return Err(StreamViolation::ContentLengthMismatch);
-        }
+        let lifecycle = Lifecycle::open(content_length, end_stream)?;
 
         #[cfg(feature = "grpc")]
         let grpc = GrpcFormat::of(&header);
@@ -123,7 +105,7 @@ impl StreamState {
             declared => {
                 #[cfg(feature = "grpc")]
                 let input = match grpc {
-                    Some(format) => Input::Grpc(GrpcInput::new(format, header.fields(), declared)),
+                    Some(format) => Input::Grpc(GrpcInput::new(format, header.fields())),
                     None => Input::Http(InputData::new(declared)),
                 };
                 #[cfg(not(feature = "grpc"))]
@@ -139,16 +121,12 @@ impl StreamState {
             grpc,
             header,
             trailers: Cell::new(None),
-            no_more_input: Cell::new(end_stream),
-            no_more_output: Cell::new(false),
+            lifecycle: Cell::new(lifecycle),
             input: RefCell::new(input),
-            received: Cell::new(0),
             sent: Cell::new(0),
             send_blocked_since: Cell::new(None),
             send_blocked: Cell::new(Duration::ZERO),
             unreleased: Cell::new(0),
-            responded: Cell::new(false),
-            retired: Cell::new(false),
             waker: RefCell::new(None),
         })
     }
@@ -171,16 +149,16 @@ impl StreamState {
     ///
     /// Fails open on a clock that stepped backwards.
     pub fn body_is_starving(&self) -> bool {
-        // The peer owes nothing more; whatever time passes is the handler's.
-        if self.no_more_input.get() {
+        // Once the peer owes nothing more, whatever time passes is the
+        // handler's.
+        let Some(Inbound::Open { received, .. }) = self.lifecycle.get().inbound() else {
             return false;
-        }
+        };
         let age = self.age();
         if age < BODY_GRACE {
             return false;
         }
-        let owed = MIN_BODY_RATE.saturating_mul(age.as_secs());
-        self.received.get() < owed
+        received < MIN_BODY_RATE.saturating_mul(age.as_secs())
     }
 
     pub fn id(&self) -> crate::shared::codec::frames::stream_id::StreamId {
@@ -199,21 +177,17 @@ impl StreamState {
         self.header.fields()
     }
 
-    pub fn has_responded(&self) -> bool {
-        self.responded.get()
+    /// Called by the connection, never the stream's own task. Returns the
+    /// state it was retired from.
+    pub(crate) fn retire(&self) -> Lifecycle {
+        self.lifecycle.replace(Lifecycle::Retired)
     }
 
-    pub fn note_responded(&self) {
-        self.responded.set(true);
-    }
-
-    pub fn is_retired(&self) -> bool {
-        self.retired.get()
-    }
-
-    /// Called by the connection, never the stream's own task.
-    pub fn note_retired(&self) {
-        self.retired.set(true);
+    /// For the token, when the task stops.
+    pub(crate) fn on_task_end(&self) -> Farewell {
+        let (next, farewell) = self.lifecycle.get().on_task_end();
+        self.lifecycle.set(next);
+        farewell
     }
 
     pub fn note_sent(&self, n: usize) {
@@ -226,8 +200,7 @@ impl StreamState {
 
     fn note_send_blocked(&self) {
         if self.send_blocked_since.get().is_none() {
-            self.send_blocked_since
-                .set(Some(runtime::runtime::now()));
+            self.send_blocked_since.set(Some(runtime::runtime::now()));
         }
     }
 
@@ -297,34 +270,53 @@ impl StreamState {
         self.unreleased.replace(0)
     }
 
+    fn respond(&self) {
+        let lifecycle = self.lifecycle.get();
+        if let Lifecycle::Live {
+            outbound: Outbound::Idle,
+            ..
+        } = lifecycle
+        {
+            self.lifecycle
+                .set(lifecycle.with_outbound(Outbound::Streaming));
+        }
+    }
+
     pub fn end_output(&self) {
-        self.no_more_output.set(true);
+        let lifecycle = self.lifecycle.get();
+        self.lifecycle.set(lifecycle.with_outbound(Outbound::Ended));
+    }
+
+    /// A head is out and the end is not.
+    fn is_streaming(&self) -> bool {
+        matches!(
+            self.lifecycle.get(),
+            Lifecycle::Live {
+                outbound: Outbound::Streaming,
+                ..
+            }
+        )
     }
 
     pub fn input_ended(&self) -> bool {
-        self.no_more_input.get()
+        self.lifecycle.get().input_ended()
     }
 
-    pub fn output_ended(&self) -> bool {
-        self.no_more_output.get()
-    }
-
-    /// For a stream we have just reset: RST_STREAM closes both halves (§5.1).
-    pub fn abandon_input(&self) {
-        self.no_more_input.set(true);
-    }
-
-    /// Both halves done, which is what lets the connection remove the stream.
     pub fn is_closed(&self) -> bool {
-        self.no_more_output.get() && self.no_more_input.get()
+        self.lifecycle.get().is_closed()
+    }
+
+    fn set_inbound(&self, inbound: Inbound) {
+        let lifecycle = self.lifecycle.get();
+        self.lifecycle.set(lifecycle.with_inbound(inbound));
     }
 
     /// §8.1. Ends the input exactly as END_STREAM on DATA does, with the same
     /// final check.
     pub fn recv_trailers(&self, headers: Box<Headers>) -> Result<(), StreamViolation> {
-        if self.no_more_input.get() {
+        let Some(inbound) = self.lifecycle.get().inbound().filter(|half| half.is_open()) else {
             return Err(StreamViolation::DataAfterEndStream);
-        }
+        };
 
         // §8.1: trailers end the message, so they carry END_STREAM; §8.3: no
         // pseudo-header may appear in them.
@@ -332,16 +324,7 @@ impl StreamState {
             return Err(StreamViolation::MalformedTrailers);
         }
 
-        // §8.1.1: the body must add up to exactly what was declared.
-        let declared = match &*self.input.borrow() {
-            Input::None => None,
-            Input::Http(input) => input.expected(),
-            #[cfg(feature = "grpc")]
-            Input::Grpc(input) => input.declared(),
-        };
-        if declared.is_some_and(|declared| self.received.get() != declared) {
-            return Err(StreamViolation::ContentLengthMismatch);
-        }
+        let inbound = inbound.on_trailers()?;
         #[cfg(feature = "grpc")]
         {
             if let Input::Grpc(input) = &mut *self.input.borrow_mut() {
@@ -350,7 +333,7 @@ impl StreamState {
         }
 
         self.trailers.set(Some(headers));
-        self.no_more_input.set(true);
+        self.set_inbound(inbound);
         self.wake();
         Ok(())
     }
@@ -381,7 +364,7 @@ impl StreamState {
     /// sweep takes that too.
     pub fn body(&self) -> impl Future<Output = Option<Box<[u8]>>> {
         std::future::poll_fn(move |cx| {
-            if !self.no_more_input.get() {
+            if !self.input_ended() {
                 self.register_waker(cx.waker());
                 return Poll::Pending;
             }
@@ -401,7 +384,7 @@ impl StreamState {
             if self.available_len() > 0 {
                 return Poll::Ready(true);
             }
-            if self.no_more_input.get() {
+            if self.input_ended() {
                 return Poll::Ready(false);
             }
             self.register_waker(cx.waker());
@@ -450,32 +433,15 @@ impl StreamState {
     /// `Ok(n)` is how much was consumed on the spot and owes the peer its
     /// credit back now; the caller must write the frames.
     pub fn recv_data(&self, payload: &[u8], end_stream: bool) -> Result<u32, StreamViolation> {
-        if self.no_more_input.get() {
+        let Some(inbound @ Inbound::Open { received: at, .. }) = self.lifecycle.get().inbound()
+        else {
             return Err(StreamViolation::DataAfterEndStream);
-        }
-
-        let mut input = self.input.borrow_mut();
-        let declared = match &*input {
-            Input::None => Some(0),
-            Input::Http(input) => input.expected(),
-            #[cfg(feature = "grpc")]
-            Input::Grpc(input) => input.declared(),
         };
+        let inbound = inbound.on_data(payload.len() as u64, end_stream)?;
 
-        // §8.1.1: the body must add up to exactly what was declared.
-        let at = self.received.get();
-        let received = at + payload.len() as u64;
-        if end_stream && declared.is_some_and(|declared| received != declared) {
-            return Err(StreamViolation::ContentLengthMismatch);
-        }
-
-        // §8.1.1: exceeding the declared length is an error as soon as it
-        // happens; for an HTTP body, `push` decides.
-        let (wake, consumed) = match &mut *input {
-            // A declared length of zero, so any byte is one too many.
-            Input::None if !payload.is_empty() => {
-                return Err(StreamViolation::ContentLengthMismatch);
-            }
+        let (wake, consumed) = match &mut *self.input.borrow_mut() {
+            // A declared length of zero, which `on_data` has held the payload
+            // to.
             Input::None => (end_stream, 0),
             Input::Http(input) => {
                 input
@@ -489,9 +455,6 @@ impl StreamState {
             }
             #[cfg(feature = "grpc")]
             Input::Grpc(input) => {
-                if declared.is_some_and(|declared| received > declared) {
-                    return Err(StreamViolation::ContentLengthMismatch);
-                }
                 let wake = input.push(payload);
                 if end_stream {
                     input.end();
@@ -509,12 +472,9 @@ impl StreamState {
 
         // Only now: a payload that was refused never landed. `unreleased` is
         // bounded by the receive window, so it cannot outgrow a u32.
-        self.received.set(received);
+        self.set_inbound(inbound);
         self.unreleased
             .set(self.unreleased.get() + payload.len() as u32 - consumed);
-        if end_stream {
-            self.no_more_input.set(true);
-        }
         if wake {
             self.wake();
         }
@@ -530,7 +490,7 @@ impl StreamState {
             };
             match taken {
                 Some(taken) => Poll::Ready(Some(taken)),
-                None if self.no_more_input.get() => Poll::Ready(None),
+                None if self.input_ended() => Poll::Ready(None),
                 None => {
                     self.register_waker(cx.waker());
                     Poll::Pending
@@ -654,14 +614,13 @@ impl Stream {
         self.token
             .shared()
             .write_response(self.id(), status, fields, false);
-        self.state().note_responded();
+        self.state().respond();
     }
 
     pub fn write_headers_final(self, status: StatusCode, fields: &http::HeaderMap) {
         self.token
             .shared()
             .write_response(self.id(), status, fields, true);
-        self.state().note_responded();
         self.state().end_output();
     }
 
@@ -696,7 +655,7 @@ impl Stream {
     /// head are a malformed response, and the handler gets the `500` instead.
     pub fn write_trailers(self, fields: &http::HeaderMap) {
         let state = self.state();
-        if !state.has_responded() || state.is_retired() {
+        if !state.is_streaming() {
             return;
         }
         self.token.shared().write_trailers(self.id(), fields);

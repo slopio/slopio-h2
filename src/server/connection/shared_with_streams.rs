@@ -11,7 +11,6 @@ use crate::shared::{
         encode::{encode_rst_stream, encode_window_update},
         stream_id::StreamId,
     },
-    codec::types::{INTERNAL_ERROR, NO_ERROR},
     hpack::Header,
 };
 use runtime::Handle;
@@ -28,7 +27,7 @@ pub fn retire_if_closed(map: &LiveStreams, shared: &SharedConnection, id: STREAM
     let Some((stream, _handle)) = map.remove(id) else {
         return;
     };
-    stream.note_retired();
+    stream.retire();
     // A reset stream is removed where the RST_STREAM is handled and never
     // arrives here, so this is the one place that knows a stream finished
     // cleanly, which is what the fault budget spends itself against.
@@ -86,39 +85,23 @@ impl Drop for StreamToken {
     /// ever runs, and so drops, while the connection is suspended at an
     /// `await` holding no reference into the map; see `StreamMap`.
     fn drop(&mut self) {
-        // A handler that returned without answering gets a `500`, since
-        // nothing else will ever speak for that stream. Only for a stream
-        // not yet retired: a HEADERS frame on a stream that no longer exists
-        // is noise the peer has to account for.
-        if !self.stream.has_responded() && !self.stream.is_retired() {
+        let farewell = self.stream.on_task_end();
+        if farewell.answer {
             self.shared.write_response(
                 self.id,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &HeaderMap::new(),
                 true,
             );
-        } else if !self.stream.output_ended() && !self.stream.is_retired() {
-            // A response started but not ended must be reset, not finished:
-            // an empty DATA with END_STREAM would pass a truncated body off as
-            // a whole one.
-            self.shared
-                .write_frame(|out| encode_rst_stream(out, self.id, INTERNAL_ERROR));
-            if !self.stream.input_ended() {
-                self.shared.note_reset(self.id.into());
-            }
-            self.stream.abandon_input();
         }
-
-        // §8.1: a complete response to a request still arriving is followed
-        // by RST_STREAM(NO_ERROR) rather than taking a body nobody will read.
-        if !self.stream.input_ended() && !self.stream.is_retired() {
+        if let Some(code) = farewell.reset {
             self.shared
-                .write_frame(|out| encode_rst_stream(out, self.id, NO_ERROR));
+                .write_frame(|out| encode_rst_stream(out, self.id, code));
+        }
+        if farewell.abandoned_input {
             self.shared.note_reset(self.id.into());
-            self.stream.abandon_input();
         }
 
-        self.stream.end_output();
         if let Some(map) = self.map.upgrade() {
             retire_if_closed(&map, &self.shared, self.id.into());
         }

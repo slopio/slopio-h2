@@ -32,8 +32,6 @@ pub struct GrpcInput {
     failure_taken: bool,
     announced: AnnouncedEncoding,
     format: GrpcFormat,
-    /// §8.1.1 holds whatever the content type.
-    declared: Option<u64>,
 }
 
 impl GrpcInput {
@@ -51,7 +49,7 @@ impl GrpcInput {
     /// thousand of them.
     pub const QUEUE_LIMIT: usize = 256;
 
-    pub fn new(format: GrpcFormat, fields: &HeaderMap, declared: Option<u64>) -> Self {
+    pub fn new(format: GrpcFormat, fields: &HeaderMap) -> Self {
         Self {
             reading: Reading::Prefix(Prefix::new()),
             ready: VecDeque::new(),
@@ -59,12 +57,7 @@ impl GrpcInput {
             failure_taken: false,
             announced: AnnouncedEncoding::of(fields),
             format,
-            declared,
         }
-    }
-
-    pub fn declared(&self) -> Option<u64> {
-        self.declared
     }
 
     /// While a whole message is waiting, the bytes that arrive hold their
@@ -185,7 +178,7 @@ mod tests {
         if let Some(encoding) = encoding {
             fields.insert("grpc-encoding", http::HeaderValue::from_static(encoding));
         }
-        GrpcInput::new(GrpcFormat::Proto, &fields, None)
+        GrpcInput::new(GrpcFormat::Proto, &fields)
     }
 
     fn framed(flag: u8, data: &[u8]) -> Vec<u8> {
