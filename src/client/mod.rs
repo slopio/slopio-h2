@@ -23,6 +23,7 @@ use crate::shared::transport::PlainMessages;
 use crate::shared::transport::{ALPN_H2, KtlsTransport};
 
 mod connection;
+mod lifecycle;
 mod shared;
 mod stream;
 

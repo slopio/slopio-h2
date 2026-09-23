@@ -10,6 +10,7 @@ use http::HeaderMap;
 use runtime::runtime::time::timeout;
 
 use crate::client::STREAM_RECV_WINDOW;
+use crate::client::lifecycle::{Inbound, Lifecycle, Outbound};
 use crate::client::shared::ClientShared;
 use crate::shared::codec::frames::{
     encode::encode_window_update, headers::content_length, stream_id::StreamId,
@@ -21,7 +22,7 @@ use crate::shared::connection::{
 
 /// A value rather than an `io::Error`: set from the connection loop, where an
 /// allocation per reset stream is a cost a peer controls.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Failure {
     /// §6.4.
     Reset(u32),
@@ -46,11 +47,10 @@ impl Failure {
 pub(crate) struct StreamState {
     id: StreamId,
     window: StreamWindow,
+    lifecycle: Cell<Lifecycle>,
+    /// Emptied by the handle, so it says nothing about whether a head came:
+    /// that is `lifecycle`'s.
     response: RefCell<Option<http::Response<()>>>,
-    /// Not `response.is_some()`: the head is taken by the handle, and reading
-    /// it off that slot would deliver the trailers (§8.1) as a second
-    /// response.
-    response_seen: Cell<bool>,
     /// Bounded by the receive window: no credit goes back until the
     /// application takes a chunk.
     chunks: RefCell<VecDeque<Vec<u8>>>,
@@ -58,17 +58,6 @@ pub(crate) struct StreamState {
     /// RFC 9110 §9.3.2: a HEAD response's `content-length` is not a promise
     /// about this stream.
     head_request: bool,
-    /// §8.1.1.
-    declared_len: Cell<Option<u64>>,
-    /// Padding excluded.
-    received_len: Cell<u64>,
-    no_more_input: Cell<bool>,
-    no_more_output: Cell<bool>,
-    /// Never set once the peer's END_STREAM has arrived: §8.1 has a server
-    /// stop an upload with RST_STREAM(NO_ERROR) after a complete response,
-    /// and clients MUST NOT discard the response for it.
-    input_failure: Cell<Option<Failure>>,
-    output_failure: Cell<Option<Failure>>,
     /// Received bytes still holding flow-control credit.
     unreleased: Cell<u32>,
     sent: Cell<u64>,
@@ -89,17 +78,11 @@ impl StreamState {
         Self {
             id,
             window: StreamWindow::new(settings, STREAM_RECV_WINDOW),
+            lifecycle: Cell::new(Lifecycle::new(end_stream)),
             response: RefCell::new(None),
-            response_seen: Cell::new(false),
             chunks: RefCell::new(VecDeque::new()),
             trailers: RefCell::new(None),
             head_request,
-            declared_len: Cell::new(None),
-            received_len: Cell::new(0),
-            no_more_input: Cell::new(false),
-            no_more_output: Cell::new(end_stream),
-            input_failure: Cell::new(None),
-            output_failure: Cell::new(None),
             unreleased: Cell::new(0),
             sent: Cell::new(0),
             recv_waker: RefCell::new(None),
@@ -111,13 +94,31 @@ impl StreamState {
         self.id
     }
 
+    fn inbound(&self) -> Inbound {
+        self.lifecycle.get().inbound
+    }
+
+    fn outbound(&self) -> Outbound {
+        self.lifecycle.get().outbound
+    }
+
+    fn set_inbound(&self, inbound: Inbound) {
+        self.lifecycle.set(Lifecycle {
+            inbound,
+            ..self.lifecycle.get()
+        });
+    }
+
     /// §5.1.
     pub(crate) fn is_closed(&self) -> bool {
-        self.no_more_input.get() && self.no_more_output.get()
+        self.lifecycle.get().is_closed()
     }
 
     pub(crate) fn end_output(&self) {
-        self.no_more_output.set(true);
+        self.lifecycle.set(Lifecycle {
+            outbound: self.outbound().end(),
+            ..self.lifecycle.get()
+        });
     }
 
     /// §8.1.2.4. Judged before it is stored, so a failing head never reaches
@@ -140,43 +141,31 @@ impl StreamState {
         let declared =
             content_length(response.headers()).map_err(|()| StreamViolation::MalformedResponse)?;
         let bodiless = self.head_request || response.status() == http::StatusCode::NOT_MODIFIED;
-        let declared = declared.filter(|_| !bodiless);
-        if end_stream && declared.is_some_and(|len| len != 0) {
-            return Err(StreamViolation::ContentLengthMismatch);
-        }
-        self.declared_len.set(declared);
+        let inbound = self
+            .inbound()
+            .on_head(declared.filter(|_| !bodiless), end_stream)?;
 
         *self.response.borrow_mut() = Some(response);
-        self.response_seen.set(true);
-        if end_stream {
-            self.no_more_input.set(true);
-        }
+        self.set_inbound(inbound);
         self.wake_recv();
         Ok(())
     }
 
     /// §8.1.
     pub(crate) fn recv_trailers(&self, fields: HeaderMap) -> Result<(), StreamViolation> {
-        // §8.1.1.
-        if self
-            .declared_len
-            .get()
-            .is_some_and(|len| len != self.received_len.get())
-        {
-            return Err(StreamViolation::ContentLengthMismatch);
-        }
+        let inbound = self.inbound().on_trailers()?;
         *self.trailers.borrow_mut() = Some(fields);
-        self.no_more_input.set(true);
+        self.set_inbound(inbound);
         self.wake_recv();
         Ok(())
     }
 
     pub(crate) fn has_response(&self) -> bool {
-        self.response_seen.get()
+        self.inbound().has_response()
     }
 
     pub(crate) fn input_ended(&self) -> bool {
-        self.no_more_input.get()
+        self.inbound().is_ended()
     }
 
     /// The payload is copied: the decoder's buffer is owed back to the ring
@@ -186,32 +175,14 @@ impl StreamState {
         payload: &[u8],
         end_stream: bool,
     ) -> Result<(), StreamViolation> {
-        if self.no_more_input.get() {
-            // §5.1.
-            return Err(StreamViolation::DataAfterEndStream);
-        }
-        // §8.1: DATA before a final response head is malformed.
-        if !self.response_seen.get() {
-            return Err(StreamViolation::MalformedResponse);
-        }
-        // §8.1.1: past the declared length is malformed at once; short of it
-        // only once the body ends.
-        let received = self.received_len.get() + payload.len() as u64;
-        if let Some(len) = self.declared_len.get()
-            && (received > len || (end_stream && received != len))
-        {
-            return Err(StreamViolation::ContentLengthMismatch);
-        }
-        self.received_len.set(received);
+        let inbound = self.inbound().on_data(payload.len() as u64, end_stream)?;
         if !payload.is_empty() {
             self.chunks.borrow_mut().push_back(payload.to_vec());
             // Bounded by the receive window, so it cannot outgrow a u32.
             self.unreleased
                 .set(self.unreleased.get() + payload.len() as u32);
         }
-        if end_stream {
-            self.no_more_input.set(true);
-        }
+        self.set_inbound(inbound);
         self.wake_recv();
         Ok(())
     }
@@ -243,19 +214,9 @@ impl StreamState {
         Ok(())
     }
 
-    /// Fails only the halves still open: a response the peer finished is
-    /// still read to its end. The first failure is the one kept, since it
-    /// closes both halves.
+    /// The first failure is the one kept, since it closes both halves.
     pub(crate) fn fail(&self, failure: Failure) {
-        if !self.no_more_input.get() {
-            self.input_failure.set(Some(failure));
-        }
-        if !self.no_more_output.get() {
-            self.output_failure.set(Some(failure));
-        }
-        // Stops a reader parking again on the next poll.
-        self.no_more_input.set(true);
-        self.no_more_output.set(true);
+        self.lifecycle.set(self.lifecycle.get().fail(failure));
         self.wake_recv();
         self.wake_send();
     }
@@ -351,12 +312,7 @@ impl Stream {
     }
 
     async fn write_body(&self, data: &[u8], end_stream: bool) -> io::Result<()> {
-        if let Some(failure) = self.state.output_failure.get() {
-            return Err(failure.error());
-        }
-        if self.state.no_more_output.get() {
-            return Err(io::Error::other("the request body already ended"));
-        }
+        self.writable()?;
 
         let mut writing = pin!(self.shared.core.write_data(
             self.id,
@@ -368,7 +324,7 @@ impl Stream {
         // by nothing, so the failure must be checked beside it; `fail` wakes
         // the send waker the write registered.
         std::future::poll_fn(|cx| {
-            if let Some(failure) = self.state.output_failure.get() {
+            if let Outbound::Failed(failure) = self.state.outbound() {
                 return Poll::Ready(Err(failure.error()));
             }
             writing.as_mut().poll(cx).map(Ok)
@@ -392,17 +348,16 @@ impl Stream {
             if let Some(response) = self.state.response.borrow_mut().take() {
                 return Poll::Ready(Ok(response));
             }
-            if let Some(failure) = self.state.input_failure.get() {
-                return Poll::Ready(Err(failure.error()));
+            match self.state.inbound() {
+                Inbound::Failed(failure) => Poll::Ready(Err(failure.error())),
+                Inbound::AwaitingHead => {
+                    self.state.register_recv_waker(cx.waker());
+                    Poll::Pending
+                }
+                Inbound::Body(_) | Inbound::Ended => {
+                    Poll::Ready(Err(io::Error::other("the response was already taken")))
+                }
             }
-            if self.state.has_response() {
-                return Poll::Ready(Err(io::Error::other("the response was already taken")));
-            }
-            if self.state.no_more_input.get() {
-                return Poll::Ready(Err(io::Error::other("the stream ended without a response")));
-            }
-            self.state.register_recv_waker(cx.waker());
-            Poll::Pending
         })
         .await
     }
@@ -419,14 +374,14 @@ impl Stream {
             if let Some(chunk) = self.state.chunks.borrow_mut().pop_front() {
                 return Poll::Ready(Ok(Some(chunk)));
             }
-            if let Some(failure) = self.state.input_failure.get() {
-                return Poll::Ready(Err(failure.error()));
+            match self.state.inbound() {
+                Inbound::Failed(failure) => Poll::Ready(Err(failure.error())),
+                Inbound::Ended => Poll::Ready(Ok(None)),
+                Inbound::AwaitingHead | Inbound::Body(_) => {
+                    self.state.register_recv_waker(cx.waker());
+                    Poll::Pending
+                }
             }
-            if self.state.no_more_input.get() {
-                return Poll::Ready(Ok(None));
-            }
-            self.state.register_recv_waker(cx.waker());
-            Poll::Pending
         })
         .await?;
 
@@ -444,17 +399,20 @@ impl Stream {
     /// §8.3's no-pseudo-header rule holds by construction: `:` cannot appear
     /// in a `HeaderName`. No window to wait on (§6.9 meters DATA only).
     pub fn send_trailers(&self, fields: &HeaderMap) -> io::Result<()> {
-        if let Some(failure) = self.state.output_failure.get() {
-            return Err(failure.error());
-        }
-        if self.state.no_more_output.get() {
-            return Err(io::Error::other("the request body already ended"));
-        }
+        self.writable()?;
 
         self.shared.core.write_trailers(self.id, fields);
         self.state.end_output();
         self.shared.retire_if_closed(self.id.into());
         Ok(())
+    }
+
+    fn writable(&self) -> io::Result<()> {
+        match self.state.outbound() {
+            Outbound::Open => Ok(()),
+            Outbound::Failed(failure) => Err(failure.error()),
+            Outbound::Ended => Err(io::Error::other("the request body already ended")),
+        }
     }
 
     /// An unfinished stream is reset with CANCEL (§8.1). Idempotent.

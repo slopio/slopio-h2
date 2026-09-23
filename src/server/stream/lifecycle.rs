@@ -3,16 +3,12 @@
 //! it.
 
 use crate::shared::codec::types::{INTERNAL_ERROR, NO_ERROR, StreamViolation};
+use crate::shared::connection::body_length::BodyLength;
 
 /// The peer's half.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Inbound {
-    /// `received` excludes padding: flow control counts it, `content-length`
-    /// does not.
-    Open {
-        received: u64,
-        declared: Option<u64>,
-    },
+    Open(BodyLength),
     /// The peer's END_STREAM.
     Ended,
     /// Cut by our RST_STREAM; what is still in flight is ignored (§5.1).
@@ -21,38 +17,28 @@ pub enum Inbound {
 
 impl Inbound {
     pub fn is_open(self) -> bool {
-        matches!(self, Self::Open { .. })
+        matches!(self, Self::Open(_))
     }
 
-    /// §5.1, then §8.1.1: past the declared length is an error at once, short
-    /// of it only once the body ends.
+    /// §5.1, then §8.1.1.
     pub fn on_data(self, len: u64, end_stream: bool) -> Result<Self, StreamViolation> {
-        let Self::Open { received, declared } = self else {
+        let Self::Open(body) = self else {
             return Err(StreamViolation::DataAfterEndStream);
         };
-        let received = received + len;
-        if declared
-            .is_some_and(|declared| received > declared || (end_stream && received != declared))
-        {
-            return Err(StreamViolation::ContentLengthMismatch);
-        }
+        let body = body.add(len, end_stream)?;
         Ok(match end_stream {
             true => Self::Ended,
-            false => Self::Open { received, declared },
+            false => Self::Open(body),
         })
     }
 
     /// §8.1: trailers end the body, which must then add up (§8.1.1).
     pub fn on_trailers(self) -> Result<Self, StreamViolation> {
-        match self {
-            Self::Open { received, declared }
-                if declared.is_some_and(|declared| received != declared) =>
-            {
-                Err(StreamViolation::ContentLengthMismatch)
-            }
-            Self::Open { .. } => Ok(Self::Ended),
-            _ => Err(StreamViolation::DataAfterEndStream),
-        }
+        let Self::Open(body) = self else {
+            return Err(StreamViolation::DataAfterEndStream);
+        };
+        body.finish()?;
+        Ok(Self::Ended)
     }
 
     fn abandon(self) -> Self {
@@ -104,10 +90,7 @@ impl Lifecycle {
                 return Err(StreamViolation::ContentLengthMismatch);
             }
             true => Inbound::Ended,
-            false => Inbound::Open {
-                received: 0,
-                declared,
-            },
+            false => Inbound::Open(BodyLength::new(declared)),
         };
         Ok(Self::Live {
             inbound,
@@ -186,17 +169,7 @@ impl Lifecycle {
 mod tests {
     use super::*;
 
-    const OPEN: Inbound = Inbound::Open {
-        received: 0,
-        declared: None,
-    };
-
-    fn declared(len: u64) -> Inbound {
-        Inbound::Open {
-            received: 0,
-            declared: Some(len),
-        }
-    }
+    const OPEN: Inbound = Inbound::Open(BodyLength::new(None));
 
     #[test]
     fn data_after_the_end_is_refused_whichever_way_it_ended() {
@@ -210,47 +183,17 @@ mod tests {
     }
 
     #[test]
-    fn a_body_past_its_declared_length_is_refused_at_once() {
-        let half = declared(4).on_data(3, false).unwrap();
+    fn the_body_is_held_to_its_declared_length() {
+        let open = Inbound::Open(BodyLength::new(Some(4)));
         assert_eq!(
-            half.on_data(2, false),
-            Err(StreamViolation::ContentLengthMismatch)
-        );
-        assert_eq!(half.on_data(1, true), Ok(Inbound::Ended));
-    }
-
-    #[test]
-    fn a_body_short_of_its_declared_length_is_refused_when_it_ends() {
-        let half = declared(4).on_data(3, false).unwrap();
-        assert_eq!(
-            half.on_data(0, true),
+            open.on_data(5, false),
             Err(StreamViolation::ContentLengthMismatch)
         );
         assert_eq!(
-            half.on_trailers(),
+            open.on_trailers(),
             Err(StreamViolation::ContentLengthMismatch)
         );
-        assert_eq!(
-            half.on_data(1, false).unwrap().on_trailers(),
-            Ok(Inbound::Ended)
-        );
-    }
-
-    #[test]
-    fn a_declared_length_of_zero_takes_no_byte() {
-        assert_eq!(
-            declared(0).on_data(1, false),
-            Err(StreamViolation::ContentLengthMismatch)
-        );
-        assert_eq!(declared(0).on_data(0, true), Ok(Inbound::Ended));
-    }
-
-    #[test]
-    fn an_undeclared_body_takes_anything() {
-        assert_eq!(
-            OPEN.on_data(70_000, false).unwrap().on_trailers(),
-            Ok(Inbound::Ended)
-        );
+        assert_eq!(open.on_data(4, true), Ok(Inbound::Ended));
     }
 
     #[test]
@@ -262,7 +205,6 @@ mod tests {
         assert!(Lifecycle::open(Some(0), true).unwrap().input_ended());
         assert!(!Lifecycle::open(Some(1), false).unwrap().input_ended());
     }
-
     #[test]
     fn a_stream_is_closed_when_both_halves_are() {
         let live = |inbound, outbound| Lifecycle::Live { inbound, outbound };

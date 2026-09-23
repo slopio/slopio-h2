@@ -151,14 +151,14 @@ impl StreamState {
     pub fn body_is_starving(&self) -> bool {
         // Once the peer owes nothing more, whatever time passes is the
         // handler's.
-        let Some(Inbound::Open { received, .. }) = self.lifecycle.get().inbound() else {
+        let Some(Inbound::Open(body)) = self.lifecycle.get().inbound() else {
             return false;
         };
         let age = self.age();
         if age < BODY_GRACE {
             return false;
         }
-        received < MIN_BODY_RATE.saturating_mul(age.as_secs())
+        body.received() < MIN_BODY_RATE.saturating_mul(age.as_secs())
     }
 
     pub fn id(&self) -> crate::shared::codec::frames::stream_id::StreamId {
@@ -433,10 +433,10 @@ impl StreamState {
     /// `Ok(n)` is how much was consumed on the spot and owes the peer its
     /// credit back now; the caller must write the frames.
     pub fn recv_data(&self, payload: &[u8], end_stream: bool) -> Result<u32, StreamViolation> {
-        let Some(inbound @ Inbound::Open { received: at, .. }) = self.lifecycle.get().inbound()
-        else {
+        let Some(inbound @ Inbound::Open(body)) = self.lifecycle.get().inbound() else {
             return Err(StreamViolation::DataAfterEndStream);
         };
+        let at = body.received();
         let inbound = inbound.on_data(payload.len() as u64, end_stream)?;
 
         let (wake, consumed) = match &mut *self.input.borrow_mut() {
