@@ -2,9 +2,7 @@ use std::time::Duration;
 
 use http::HeaderMap;
 
-/// The longest one `Sleep` will take. The runtime's timewheel holds a minute
-/// and `unimplemented!`s past it.
-const SLICE: Duration = Duration::from_secs(30);
+use crate::shared::connection::MAX_SLEEP;
 
 /// §5's `grpc-timeout`: at most eight digits and a unit.
 ///
@@ -30,8 +28,9 @@ pub fn parse_timeout(fields: &HeaderMap) -> Option<Duration> {
     })
 }
 
-/// `Sleep` panics past a minute, so anything longer is taken in slices. Each
-/// slice re-reads the clock, so the slicing cannot drift the deadline later.
+/// Eight digits of hours is past [`MAX_SLEEP`], so anything longer is taken
+/// in slices. Each slice re-reads the clock, so the slicing cannot drift the
+/// deadline later.
 pub async fn sleep(duration: Duration) {
     let deadline = runtime::runtime::now() + duration;
     loop {
@@ -41,7 +40,7 @@ pub async fn sleep(duration: Duration) {
         if left.is_zero() {
             return;
         }
-        runtime::runtime::time::Sleep::during(left.min(SLICE)).await;
+        runtime::runtime::time::Sleep::during(left.min(MAX_SLEEP)).await;
     }
 }
 

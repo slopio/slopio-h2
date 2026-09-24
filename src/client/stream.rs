@@ -17,7 +17,7 @@ use crate::shared::codec::frames::{
 };
 use crate::shared::codec::types::{CANCEL, StreamViolation};
 use crate::shared::connection::{
-    DEADLINE_TICK, SendSide, settings::Settings, stream_window::StreamWindow,
+    MAX_SLEEP, SendSide, settings::Settings, stream_window::StreamWindow,
 };
 
 /// A value rather than an `io::Error`: set from the connection loop, where an
@@ -426,9 +426,9 @@ impl Stream {
         self.shared.core.wake_flusher();
     }
 
-    /// Waited in slices of at most [`DEADLINE_TICK`] because the runtime's
-    /// timewheel holds a minute at most. `op` must be held across slices, not
-    /// restarted, so a half-written body stays half-written.
+    /// Waited in slices of at most [`MAX_SLEEP`], the longest the runtime's
+    /// timewheel holds. `op` must be held across slices, not restarted, so a
+    /// half-written body stays half-written.
     async fn within<T>(&self, op: impl Future<Output = io::Result<T>>) -> io::Result<T> {
         let Some(deadline) = self.deadline else {
             return op.await;
@@ -442,7 +442,7 @@ impl Stream {
             if left.is_zero() {
                 return Err(self.expire());
             }
-            match timeout(left.min(DEADLINE_TICK), op.as_mut()).await {
+            match timeout(left.min(MAX_SLEEP), op.as_mut()).await {
                 Ok(done) => return done,
                 Err(()) => continue,
             }

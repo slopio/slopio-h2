@@ -5,6 +5,8 @@ use crate::server::connection::{
     CONNECTION_RECV_WINDOW, DEADLINE_TICK, IDLE_TICKS, MAX_CONCURRENT_STREAMS, STREAM_RECV_WINDOW,
 };
 use crate::shared::codec::frames::DECODE_MAX_HEADER_LIST_SIZE;
+#[cfg(feature = "tls")]
+use crate::shared::connection::MAX_SLEEP;
 
 /// What one connection may hold, and for how long. The defaults are what the
 /// test suite and the benchmarks run on; [`Server::run`](super::Server::run)
@@ -29,8 +31,8 @@ pub struct Limits {
     pub idle_timeout: Duration,
     /// How long a peer has to finish the TLS handshake. No connection
     /// deadline applies before it, so a peer that connects and sends nothing
-    /// would otherwise hold a task, a socket and a handshake buffer. At most a
-    /// minute, the longest timer the runtime has.
+    /// would otherwise hold a task, a socket and a handshake buffer. At most
+    /// an hour, the longest timer the runtime has.
     #[cfg(feature = "tls")]
     pub tls_handshake_timeout: Duration,
 }
@@ -73,15 +75,11 @@ impl Limits {
         }
         #[cfg(feature = "tls")]
         if self.tls_handshake_timeout.is_zero() || self.tls_handshake_timeout > MAX_SLEEP {
-            return invalid("tls_handshake_timeout: more than zero, at most a minute");
+            return invalid("tls_handshake_timeout: more than zero, at most an hour");
         }
         Ok(())
     }
 }
-
-/// `Sleep` panics past this, on its first poll.
-#[cfg(feature = "tls")]
-const MAX_SLEEP: Duration = Duration::from_secs(60);
 
 #[cfg(test)]
 mod tests {
@@ -109,7 +107,8 @@ mod tests {
         #[cfg(feature = "tls")]
         {
             assert!(refused(Limits { tls_handshake_timeout: Duration::ZERO, ..base }));
-            assert!(refused(Limits { tls_handshake_timeout: Duration::from_secs(61), ..base }));
+            assert!(refused(Limits { tls_handshake_timeout: MAX_SLEEP + Duration::from_secs(1), ..base }));
+            assert!(!refused(Limits { tls_handshake_timeout: MAX_SLEEP, ..base }));
         }
         assert!(!refused(Limits {
             max_concurrent_streams: 1024,

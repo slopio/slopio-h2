@@ -1691,7 +1691,7 @@ fn a_deadline_longer_than_one_tick_is_still_one_deadline() {
     let (kind, _) = with_client(
         vec![
             ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
-            // Arrives after the first slice, before the deadline.
+            // Arrives after two ticks, before the deadline.
             ReadEvent::Data(frame(
                 HEADERS,
                 FLAG_END_HEADERS | FLAG_END_STREAM,
