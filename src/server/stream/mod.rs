@@ -550,6 +550,12 @@ impl Stream {
         self.state().fields()
     }
 
+    /// The transport's peer: behind a proxy, the proxy. `None` when the
+    /// address could not be read, a peer gone before it was asked.
+    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.token.shared().peer()
+    }
+
     pub fn body_is_oneshot(&self) -> bool {
         self.state().body_is_oneshot()
     }

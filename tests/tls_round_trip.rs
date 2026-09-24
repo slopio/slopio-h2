@@ -62,8 +62,14 @@ fn make_server_config() -> Config {
     .expect("server config")
 }
 
+/// The peer's address goes back in a header: it is read before the
+/// handshake, which takes the socket.
 async fn answer(stream: Stream) {
-    stream.write_headers(StatusCode::OK, &HeaderMap::new());
+    let mut fields = HeaderMap::new();
+    if let Some(peer) = stream.peer_addr() {
+        fields.insert("x-peer-ip", peer.ip().to_string().parse().unwrap());
+    }
+    stream.write_headers(StatusCode::OK, &fields);
     stream.write_data_final(BODY).await;
 }
 
@@ -76,7 +82,7 @@ fn a_request_and_its_response_cross_a_tls_connection() {
     init_provider();
 
     let port = pick_port();
-    let (done_tx, done_rx) = mpsc::channel::<Result<(u16, Vec<u8>), String>>();
+    let (done_tx, done_rx) = mpsc::channel::<Result<(u16, Option<String>, Vec<u8>), String>>();
 
     // Detached on purpose: `Server::run` accepts for ever.
     thread::spawn(move || {
@@ -124,7 +130,12 @@ fn a_request_and_its_response_cross_a_tls_connection() {
                 while let Some(chunk) = stream.read().await.map_err(|e| e.to_string())? {
                     body.extend_from_slice(&chunk);
                 }
-                Ok((response.status().as_u16(), body))
+                let peer = response
+                    .headers()
+                    .get("x-peer-ip")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                Ok((response.status().as_u16(), peer, body))
             }
             .await;
 
@@ -137,7 +148,8 @@ fn a_request_and_its_response_cross_a_tls_connection() {
         .expect("the client reports");
     client.join().expect("client thread");
 
-    let (status, body) = outcome.expect("the exchange completed");
+    let (status, peer, body) = outcome.expect("the exchange completed");
     assert_eq!(status, 200);
+    assert_eq!(peer.as_deref(), Some("127.0.0.1"), "the handler saw its peer");
     assert_eq!(body, BODY, "the response body crossed intact");
 }

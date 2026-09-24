@@ -1,4 +1,5 @@
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::Poll;
 use std::time::{Duration, SystemTime};
@@ -122,11 +123,11 @@ pub struct Connection<T: Transport, H: Handler> {
 }
 
 impl<T: Transport, H: Handler> Connection<T, H> {
-    pub fn new(transport: T, handler: H) -> Self {
+    pub fn new(transport: T, peer: Option<SocketAddr>, handler: H) -> Self {
         Self {
             transport,
             decoder: FrameDecoder::new(),
-            protocol: Protocol::new(handler),
+            protocol: Protocol::new(handler, peer),
             partial_since: None,
             last_swept: runtime::runtime::now(),
             probe_sent: None,

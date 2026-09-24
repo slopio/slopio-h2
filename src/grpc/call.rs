@@ -35,6 +35,10 @@ impl GrpcCall {
         self.stream.fields()
     }
 
+    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.stream.peer_addr()
+    }
+
     pub fn format(&self) -> GrpcFormat {
         self.format
     }

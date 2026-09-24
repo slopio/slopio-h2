@@ -188,7 +188,7 @@ fn run_writes<H: crate::server::Handler>(
             // Spawned, as `Server` does: a root future that yields with an empty task
             // list puts the runtime to sleep with nothing armed to wake it.
             runtime_core::runtime::spawn(
-                Connection::new(PlainMessages::<TestRing, false>::new(socket), handler).run(),
+                Connection::new(PlainMessages::<TestRing, false>::new(socket), None, handler).run(),
             )
             .await;
         },

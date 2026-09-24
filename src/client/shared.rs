@@ -57,6 +57,7 @@ impl ClientShared {
                 peer_settings.header_table_size,
                 peer_settings.max_frame_size,
                 recv_window,
+                None,
             ),
             streams: LiveStreams::new(),
             next_stream_id: Cell::new(FIRST_CLIENT_STREAM),

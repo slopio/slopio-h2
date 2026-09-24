@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::rc::Rc;
@@ -327,13 +328,14 @@ impl<H: Handler> Drop for Streams<H> {
 }
 
 impl<H: Handler> Protocol<H> {
-    pub(super) fn new(handler: H) -> Self {
+    pub(super) fn new(handler: H, peer: Option<SocketAddr>) -> Self {
         // §6.5.2 defaults, until the peer's SETTINGS says otherwise.
         let peer_settings = Settings::default();
         let shared = SharedConnection::new(
             peer_settings.header_table_size,
             peer_settings.max_frame_size,
             CONNECTION_RECV_WINDOW,
+            peer,
         );
         Self {
             peer_settings,

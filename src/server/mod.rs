@@ -122,7 +122,9 @@ where
     PlainMessages<U, ZC>: Transport,
 {
     while let Some(socket) = accept(acceptor).await? {
-        spawn(Connection::new(PlainMessages::<U, ZC>::new(socket), handler.clone()).run());
+        let peer = socket.peer_addr().ok();
+        let transport = PlainMessages::<U, ZC>::new(socket);
+        spawn(Connection::new(transport, peer, handler.clone()).run());
     }
     Ok(())
 }
@@ -136,6 +138,8 @@ async fn serve_tls<U: BufRingSpec + 'static, H: Handler>(
     handler: H,
 ) -> std::io::Result<()> {
     while let Some(socket) = accept(acceptor).await? {
+        // Before the handshake, which takes the socket.
+        let peer = socket.peer_addr().ok();
         let config = config.clone();
         let handler = handler.clone();
         spawn(async move {
@@ -148,7 +152,7 @@ async fn serve_tls<U: BufRingSpec + 'static, H: Handler>(
             if transport.alpn() != Some(ALPN_H2) {
                 return;
             }
-            Connection::new(transport, handler).run().await;
+            Connection::new(transport, peer, handler).run().await;
         });
     }
     Ok(())

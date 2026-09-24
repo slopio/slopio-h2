@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::task::{Poll, Waker};
 
 use http::{HeaderMap, HeaderName};
@@ -160,10 +161,17 @@ pub struct SharedConnection {
     /// No WINDOW_UPDATE will ever come: a writer out of credit is out of it
     /// for good.
     credit_closed: Cell<bool>,
+    /// `None` when `getpeername` failed: the peer can be gone by then.
+    peer: Option<SocketAddr>,
 }
 
 impl SharedConnection {
-    pub fn new(header_table_size: u32, max_frame_size: u32, recv_window: u32) -> Self {
+    pub fn new(
+        header_table_size: u32,
+        max_frame_size: u32,
+        recv_window: u32,
+        peer: Option<SocketAddr>,
+    ) -> Self {
         Self {
             // `max_size` is bytes, `capacity` is entries: passing the byte
             // size as capacity made 192 KiB resident per idle connection.
@@ -183,7 +191,12 @@ impl SharedConnection {
             output: UnsafeCell::new(Output::new()),
             flusher: RefCell::new(None),
             credit_closed: Cell::new(false),
+            peer,
         }
+    }
+
+    pub fn peer(&self) -> Option<SocketAddr> {
+        self.peer
     }
 
     /// The borrow is held for the whole call, so a header block with its
