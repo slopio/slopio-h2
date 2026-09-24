@@ -32,7 +32,8 @@ fn main() {
 
 async fn serve(port: u16, mode: String) {
     let mut acceptor = MultiAccept::new(port).expect("bind");
-    while let Some(socket) = acceptor.next().await {
+    while let Some(accepted) = acceptor.next().await {
+        let Ok(socket) = accepted else { continue };
         match mode.as_str() {
             "hold" => spawn(async move {
                 let _socket = socket;

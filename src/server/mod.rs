@@ -1,4 +1,9 @@
-use runtime::net::{BufRingSpec, MultiAccept};
+use std::time::Duration;
+
+use runtime::io_driver::operations::sockets::multi_accept::AcceptError;
+use runtime::io_driver::operations::sockets::multi_recv::Continuation;
+use runtime::net::{BufRingSpec, MultiAccept, SocketWrapper};
+use runtime::runtime::time::Sleep;
 use runtime::spawn;
 use runtime_streams::StreamExt;
 
@@ -51,7 +56,11 @@ pub enum ServerTransport {
 /// and sends nothing would otherwise hold a task, a socket and a handshake
 /// buffer indefinitely: none of the connection deadlines apply yet.
 #[cfg(feature = "tls")]
-pub const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the listener waits after running out of descriptors or memory.
+/// Only another holder can release them, so re-arming at once would spin.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
 
 impl Server {
     pub fn new(settings: ServerSettings) -> Self {
@@ -80,19 +89,38 @@ impl Server {
                 serve_tls::<U, H>(&mut acceptor, config, handler).await
             }
         }
-        Ok(())
+    }
+}
+
+/// Exhaustion leaves the listener open; any other error ends it, and is
+/// what `run` returns.
+async fn accept(acceptor: &mut MultiAccept) -> std::io::Result<Option<SocketWrapper>> {
+    loop {
+        match acceptor.next().await {
+            Some(Ok(socket)) => return Ok(Some(socket)),
+            Some(Err(e)) if e.continuation() == Continuation::ContinueLater => {
+                Sleep::during(ACCEPT_BACKOFF).await
+            }
+            Some(Err(AcceptError::Other(errno))) => {
+                return Err(std::io::Error::from_raw_os_error(errno));
+            }
+            // Cancelled is the driver's own pause or shutdown, never the peer's.
+            Some(Err(AcceptError::Cancelled)) | None => return Ok(None),
+        }
     }
 }
 
 async fn serve_plain<U: BufRingSpec + 'static, const ZC: bool, H: Handler>(
     acceptor: &mut MultiAccept,
     handler: H,
-) where
+) -> std::io::Result<()>
+where
     PlainMessages<U, ZC>: Transport,
 {
-    while let Some(socket) = acceptor.next().await {
+    while let Some(socket) = accept(acceptor).await? {
         spawn(Connection::new(PlainMessages::<U, ZC>::new(socket), handler.clone()).run());
     }
+    Ok(())
 }
 
 /// The handshake runs inside the spawned task, not the accept loop: there,
@@ -102,8 +130,8 @@ async fn serve_tls<U: BufRingSpec + 'static, H: Handler>(
     acceptor: &mut MultiAccept,
     config: popple_tls::Config,
     handler: H,
-) {
-    while let Some(socket) = acceptor.next().await {
+) -> std::io::Result<()> {
+    while let Some(socket) = accept(acceptor).await? {
         let config = config.clone();
         let handler = handler.clone();
         spawn(async move {
@@ -119,4 +147,5 @@ async fn serve_tls<U: BufRingSpec + 'static, H: Handler>(
             Connection::new(transport, handler).run().await;
         });
     }
+    Ok(())
 }

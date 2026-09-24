@@ -11,11 +11,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "async_timers"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#a9a5d141135afc838264965e5fdab97602e73c1e"
-dependencies = [
- "slab",
- "smallvec",
-]
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#9de4acadfadf24b400ca475439c9e77866cc295b"
 
 [[package]]
 name = "aws-lc-rs"
@@ -194,7 +190,7 @@ dependencies = [
 [[package]]
 name = "io_uring_rb"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#a9a5d141135afc838264965e5fdab97602e73c1e"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#9de4acadfadf24b400ca475439c9e77866cc295b"
 dependencies = [
  "io-uring",
  "rustix",
@@ -333,7 +329,7 @@ dependencies = [
 [[package]]
 name = "popple-tls"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/popple-tls.git#e29ece4ec790b468f863c06be10a226b0ef7ef8f"
+source = "git+ssh://git@github.com/saucisoupe/popple-tls.git#fb980c4152127a83ce3e85bfcd7d15117548a926"
 dependencies = [
  "libc",
  "runtime",
@@ -465,7 +461,7 @@ dependencies = [
 [[package]]
 name = "runtime"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#a9a5d141135afc838264965e5fdab97602e73c1e"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#9de4acadfadf24b400ca475439c9e77866cc295b"
 dependencies = [
  "libc",
  "mimalloc",
@@ -475,7 +471,7 @@ dependencies = [
 [[package]]
 name = "runtime-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#a9a5d141135afc838264965e5fdab97602e73c1e"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#9de4acadfadf24b400ca475439c9e77866cc295b"
 dependencies = [
  "async_timers",
  "bitfield-struct",
@@ -494,7 +490,7 @@ dependencies = [
 [[package]]
 name = "runtime-streams"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#a9a5d141135afc838264965e5fdab97602e73c1e"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#9de4acadfadf24b400ca475439c9e77866cc295b"
 
 [[package]]
 name = "rustc-hash"
@@ -772,18 +768,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.57"
+version = "0.8.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d35102a9f36d089ccae9e4c6802bc118be4487b80aaffc0ab4e0cf5ce92d2873"
+checksum = "c17e8fafad82b542ff3717217ecdc736231b59e387768c9630123b4ce4d2db44"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.57"
+version = "0.8.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "146c01f5ab44258da43cf276c74a2763db2ff3969c9c652c3f2de07041d0b2bc"
+checksum = "595f56e044df4f46a0c9a626f65c3d99eb8488f7e8a8baa12dd76326d9710bf2"
 dependencies = [
  "proc-macro2",
  "quote",
