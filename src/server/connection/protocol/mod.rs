@@ -1,4 +1,7 @@
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll};
 
 use crate::server::connection::{
     CONNECTION_INITIAL_WINDOW_SIZE, CONNECTION_RECV_WINDOW, MAX_CONCURRENT_STREAMS,
@@ -183,7 +186,9 @@ impl<H: Handler> Streams<H> {
         // The handler runs on the task's first poll, not here, so the stream is
         // in the map before the handler can touch (or drop) it.
         let handler = self.handler.clone();
-        let handle = spawn(async move { handler.handle(Stream::new(token)).await });
+        let handle = spawn(ContainPanic(async move {
+            handler.handle(Stream::new(token)).await
+        }));
         self.streams.insert(raw, stream, handle);
         Ok(())
     }
@@ -280,6 +285,28 @@ impl<H: Handler> Streams<H> {
         stream
             .credit_send(increment)
             .map_err(|()| Rejected::Violation(StreamViolation::StreamWindowOverflow))
+    }
+}
+
+/// A panicking handler fails its stream, not the process: unwinding out of a
+/// task takes down the worker, and the runtime aborts on that. The handler is
+/// then dropped here, and its `StreamToken` answers for the stream as for any
+/// handler that returned early: a `500`, or `INTERNAL_ERROR` once the
+/// response has started.
+///
+/// Asserted unwind-safe because the panic is the application's, raised
+/// between our calls: nothing on the connection is left half-written, since
+/// no frame is encoded across a call into application code.
+struct ContainPanic<F>(F);
+
+impl<F: Future<Output = ()>> Future for ContainPanic<F> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // SAFETY: the field is pinned structurally: never moved out of, and
+        // `ContainPanic` has no `Drop` or `Unpin` of its own.
+        let handler = unsafe { self.map_unchecked_mut(|this| &mut this.0) };
+        catch_unwind(AssertUnwindSafe(|| handler.poll(cx))).unwrap_or(Poll::Ready(()))
     }
 }
 

@@ -19,6 +19,10 @@ pub use stream::Stream;
 
 /// Taken by value because the future it returns is spawned and must not
 /// borrow the handler.
+///
+/// A handler that panics fails its own stream, with a `500` or a reset, and
+/// nothing else. Not under `panic = "abort"`, where there is no unwinding to
+/// stop.
 pub trait Handler: Clone + 'static {
     fn handle(self, stream: Stream) -> impl Future<Output = ()> + 'static;
 }

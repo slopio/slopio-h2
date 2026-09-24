@@ -866,3 +866,80 @@ fn a_grpc_call_with_no_body_is_still_grpc() {
         Some("13")
     );
 }
+
+fn two_gets() -> Vec<ReadEvent> {
+    let mut bytes = preface();
+    for id in [1, 3] {
+        bytes.extend_from_slice(&frame(
+            HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            id,
+            GET_BLOCK,
+        ));
+    }
+    vec![ReadEvent::Data(bytes), ReadEvent::Eof]
+}
+
+/// A panic unwinding out of the task would take the worker down, and every
+/// connection on it.
+#[test]
+fn a_handler_that_panics_fails_its_stream_and_nothing_else() {
+    let written = run_connection_with(
+        two_gets().into_iter().map(Into::into).collect(),
+        |_, _| {},
+        |stream: crate::server::Stream| async move {
+            if u32::from(stream.id()) == 1 {
+                panic!("the application's bug");
+            }
+            stream.write_headers_final(http::StatusCode::OK, &http::HeaderMap::new());
+        },
+    );
+
+    let head = |id| {
+        written
+            .iter()
+            .find(|f| f.kind == HEADERS && f.stream_id == id)
+            .unwrap_or_else(|| panic!("stream {id} was answered: {written:?}"))
+    };
+    assert_eq!(status_of(head(1)).as_deref(), Some("500"));
+    assert_eq!(head(1).flags & FLAG_END_STREAM, FLAG_END_STREAM);
+    assert_eq!(status_of(head(3)).as_deref(), Some("200"));
+    assert!(
+        !written.iter().any(|f| f.kind == GOAWAY || f.kind == RST_STREAM),
+        "{written:?}"
+    );
+}
+
+/// A `500` after a `200` is not a response; a reset is what says the body
+/// is cut short.
+#[test]
+fn a_handler_that_panics_mid_response_resets_its_stream() {
+    let written = run_connection_with(
+        two_gets().into_iter().map(Into::into).collect(),
+        |_, _| {},
+        |stream: crate::server::Stream| async move {
+            stream.write_headers(http::StatusCode::OK, &http::HeaderMap::new());
+            if u32::from(stream.id()) == 1 {
+                stream.write_data(b"half of it").await;
+                panic!("the application's bug");
+            }
+            stream.write_data_final(b"all of it").await;
+        },
+    );
+
+    let reset = written
+        .iter()
+        .find(|f| f.kind == RST_STREAM && f.stream_id == 1)
+        .unwrap_or_else(|| panic!("the cut body was reset: {written:?}"));
+    assert_eq!(
+        u32::from_be_bytes(reset.payload[..4].try_into().unwrap()),
+        crate::shared::codec::types::INTERNAL_ERROR
+    );
+    assert!(
+        written
+            .iter()
+            .any(|f| f.kind == DATA && f.stream_id == 3 && f.flags & FLAG_END_STREAM != 0),
+        "the stream beside it finished: {written:?}"
+    );
+    assert!(!written.iter().any(|f| f.kind == GOAWAY), "{written:?}");
+}
