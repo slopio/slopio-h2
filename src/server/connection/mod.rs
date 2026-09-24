@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::task::Poll;
 use std::time::{Duration, SystemTime};
 
-use crate::server::Handler;
+use crate::server::{Handler, Limits};
 use crate::server::connection::protocol::{Phase, Protocol};
 use crate::shared::{
     codec::frames::FrameDecoder,
@@ -120,17 +120,20 @@ pub struct Connection<T: Transport, H: Handler> {
     partial_since: Option<std::time::SystemTime>,
     last_swept: std::time::SystemTime,
     probe_sent: Option<SystemTime>,
+    idle_timeout: Duration,
 }
 
 impl<T: Transport, H: Handler> Connection<T, H> {
-    pub fn new(transport: T, peer: Option<SocketAddr>, handler: H) -> Self {
+    pub fn new(transport: T, peer: Option<SocketAddr>, limits: Limits, handler: H) -> Self {
         Self {
             transport,
-            decoder: FrameDecoder::new(),
-            protocol: Protocol::new(handler, peer),
+            decoder: FrameDecoder::new()
+                .with_max_header_list_size(limits.max_header_list_size as usize),
+            protocol: Protocol::new(handler, peer, limits),
             partial_since: None,
             last_swept: runtime::runtime::now(),
             probe_sent: None,
+            idle_timeout: limits.idle_timeout,
         }
     }
 
@@ -249,7 +252,7 @@ impl<T: Transport, H: Handler> Connection<T, H> {
 
         let silent = since(last_heard);
         if !self.protocol.has_live_streams() {
-            return match silent >= DEADLINE_TICK * IDLE_TICKS {
+            return match silent >= self.idle_timeout {
                 true => Due::Close("idle too long"),
                 false => Due::Nothing,
             };

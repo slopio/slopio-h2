@@ -5,15 +5,14 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use crate::server::connection::{
-    CONNECTION_INITIAL_WINDOW_SIZE, CONNECTION_RECV_WINDOW, MAX_CONCURRENT_STREAMS,
-    STREAM_RECV_WINDOW,
+    CONNECTION_INITIAL_WINDOW_SIZE, CONNECTION_RECV_WINDOW,
     shared_with_streams::{LiveStreams, StreamToken, retire_if_closed},
 };
 use crate::server::stream::{Lifecycle, StreamState};
-use crate::server::{Handler, Stream};
+use crate::server::{Handler, Limits, Stream};
 use crate::shared::codec::{
     frames::{
-        DECODE_MAX_HEADER_LIST_SIZE, FrameHandler, FrameKind, SettingsIter,
+        FrameHandler, FrameKind, SettingsIter,
         encode::{
             encode_goaway, encode_ping, encode_rst_stream, encode_settings, encode_settings_ack,
             encode_window_update,
@@ -69,7 +68,7 @@ impl FrameWorth {
                 true => Self::Progress,
                 false => Self::Control,
             },
-            // An empty fragment never reaches `MAX_HEADER_BLOCK_SIZE` (CVE-2024-27316).
+            // An empty fragment never reaches `max_header_block_size` (CVE-2024-27316).
             FrameKind::Headers | FrameKind::Continuation if length > 0 => Self::Progress,
             FrameKind::Data | FrameKind::Headers | FrameKind::Continuation => Self::Odd,
             // PRIORITY is validated and ignored (CVE-2019-9513).
@@ -122,6 +121,7 @@ pub(super) enum Phase {
 
 struct Streams<H: Handler> {
     handler: H,
+    limits: Limits,
     last_client_stream_id: STREAM_ID,
     goaway_stream_id: Option<STREAM_ID>,
     streams: Rc<LiveStreams>,
@@ -177,7 +177,9 @@ impl<H: Handler> Streams<H> {
             return Err(Rejected::Refused(REFUSED_STREAM));
         }
 
-        let stream = Rc::new(StreamState::create(settings, headers).map_err(Rejected::Violation)?);
+        let stream = StreamState::create(settings, self.limits.stream_window, headers)
+            .map_err(Rejected::Violation)?;
+        let stream = Rc::new(stream);
         let token = StreamToken::new(
             id,
             Rc::clone(&stream),
@@ -203,7 +205,7 @@ impl<H: Handler> Streams<H> {
     /// §5.1.2: the map only holds live streams, so its length is the current
     /// count.
     fn admits(&self) -> bool {
-        self.streams.len() < MAX_CONCURRENT_STREAMS as usize
+        self.streams.len() < self.limits.max_concurrent_streams as usize
     }
 
     fn body_is_starving(&self, id: STREAM_ID) -> bool {
@@ -328,7 +330,7 @@ impl<H: Handler> Drop for Streams<H> {
 }
 
 impl<H: Handler> Protocol<H> {
-    pub(super) fn new(handler: H, peer: Option<SocketAddr>) -> Self {
+    pub(super) fn new(handler: H, peer: Option<SocketAddr>, limits: Limits) -> Self {
         // §6.5.2 defaults, until the peer's SETTINGS says otherwise.
         let peer_settings = Settings::default();
         let shared = SharedConnection::new(
@@ -342,6 +344,7 @@ impl<H: Handler> Protocol<H> {
             shared: Rc::new(shared),
             streams: Streams {
                 handler,
+                limits,
                 last_client_stream_id: 0,
                 goaway_stream_id: None,
                 streams: Rc::new(LiveStreams::new()),
@@ -770,16 +773,17 @@ impl<H: Handler> FrameHandler for Protocol<H> {
     /// §3.4: the server preface must be the first thing we write. The decoder
     /// calls this before dispatching any frame.
     fn on_preface(&mut self) {
+        let limits = self.streams.limits;
         self.shared.write_frame(|out| {
             encode_settings(
                 out,
                 &[
-                    Setting::MaxConcurrentStreams(MAX_CONCURRENT_STREAMS),
+                    Setting::MaxConcurrentStreams(limits.max_concurrent_streams),
                     Setting::EnablePush(0),
-                    Setting::MaxHeaderListSize(DECODE_MAX_HEADER_LIST_SIZE as u32),
+                    Setting::MaxHeaderListSize(limits.max_header_list_size),
                     // §6.9.2: every `StreamWindow` starts its ledger at this number, and no
                     // stream exists before this frame is out.
-                    Setting::InitialWindowSize(STREAM_RECV_WINDOW),
+                    Setting::InitialWindowSize(limits.stream_window),
                 ],
             );
         });

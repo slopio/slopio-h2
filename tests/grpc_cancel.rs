@@ -98,10 +98,7 @@ impl Rng {
 fn serve(port: u16) {
     thread::spawn(move || {
         main_thread_with::<ServerRing, _>(async move {
-            let settings = ServerSettings {
-                bind_port: port,
-                transport: ServerTransport::Plain,
-            };
+            let settings = ServerSettings::new(([127, 0, 0, 1], port), ServerTransport::Plain);
             let _ = Server::new(settings)
                 .run::<ServerRing, _>(service(route, not_grpc))
                 .await;

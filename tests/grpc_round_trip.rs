@@ -104,10 +104,7 @@ fn the_client_and_the_server_agree_over_a_real_socket() {
     // Detached: the accept loop runs until the process ends.
     thread::spawn(move || {
         main_thread_with::<ServerRing, _>(async move {
-            let settings = ServerSettings {
-                bind_port: port,
-                transport: ServerTransport::Plain,
-            };
+            let settings = ServerSettings::new(([127, 0, 0, 1], port), ServerTransport::Plain);
             let _ = Server::new(settings)
                 .run::<ServerRing, _>(service(route, not_grpc))
                 .await;
@@ -216,10 +213,7 @@ fn a_status_sent_before_the_upload_ends_is_the_one_reported() {
 
     thread::spawn(move || {
         main_thread_with::<ServerRing, _>(async move {
-            let settings = ServerSettings {
-                bind_port: port,
-                transport: ServerTransport::Plain,
-            };
+            let settings = ServerSettings::new(([127, 0, 0, 1], port), ServerTransport::Plain);
             let _ = Server::new(settings)
                 .run::<ServerRing, _>(service(route, not_grpc))
                 .await;

@@ -87,10 +87,8 @@ fn a_request_and_its_response_cross_a_tls_connection() {
     // Detached on purpose: `Server::run` accepts for ever.
     thread::spawn(move || {
         main_thread_with::<ServerRing, _>(async move {
-            let settings = ServerSettings {
-                bind_port: port,
-                transport: ServerTransport::Tls(make_server_config()),
-            };
+            let transport = ServerTransport::Tls(make_server_config());
+            let settings = ServerSettings::new(([127, 0, 0, 1], port), transport);
             let _ = Server::new(settings).run::<ServerRing, _>(answer).await;
         });
     });

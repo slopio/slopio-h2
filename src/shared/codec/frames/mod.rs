@@ -27,17 +27,19 @@ pub const DEFAULT_MAX_FRAME_SIZE: u32 = 16_384;
 /// §3.4.
 pub const CLIENT_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+/// Limit on the *decompressed* header-list size (RFC 7541 §4.1: name + value
+/// + 32 octets per field); the compressed cap cannot see an HPACK bomb.
+/// Decoding always runs to the end (HPACK state must stay in sync); fields past
+/// the limit are dropped and the block is flagged `is_over_size`.
+pub const DECODE_MAX_HEADER_LIST_SIZE: usize = 16 * 1024;
+
 /// Cap on *compressed* bytes accumulated across HEADERS + CONTINUATIONs before
 /// END_HEADERS: defends against the CONTINUATION flood (CVE-2024-27316), where
 /// nothing else limits how many CONTINUATIONs a peer may send. Compressed is
 /// never much larger than decoded, so anything beyond would be refused anyway.
-const MAX_HEADER_BLOCK_SIZE: usize = 2 * DECODE_MAX_HEADER_LIST_SIZE;
-
-/// Limit on the *decompressed* header-list size (RFC 7541 §4.1: name + value
-/// + 32 octets per field); the compressed cap above cannot see an HPACK bomb.
-/// Decoding always runs to the end (HPACK state must stay in sync); fields past
-/// the limit are dropped and the block is flagged `is_over_size`.
-pub const DECODE_MAX_HEADER_LIST_SIZE: usize = 16 * 1024;
+fn max_header_block_size(max_header_list_size: usize) -> usize {
+    2 * max_header_list_size
+}
 
 #[derive(FromBytes, KnownLayout, Immutable)]
 #[repr(C)]
@@ -229,6 +231,13 @@ impl FrameDecoder {
             preface_seen: false,
             poisoned: false,
         }
+    }
+
+    /// Decoded size past which a header list is refused, and twice which a
+    /// header block is a flood.
+    pub fn with_max_header_list_size(mut self, size: usize) -> Self {
+        self.max_header_list_size = size;
+        self
     }
 
     /// No client preface inbound, so `on_preface` is never dispatched.
@@ -649,7 +658,7 @@ fn dispatch_frame<H: FrameHandler>(
                 }
                 handler.on_headers(Box::new(headers));
             } else {
-                if hpack_buf.len() > MAX_HEADER_BLOCK_SIZE {
+                if hpack_buf.len() > max_header_block_size(max_header_list_size) {
                     return report_connection(
                         handler,
                         ENHANCE_YOUR_CALM,
@@ -689,7 +698,7 @@ fn dispatch_frame<H: FrameHandler>(
                 );
             }
             state.buf.extend_from_slice(payload);
-            if state.buf.len() > MAX_HEADER_BLOCK_SIZE {
+            if state.buf.len() > max_header_block_size(max_header_list_size) {
                 return report_connection(
                     handler,
                     ENHANCE_YOUR_CALM,
@@ -941,7 +950,7 @@ mod tests {
         let mut input = Vec::new();
         input.extend_from_slice(CLIENT_PREFACE);
         push_frame(&mut input, HEADERS, 0x0, 1, &frame_payload);
-        let n = MAX_HEADER_BLOCK_SIZE / frame_payload.len() + 4;
+        let n = max_header_block_size(DECODE_MAX_HEADER_LIST_SIZE) / frame_payload.len() + 4;
         for _ in 0..n {
             push_frame(&mut input, CONTINUATION, 0x0, 1, &frame_payload);
         }

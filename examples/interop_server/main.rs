@@ -44,10 +44,7 @@ fn main() {
 }
 
 async fn serve(port: u16) {
-    let settings = ServerSettings {
-        bind_port: port,
-        transport: ServerTransport::Plain,
-    };
+    let settings = ServerSettings::new(([0, 0, 0, 0], port), ServerTransport::Plain);
     if let Err(e) = Server::new(settings).run::<MyBufRing, _>(service(route, plain_http)).await {
         eprintln!("server error: {e}");
     }

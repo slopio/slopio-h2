@@ -29,10 +29,7 @@ fn main() {
 }
 
 async fn serve() {
-    let settings = ServerSettings {
-        bind_port: 8080,
-        transport: ServerTransport::Plain,
-    };
+    let settings = ServerSettings::new(([0, 0, 0, 0], 8080), ServerTransport::Plain);
     if let Err(e) = Server::new(settings).run::<MyBufRing, _>(hello).await {
         eprintln!("server error: {e}");
     }

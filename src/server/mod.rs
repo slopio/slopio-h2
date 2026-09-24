@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use runtime::io_driver::operations::sockets::multi_accept::AcceptError;
@@ -13,8 +14,10 @@ use crate::shared::transport::{ALPN_H2, KtlsTransport};
 use crate::shared::transport::{PlainMessages, Transport};
 
 pub(crate) mod connection;
+mod limits;
 mod stream;
 
+pub use limits::Limits;
 pub use stream::Stream;
 
 /// Taken by value because the future it returns is spawned and must not
@@ -44,8 +47,21 @@ pub struct Server {
 }
 
 pub struct ServerSettings {
-    pub bind_port: u16,
+    /// A v6 address serves v6 only.
+    pub bind: SocketAddr,
     pub transport: ServerTransport,
+    pub limits: Limits,
+}
+
+impl ServerSettings {
+    /// With the default [`Limits`].
+    pub fn new(bind: impl Into<SocketAddr>, transport: ServerTransport) -> Self {
+        Self {
+            bind: bind.into(),
+            transport,
+            limits: Limits::default(),
+        }
+    }
 }
 
 /// Cleartext HTTP/2 is prior knowledge only (§3.4); there is no `Upgrade: h2c`.
@@ -55,12 +71,6 @@ pub enum ServerTransport {
     #[cfg(feature = "tls")]
     Tls(popple_tls::Config),
 }
-
-/// How long a peer has to complete the TLS handshake. A peer that connects
-/// and sends nothing would otherwise hold a task, a socket and a handshake
-/// buffer indefinitely: none of the connection deadlines apply yet.
-#[cfg(feature = "tls")]
-pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the listener waits after running out of descriptors or memory.
 /// Only another holder can release them, so re-arming at once would spin.
@@ -75,11 +85,15 @@ impl Server {
         self,
         handler: H,
     ) -> std::io::Result<()> {
-        let mut acceptor = MultiAccept::new(self.settings.bind_port)?;
+        let limits = self.settings.limits;
+        limits.validate()?;
+        let mut acceptor = MultiAccept::bind(self.settings.bind)?;
         match self.settings.transport {
-            ServerTransport::Plain => serve_plain::<U, false, H>(&mut acceptor, handler).await,
+            ServerTransport::Plain => {
+                serve_plain::<U, false, H>(&mut acceptor, limits, handler).await
+            }
             ServerTransport::PlainZeroCopy => {
-                serve_plain::<U, true, H>(&mut acceptor, handler).await
+                serve_plain::<U, true, H>(&mut acceptor, limits, handler).await
             }
             // A server asked for TLS must not come up at all without kTLS,
             // rather than refuse every connection or serve them in the clear.
@@ -90,7 +104,7 @@ impl Server {
                         "this kernel has no kTLS: `modprobe tls`, or build without the tls feature",
                     ));
                 }
-                serve_tls::<U, H>(&mut acceptor, config, handler).await
+                serve_tls::<U, H>(&mut acceptor, config, limits, handler).await
             }
         }
     }
@@ -116,6 +130,7 @@ async fn accept(acceptor: &mut MultiAccept) -> std::io::Result<Option<SocketWrap
 
 async fn serve_plain<U: BufRingSpec + 'static, const ZC: bool, H: Handler>(
     acceptor: &mut MultiAccept,
+    limits: Limits,
     handler: H,
 ) -> std::io::Result<()>
 where
@@ -124,7 +139,7 @@ where
     while let Some(socket) = accept(acceptor).await? {
         let peer = socket.peer_addr().ok();
         let transport = PlainMessages::<U, ZC>::new(socket);
-        spawn(Connection::new(transport, peer, handler.clone()).run());
+        spawn(Connection::new(transport, peer, limits, handler.clone()).run());
     }
     Ok(())
 }
@@ -135,6 +150,7 @@ where
 async fn serve_tls<U: BufRingSpec + 'static, H: Handler>(
     acceptor: &mut MultiAccept,
     config: popple_tls::Config,
+    limits: Limits,
     handler: H,
 ) -> std::io::Result<()> {
     while let Some(socket) = accept(acceptor).await? {
@@ -143,7 +159,8 @@ async fn serve_tls<U: BufRingSpec + 'static, H: Handler>(
         let config = config.clone();
         let handler = handler.clone();
         spawn(async move {
-            let ktls = match popple_tls::handshake(socket, config, TLS_HANDSHAKE_TIMEOUT).await {
+            let deadline = limits.tls_handshake_timeout;
+            let ktls = match popple_tls::handshake(socket, config, deadline).await {
                 Ok(ktls) => ktls,
                 Err(_) => return,
             };
@@ -152,7 +169,7 @@ async fn serve_tls<U: BufRingSpec + 'static, H: Handler>(
             if transport.alpn() != Some(ALPN_H2) {
                 return;
             }
-            Connection::new(transport, peer, handler).run().await;
+            Connection::new(transport, peer, limits, handler).run().await;
         });
     }
     Ok(())

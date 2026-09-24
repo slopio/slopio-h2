@@ -60,7 +60,7 @@ impl Drop for Lent {
 
 /// A refill unit, not a limit. Nothing is compacted — that would move bytes
 /// live `Bytes` point at. A larger block takes a chunk of its own size, capped
-/// by the frame decoder at `MAX_HEADER_BLOCK_SIZE`.
+/// by the frame decoder at `max_header_block_size`.
 const STAGE_CAPACITY: usize = 4096;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

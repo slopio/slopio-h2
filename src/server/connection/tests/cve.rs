@@ -165,7 +165,7 @@ fn empty_data_flood() {
 }
 
 /// CVE-2024-27316 — the CONTINUATION flood, with empty fragments.
-/// `MAX_HEADER_BLOCK_SIZE` counts bytes and an empty fragment adds none, so
+/// `max_header_block_size` counts bytes and an empty fragment adds none, so
 /// the budget is what catches this form.
 #[test]
 fn continuation_flood_with_empty_fragments() {
@@ -365,7 +365,7 @@ fn a_flood_of_over_sized_header_lists_ends_the_connection() {
 }
 
 /// An HPACK bomb: one large value in the dynamic table, then one-byte
-/// references to it. Caught by the decoded size, not `MAX_HEADER_BLOCK_SIZE`.
+/// references to it. Caught by the decoded size, not `max_header_block_size`.
 ///
 /// 4000 bytes, not 4096: §4.4 empties the table instead of adding an entry
 /// larger than it, so index 62 would not exist.

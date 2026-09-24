@@ -89,7 +89,11 @@ pub struct StreamState {
 }
 
 impl StreamState {
-    pub fn create(settings: &Settings, header: Box<Headers>) -> Result<Self, StreamViolation> {
+    pub fn create(
+        settings: &Settings,
+        window: u32,
+        header: Box<Headers>,
+    ) -> Result<Self, StreamViolation> {
         let content_length =
             content_length(header.fields()).map_err(|()| StreamViolation::MalformedRequest)?;
 
@@ -116,7 +120,7 @@ impl StreamState {
 
         Ok(Self {
             created_at: runtime::runtime::now(),
-            window: StreamWindow::new(settings, crate::server::connection::STREAM_RECV_WINDOW),
+            window: StreamWindow::new(settings, window),
             #[cfg(feature = "grpc")]
             grpc,
             header,

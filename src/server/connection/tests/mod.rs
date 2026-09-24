@@ -13,6 +13,7 @@ mod cve;
 mod dst;
 #[cfg(feature = "grpc")]
 mod grpc;
+mod limits;
 mod logic;
 
 use std::time::Duration;
@@ -23,6 +24,7 @@ use runtime_core::deterministic_testing::{
 use runtime_core::runtime::RuntimeInner;
 
 use super::FLUSH_TIMEOUT;
+use crate::server::Limits;
 use crate::server::connection::Connection;
 use crate::shared::transport::PlainMessages;
 
@@ -155,7 +157,15 @@ pub(super) fn run_connection_with<H: crate::server::Handler>(
     script: impl FnOnce(&FakeRingHandle, i32),
     handler: H,
 ) -> Vec<Frame> {
-    frames(&run_writes(inbound, script, handler).concat())
+    frames(&run_writes(inbound, script, Limits::default(), handler).concat())
+}
+
+pub(super) fn run_connection_limited<H: crate::server::Handler>(
+    inbound: Vec<Scripted>,
+    limits: Limits,
+    handler: H,
+) -> Vec<Frame> {
+    frames(&run_writes(inbound, |_, _| {}, limits, handler).concat())
 }
 
 /// Only for a peer that takes every write whole: a short write cuts a frame
@@ -165,7 +175,7 @@ pub(super) fn run_connection_writes<H: crate::server::Handler>(
     script: impl FnOnce(&FakeRingHandle, i32),
     handler: H,
 ) -> Vec<Vec<Frame>> {
-    run_writes(inbound, script, handler)
+    run_writes(inbound, script, Limits::default(), handler)
         .iter()
         .map(|write| frames(write))
         .collect()
@@ -174,6 +184,7 @@ pub(super) fn run_connection_writes<H: crate::server::Handler>(
 fn run_writes<H: crate::server::Handler>(
     inbound: Vec<Scripted>,
     script: impl FnOnce(&FakeRingHandle, i32),
+    limits: Limits,
     handler: H,
 ) -> Vec<Vec<u8>> {
     let (fake, handle) = FakeRing::builder().virtual_time().build();
@@ -188,7 +199,13 @@ fn run_writes<H: crate::server::Handler>(
             // Spawned, as `Server` does: a root future that yields with an empty task
             // list puts the runtime to sleep with nothing armed to wake it.
             runtime_core::runtime::spawn(
-                Connection::new(PlainMessages::<TestRing, false>::new(socket), None, handler).run(),
+                Connection::new(
+                    PlainMessages::<TestRing, false>::new(socket),
+                    None,
+                    limits,
+                    handler,
+                )
+                .run(),
             )
             .await;
         },
