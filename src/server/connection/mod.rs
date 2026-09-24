@@ -92,11 +92,6 @@ pub const PARTIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// the stream whose peer sends nothing at all.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Empty-ring reads in a row before a connection gives up. Bounded because
-/// each retry re-arms the multishot and costs an SQE, so a ring that never
-/// refills would otherwise spin.
-pub const MAX_DRY_READS: u32 = 16;
-
 enum Event<B> {
     Inbound(B),
     Flush,
@@ -143,7 +138,6 @@ impl<T: Transport, H: Handler> Connection<T, H> {
         // restarts whenever handler output wakes the loop, so a dead peer
         // would otherwise be held for as long as a handler kept writing.
         let mut last_heard = runtime::runtime::now();
-        let mut dry_reads = 0;
         loop {
             match self.due(last_heard) {
                 Due::Nothing => {}
@@ -179,11 +173,12 @@ impl<T: Transport, H: Handler> Connection<T, H> {
                     }
                     continue;
                 }
+                // An empty ring is other connections holding buffers, not
+                // this peer's doing, so it never ends the connection. Yield,
+                // not sleep: a sleeper loses every refill to the yielders.
+                // `last_heard` is untouched, so a ring that never refills
+                // still ends in the silence deadline's GOAWAY.
                 Ok(Event::Retry) => {
-                    if dry_reads == MAX_DRY_READS {
-                        return;
-                    }
-                    dry_reads += 1;
                     runtime::yield_now().await;
                     continue;
                 }
@@ -192,7 +187,6 @@ impl<T: Transport, H: Handler> Connection<T, H> {
             self.decoder.decode_with(chunk.as_ref(), &mut self.protocol);
             last_heard = runtime::runtime::now();
             self.probe_sent = None;
-            dry_reads = 0;
             self.sweep_if_due();
             if self.drain().await.is_err() {
                 return;

@@ -178,9 +178,8 @@ that happens 1 652 and 1 996 times across two runs.
 
 What it costs is nothing. Each of those is one `yield_now` and a retry, because
 an empty ring means another connection is holding buffers and not that this peer
-is gone — the runtime classifies it `ContinueLater` and `MAX_DRY_READS` bounds
-how long the loop will wait. Not one connection was dropped, and the bound was
-never approached:
+is gone — the runtime classifies it `ContinueLater`. Not one connection was
+dropped:
 
 | | dry reads | dropped | deepest retry (of 16) |
 |---|---|---|---|
@@ -190,6 +189,20 @@ never approached:
 
 Single core is the harder case: 20 000 connections share *one* ring rather than
 one per worker. It holds.
+
+Those runs had a bound, `MAX_DRY_READS`: sixteen empty reads in a row and the
+connection was closed, without a GOAWAY. GET traffic never came near it. Uploads
+did, once `f675fb7` opened every stream at 1 MiB of window: 100 connections
+posting 1 MiB bodies ten at a time put far more in flight than the shipped ring
+holds, and 820-930 of 3 000 requests errored against 0 before. Raising the ring
+to `16x4096` hid it, removing the bound fixed it. The loop now yields for as long
+as the ring is dry; the silence deadline is what ends a connection whose ring
+never refills.
+
+Sleeping one timer tick (10 ms) after sixteen yields was tried and is worse: the
+sleeper loses every refill to the connections still yielding, and was starved
+into its silence deadline — 8.4 s worst case and 16-20 failed requests a run,
+against 1.6 s and none for yielding alone.
 
 Before that, ENOBUFS was fatal and the same load dropped ~2 500 connections a
 run — and `RING=16x4096` was the answer, at 79 MB for the bigger slot count. It
