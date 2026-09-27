@@ -185,7 +185,8 @@ impl Call {
         }
 
         // A response that announced no gRPC content-type carries no
-        // messages, whatever its body holds: the stream says `None` at once.
+        // messages, whatever its body holds: the stream says `None` once it
+        // has ended, so the trailers are in.
         match self.stream.message().await {
             Ok(Some(message)) => message.map(Some).map_err(from_input),
             Ok(None) => {

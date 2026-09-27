@@ -263,6 +263,32 @@ fn the_held_credit_goes_back_once_none_waits() {
     assert!(credit_after_taking(2));
 }
 
+/// A 200 with no gRPC content-type carries no messages, but the status still
+/// comes in its trailers, later: it must be waited for, not guessed.
+#[test]
+fn a_response_with_no_messages_still_waits_for_its_status() {
+    let head = frame(HEADERS, FLAG_END_HEADERS, 1, STATUS_200);
+
+    let (outcome, _) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(head).after(Duration::from_millis(20)),
+            ReadEvent::Data(status_trailers("14", Some("draining")))
+                .after(Duration::from_millis(60)),
+            ReadEvent::Eof.after(Duration::from_millis(500)),
+        ],
+        |client| async move {
+            let grpc = over(client);
+            grpc.unary::<_, HelloReply>(PATH, &HelloRequest::default())
+                .await
+        },
+    );
+
+    let status = outcome.expect_err("the call failed");
+    assert_eq!(status.code, Code::Unavailable, "the peer's own: {status:?}");
+    assert_eq!(status.message, "draining");
+}
+
 /// Only a gRPC call's stream gathers messages: one sent as plain HTTP, as a
 /// proxy relaying gRPC would, reads the same response as bytes.
 #[test]

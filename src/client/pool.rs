@@ -266,7 +266,10 @@ impl<S: Security> Client<S> {
             if self.closed.get() {
                 return Err(Unavailable::Closed.into());
             }
-            if connections.live() > 0 {
+            // Let go first: one closed by a GOAWAY still counts against
+            // `max_connections` until it is.
+            connections.let_go_of_closed();
+            if !connections.held.borrow().is_empty() {
                 return Ok(());
             }
             if let Some(outcome) = connections.opened_elsewhere().await {
@@ -457,18 +460,25 @@ impl<S: Security> Default for Connections<S> {
 }
 
 impl<S: Security> Connections<S> {
-    /// Connections that can take no more are let go here; their streams keep
-    /// them running until they end.
     fn on_a_held_connection(
         &self,
         request: &http::Request<()>,
         end_stream: bool,
         grpc: bool,
     ) -> Option<Stream> {
-        let mut held = self.held.borrow_mut();
-        held.retain(|connection| !connection.is_closed());
-        held.iter()
+        self.let_go_of_closed();
+        self.held
+            .borrow()
+            .iter()
             .find_map(|connection| connection.open(request, end_stream, grpc).ok())
+    }
+
+    /// Connections that can take no more; their streams keep them running
+    /// until they end.
+    fn let_go_of_closed(&self) {
+        self.held
+            .borrow_mut()
+            .retain(|connection| !connection.is_closed());
     }
 
     fn live(&self) -> usize {
@@ -1028,6 +1038,25 @@ mod tests {
 
         assert_eq!(opened.borrow().len(), 1);
         assert_eq!((live_streams, connections), (0, 1));
+    }
+
+    /// A connection a GOAWAY closed no longer counts against the limit.
+    #[test]
+    fn preconnecting_after_a_goaway_opens_a_new_connection() {
+        let (opened, client) = counting(1, 8);
+        let connections = run(async move {
+            let uri = "http://example.test/".parse().unwrap();
+            let key = origin("http://example.test/");
+            client.preconnect(&uri).await.expect("a connection");
+            client.origins.borrow()[&key].held.borrow()[0]
+                .shared
+                .stop_opening();
+            client.preconnect(&uri).await.expect("another, not AtLimit");
+            client.connections(&key)
+        });
+
+        assert_eq!(opened.borrow().len(), 2);
+        assert_eq!(connections, 1);
     }
 
     #[test]

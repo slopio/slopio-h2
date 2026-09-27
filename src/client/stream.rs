@@ -605,9 +605,9 @@ impl Stream {
     }
 
     /// The next whole message of a gRPC call, decoded from nothing but the
-    /// buffer it was gathered in. `None` once the response ends, or at once
-    /// if it carries no messages. Messages that arrived are delivered before
-    /// a failure is reported.
+    /// buffer it was gathered in. `None` once the response ends, carrying
+    /// messages or not. Messages that arrived are delivered before a failure
+    /// is reported.
     #[cfg(feature = "grpc")]
     pub(crate) async fn message(&self) -> io::Result<Option<Result<GrpcFrame, GrpcError>>> {
         self.within(self.next_message()).await
@@ -623,7 +623,13 @@ impl Stream {
                         return Poll::Ready(Ok((Some(taken), !input.has_ready())));
                     }
                 }
-                Some(Input::Bytes(_)) => return Poll::Ready(Ok((None, false))),
+                // No messages in it, but it must still end before its
+                // trailers can say how the call went. What it carries is
+                // dropped, and credited back so it cannot stall.
+                Some(Input::Bytes(body)) => {
+                    let dropped = body.take_available().len();
+                    self.release(dropped as u32);
+                }
                 None => {}
             }
             match inbound {
