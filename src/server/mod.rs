@@ -1,20 +1,26 @@
 use std::net::SocketAddr;
+use std::pin::{Pin, pin};
+use std::rc::Rc;
 use std::time::Duration;
 
 use runtime::io_driver::operations::sockets::multi_accept::AcceptError;
 use runtime::io_driver::operations::sockets::multi_recv::Continuation;
 use runtime::net::{BufRingSpec, MultiAccept, SocketWrapper};
-use runtime::runtime::time::Sleep;
+use runtime::runtime::select::{SelectResult, select};
+use runtime::runtime::time::{Sleep, timeout};
 use runtime::spawn;
 use runtime_streams::StreamExt;
 
 use crate::server::connection::Connection;
+use crate::server::limits::DRAIN_GRACE;
+use crate::server::shutdown::Shutdown;
 #[cfg(feature = "tls")]
 use crate::shared::transport::{ALPN_H2, KtlsTransport};
 use crate::shared::transport::{PlainMessages, Transport};
 
 pub(crate) mod connection;
 mod limits;
+mod shutdown;
 mod stream;
 
 pub use limits::Limits;
@@ -39,8 +45,6 @@ where
         self(stream)
     }
 }
-
-pub struct Header {}
 
 pub struct Server {
     pub settings: ServerSettings,
@@ -81,19 +85,41 @@ impl Server {
         Self { settings }
     }
 
+    /// Until the runtime is asked to stop — under `thread_per_core`, SIGTERM
+    /// or SIGINT — and then as [`run_until`](Self::run_until) does.
     pub async fn run<U: BufRingSpec + 'static, H: Handler>(
         self,
         handler: H,
     ) -> std::io::Result<()> {
+        self.run_until::<U, H, _>(handler, std::future::pending())
+            .await
+    }
+
+    /// Until `stop` completes or the runtime is asked to stop, whichever is
+    /// first. Then the listener closes, every connection is sent a
+    /// GOAWAY(NO_ERROR) naming the last stream it took (§6.8), and the
+    /// streams in flight get [`Limits::drain_timeout`] to finish. Returns once
+    /// the last connection has closed, or when that has run out; an accept
+    /// error is returned after the drain, not instead of it.
+    ///
+    /// The drain is this worker's: under `thread_per_core` each worker runs
+    /// its own server, and stops it on the same signal.
+    pub async fn run_until<U: BufRingSpec + 'static, H: Handler, S: Future<Output = ()>>(
+        self,
+        handler: H,
+        stop: S,
+    ) -> std::io::Result<()> {
         let limits = self.settings.limits;
         limits.validate()?;
-        let mut acceptor = MultiAccept::bind(self.settings.bind)?;
-        match self.settings.transport {
+        let acceptor = MultiAccept::bind(self.settings.bind)?;
+        let shutdown = Rc::new(Shutdown::default());
+        let stop = pin!(stop);
+        let served = match self.settings.transport {
             ServerTransport::Plain => {
-                serve_plain::<U, false, H>(&mut acceptor, limits, handler).await
+                serve_plain::<U, false, H, S>(acceptor, limits, handler, &shutdown, stop).await
             }
             ServerTransport::PlainZeroCopy => {
-                serve_plain::<U, true, H>(&mut acceptor, limits, handler).await
+                serve_plain::<U, true, H, S>(acceptor, limits, handler, &shutdown, stop).await
             }
             // A server asked for TLS must not come up at all without kTLS,
             // rather than refuse every connection or serve them in the clear.
@@ -104,9 +130,26 @@ impl Server {
                         "this kernel has no kTLS: `modprobe tls`, or build without the tls feature",
                     ));
                 }
-                serve_tls::<U, H>(&mut acceptor, config, limits, handler).await
+                serve_tls::<U, H, S>(acceptor, config, limits, handler, &shutdown, stop).await
             }
-        }
+        };
+        // The listener is gone by now, so nothing new can join.
+        shutdown.begin(limits.drain_timeout);
+        // Each connection holds its own deadline; this only stops a server
+        // being held past it by one that never turns its loop.
+        let _ = timeout(limits.drain_timeout + DRAIN_GRACE, shutdown.emptied()).await;
+        served
+    }
+}
+
+/// `None` once `stop` has completed or the runtime is stopping.
+async fn next_socket<S: Future<Output = ()>>(
+    acceptor: &mut MultiAccept,
+    stop: Pin<&mut S>,
+) -> std::io::Result<Option<SocketWrapper>> {
+    match select(accept(acceptor), stop).await {
+        SelectResult::First(accepted) => accepted,
+        SelectResult::Second(()) => Ok(None),
     }
 }
 
@@ -128,36 +171,46 @@ async fn accept(acceptor: &mut MultiAccept) -> std::io::Result<Option<SocketWrap
     }
 }
 
-async fn serve_plain<U: BufRingSpec + 'static, const ZC: bool, H: Handler>(
-    acceptor: &mut MultiAccept,
+/// Takes the listener, so that it closes on the way out.
+async fn serve_plain<U: BufRingSpec + 'static, const ZC: bool, H: Handler, S: Future<Output = ()>>(
+    mut acceptor: MultiAccept,
     limits: Limits,
     handler: H,
+    shutdown: &Rc<Shutdown>,
+    mut stop: Pin<&mut S>,
 ) -> std::io::Result<()>
 where
     PlainMessages<U, ZC>: Transport,
 {
-    while let Some(socket) = accept(acceptor).await? {
+    while let Some(socket) = next_socket(&mut acceptor, stop.as_mut()).await? {
         let peer = socket.peer_addr().ok();
         let transport = PlainMessages::<U, ZC>::new(socket);
-        spawn(Connection::new(transport, peer, limits, handler.clone()).run());
+        let connection = Connection::new(transport, peer, limits, handler.clone());
+        spawn(connection.in_shutdown(shutdown.join()).run());
     }
     Ok(())
 }
 
 /// The handshake runs inside the spawned task, not the accept loop: there,
 /// a single slow peer would stall every waiting connection.
+///
+/// A handshake joins the shutdown from its accept, so a stopping server
+/// waits for it too; its connection learns of the drain on its first turn.
 #[cfg(feature = "tls")]
-async fn serve_tls<U: BufRingSpec + 'static, H: Handler>(
-    acceptor: &mut MultiAccept,
+async fn serve_tls<U: BufRingSpec + 'static, H: Handler, S: Future<Output = ()>>(
+    mut acceptor: MultiAccept,
     config: popple_tls::Config,
     limits: Limits,
     handler: H,
+    shutdown: &Rc<Shutdown>,
+    mut stop: Pin<&mut S>,
 ) -> std::io::Result<()> {
-    while let Some(socket) = accept(acceptor).await? {
+    while let Some(socket) = next_socket(&mut acceptor, stop.as_mut()).await? {
         // Before the handshake, which takes the socket.
         let peer = socket.peer_addr().ok();
         let config = config.clone();
         let handler = handler.clone();
+        let registration = shutdown.join();
         spawn(async move {
             let deadline = limits.tls_handshake_timeout;
             let ktls = match popple_tls::handshake(socket, config, deadline).await {
@@ -169,7 +222,10 @@ async fn serve_tls<U: BufRingSpec + 'static, H: Handler>(
             if transport.alpn() != Some(ALPN_H2) {
                 return;
             }
-            Connection::new(transport, peer, limits, handler).run().await;
+            Connection::new(transport, peer, limits, handler)
+                .in_shutdown(registration)
+                .run()
+                .await;
         });
     }
     Ok(())

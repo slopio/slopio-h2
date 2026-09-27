@@ -4,8 +4,9 @@ use std::pin::Pin;
 use std::task::Poll;
 use std::time::{Duration, SystemTime};
 
-use crate::server::{Handler, Limits};
 use crate::server::connection::protocol::{Phase, Protocol};
+use crate::server::shutdown::Registration;
+use crate::server::{Handler, Limits};
 use crate::shared::{
     codec::frames::FrameDecoder,
     transport::{RecvError, Transport},
@@ -99,6 +100,9 @@ enum Event<B> {
     Retry,
     Closed,
     Failed,
+    /// The server stopped accepting, and the streams in flight have until
+    /// then to finish. Once per connection.
+    Shutdown(SystemTime),
 }
 
 enum Due {
@@ -121,6 +125,9 @@ pub struct Connection<T: Transport, H: Handler> {
     last_swept: std::time::SystemTime,
     probe_sent: Option<SystemTime>,
     idle_timeout: Duration,
+    /// `None` outside a `Server`: nothing can stop the connection but itself.
+    shutdown: Option<Registration>,
+    shutdown_seen: bool,
 }
 
 impl<T: Transport, H: Handler> Connection<T, H> {
@@ -134,7 +141,17 @@ impl<T: Transport, H: Handler> Connection<T, H> {
             last_swept: runtime::runtime::now(),
             probe_sent: None,
             idle_timeout: limits.idle_timeout,
+            shutdown: None,
+            shutdown_seen: false,
         }
+    }
+
+    /// Counted among the connections its server waits for when it stops, and
+    /// told to drain when it does, even if that was before this.
+    pub(crate) fn in_shutdown(mut self, registration: Registration) -> Self {
+        registration.attach(self.protocol.shared_handle());
+        self.shutdown = Some(registration);
+        self
     }
 
     pub async fn run(mut self) {
@@ -150,7 +167,16 @@ impl<T: Transport, H: Handler> Connection<T, H> {
                 Due::Close(reason) => self.protocol.time_out(reason),
             }
             let waited = match self.protocol.phase() {
-                Phase::Open | Phase::Draining => timeout(DEADLINE_TICK, self.next_event()).await,
+                Phase::Open => timeout(DEADLINE_TICK, self.next_event()).await,
+                // Woken at the drain's deadline rather than up to a tick past it.
+                Phase::Draining { until } => {
+                    let left = until.map_or(DEADLINE_TICK, |until| {
+                        until
+                            .duration_since(runtime::runtime::now())
+                            .unwrap_or_default()
+                    });
+                    timeout(left.min(DEADLINE_TICK), self.next_event()).await
+                }
                 Phase::HalfClosed { .. } => timeout(DEADLINE_TICK, self.next_output()).await,
                 Phase::Closing => break,
             };
@@ -187,6 +213,18 @@ impl<T: Transport, H: Handler> Connection<T, H> {
                     continue;
                 }
                 Ok(Event::Failed) => return,
+                // Not the peer's doing either.
+                Ok(Event::Shutdown(until)) => {
+                    self.protocol.shut_down(until);
+                    if self.drain().await.is_err() {
+                        return;
+                    }
+                    // A connection with nothing in flight goes now.
+                    if self.protocol.is_done() {
+                        break;
+                    }
+                    continue;
+                }
             };
             self.decoder.decode_with(chunk.as_ref(), &mut self.protocol);
             last_heard = runtime::runtime::now();
@@ -224,7 +262,13 @@ impl<T: Transport, H: Handler> Connection<T, H> {
         let since = |then: SystemTime| now.duration_since(then).unwrap_or_default();
 
         match self.protocol.phase() {
-            Phase::Open | Phase::Draining => {}
+            Phase::Open | Phase::Draining { until: None } => {}
+            // What has not finished by then is cut, whatever else is due.
+            Phase::Draining { until: Some(until) } => {
+                if now >= until {
+                    return Due::Close("shutting down");
+                }
+            }
             Phase::HalfClosed { since: closed } => {
                 return match since(closed) >= DEADLINE_TICK * HALF_CLOSED_TICKS {
                     true => Due::Close("peer half-closed, answers not finished"),
@@ -304,11 +348,18 @@ impl<T: Transport, H: Handler> Connection<T, H> {
         let Self {
             transport,
             protocol,
+            shutdown,
+            shutdown_seen,
             ..
         } = self;
         let shared = protocol.shared();
 
         std::future::poll_fn(move |cx| {
+            // `Shutdown::begin` wakes the flusher parked below.
+            if !*shutdown_seen && let Some(until) = shutdown.as_ref().and_then(|s| s.until()) {
+                *shutdown_seen = true;
+                return Poll::Ready(Event::Shutdown(until));
+            }
             if !shared.output_is_empty() {
                 return Poll::Ready(Event::Flush);
             }

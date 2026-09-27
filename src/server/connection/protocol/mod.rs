@@ -109,8 +109,10 @@ enum Greeting {
 pub(super) enum Phase {
     /// Reading and writing.
     Open,
-    /// §6.8: the peer sent GOAWAY(NO_ERROR); its streams in flight finish.
-    Draining,
+    /// §6.8: a GOAWAY(NO_ERROR) went one way or the other; the streams in
+    /// flight finish. `until` is ours: a shutdown bounds the drain, a peer's
+    /// GOAWAY does not.
+    Draining { until: Option<SystemTime> },
     /// The peer closed its half of the transport: nothing more will be read,
     /// and the transport must not be asked again. Streams waiting on the peer
     /// are reset at once; `HALF_CLOSED_TICKS` bounds the rest.
@@ -384,7 +386,36 @@ impl<H: Handler> Protocol<H> {
     }
 
     pub(super) fn is_done(&self) -> bool {
-        matches!(self.phase, Phase::Draining | Phase::HalfClosed { .. }) && !self.has_live_streams()
+        matches!(self.phase, Phase::Draining { .. } | Phase::HalfClosed { .. })
+            && !self.has_live_streams()
+    }
+
+    pub(super) fn shared_handle(&self) -> Rc<SharedConnection> {
+        self.shared.clone()
+    }
+
+    /// §6.8: the server is stopping. GOAWAY(NO_ERROR) names the last stream
+    /// taken, anything above it is refused and may be retried elsewhere, and
+    /// what is in flight has until `until` to finish.
+    pub(super) fn shut_down(&mut self, until: SystemTime) {
+        match self.phase {
+            // §3.4: no GOAWAY before the preface, and nothing to wait for.
+            Phase::Open if self.greeting == Greeting::AwaitingPreface => {
+                self.fail_connection(NO_ERROR, "shutting down");
+            }
+            Phase::Open => {
+                let last = self.streams.last_client_stream_id;
+                self.streams.goaway_stream_id = Some(last);
+                self.shared.write_frame(|out| {
+                    encode_goaway(out, StreamId::from(last), NO_ERROR, b"shutting down");
+                });
+                self.phase = Phase::Draining { until: Some(until) };
+            }
+            // The peer already said it opens nothing more.
+            Phase::Draining { .. } => self.phase = Phase::Draining { until: Some(until) },
+            // Bounded already, and a GOAWAY changes nothing for either.
+            Phase::HalfClosed { .. } | Phase::Closing => {}
+        }
     }
 
     pub(super) fn peer_closed(&mut self) {
@@ -723,7 +754,7 @@ impl<H: Handler> FrameHandler for Protocol<H> {
     /// §6.8: `NO_ERROR` drains, anything else closes.
     fn on_goaway(&mut self, _last_stream_id: StreamId, error_code: u32, _debug_data: &[u8]) {
         self.phase = match (self.phase, error_code) {
-            (Phase::Open, NO_ERROR) => Phase::Draining,
+            (Phase::Open, NO_ERROR) => Phase::Draining { until: None },
             (phase, NO_ERROR) => phase,
             _ => Phase::Closing,
         };

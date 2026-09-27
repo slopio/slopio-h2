@@ -2,11 +2,16 @@ use std::io;
 use std::time::Duration;
 
 use crate::server::connection::{
-    CONNECTION_RECV_WINDOW, DEADLINE_TICK, IDLE_TICKS, MAX_CONCURRENT_STREAMS, STREAM_RECV_WINDOW,
+    CONNECTION_RECV_WINDOW, DEADLINE_TICK, FLUSH_TIMEOUT, IDLE_TICKS, MAX_CONCURRENT_STREAMS,
+    STREAM_RECV_WINDOW,
 };
 use crate::shared::codec::frames::DECODE_MAX_HEADER_LIST_SIZE;
-#[cfg(feature = "tls")]
 use crate::shared::connection::MAX_SLEEP;
+
+/// How far past `drain_timeout` a stopping server still waits: a connection
+/// cut at its deadline flushes its last GOAWAY, and a flush may take up to
+/// `FLUSH_TIMEOUT`, twice if the cut came during one.
+pub(super) const DRAIN_GRACE: Duration = Duration::from_secs(2 * FLUSH_TIMEOUT.as_secs());
 
 /// What one connection may hold, and for how long. The defaults are what the
 /// test suite and the benchmarks run on; [`Server::run`](super::Server::run)
@@ -35,6 +40,14 @@ pub struct Limits {
     /// an hour, the longest timer the runtime has.
     #[cfg(feature = "tls")]
     pub tls_handshake_timeout: Duration,
+    /// How long a stopping server gives the streams in flight to finish,
+    /// once every connection has been sent its GOAWAY. What is still open
+    /// then is cut. Zero sends the GOAWAY and cuts at once.
+    ///
+    /// Under `thread_per_core`, SIGTERM or SIGINT stops the server, and the
+    /// runtime ends the process 30 s after the signal whatever is still
+    /// running: past about 20 s, that is the deadline, not this.
+    pub drain_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -46,6 +59,8 @@ impl Default for Limits {
             idle_timeout: DEADLINE_TICK * IDLE_TICKS,
             #[cfg(feature = "tls")]
             tls_handshake_timeout: Duration::from_secs(10),
+            // With `DRAIN_GRACE`, inside the runtime's 30 s after a signal.
+            drain_timeout: Duration::from_secs(20),
         }
     }
 }
@@ -76,6 +91,9 @@ impl Limits {
         #[cfg(feature = "tls")]
         if self.tls_handshake_timeout.is_zero() || self.tls_handshake_timeout > MAX_SLEEP {
             return invalid("tls_handshake_timeout: more than zero, at most an hour");
+        }
+        if self.drain_timeout + DRAIN_GRACE > MAX_SLEEP {
+            return invalid("drain_timeout: at most an hour less 10 s");
         }
         Ok(())
     }
@@ -110,6 +128,9 @@ mod tests {
             assert!(refused(Limits { tls_handshake_timeout: MAX_SLEEP + Duration::from_secs(1), ..base }));
             assert!(!refused(Limits { tls_handshake_timeout: MAX_SLEEP, ..base }));
         }
+        assert!(!refused(Limits { drain_timeout: Duration::ZERO, ..base }));
+        assert!(!refused(Limits { drain_timeout: MAX_SLEEP - DRAIN_GRACE, ..base }));
+        assert!(refused(Limits { drain_timeout: MAX_SLEEP, ..base }));
         assert!(!refused(Limits {
             max_concurrent_streams: 1024,
             stream_window: 1 << 20,
