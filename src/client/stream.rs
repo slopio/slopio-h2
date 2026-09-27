@@ -184,15 +184,12 @@ impl StreamState {
         Ok(())
     }
 
-    /// As a `Call` reads the head: a status in it (Trailers-Only, §9.1), a
-    /// failed HTTP status or no gRPC content-type means no messages.
+    /// No messages in a head that settles the call (§9.1), as its `Call`
+    /// reads it, nor in one with no gRPC content-type.
     #[cfg(feature = "grpc")]
     fn messages(&self, response: &http::Response<()>, end_stream: bool) -> Option<Input> {
         let fields = response.headers();
-        if !self.grpc
-            || end_stream
-            || !response.status().is_success()
-            || Status::of(fields).is_some()
+        if !self.grpc || end_stream || Status::settled_by_head(response.status(), fields).is_some()
         {
             return None;
         }
@@ -657,45 +654,34 @@ impl Stream {
     #[cfg(feature = "grpc")]
     fn release_held(&self) {
         let held = self.state.release(u32::MAX);
-        if held == 0 {
-            return;
-        }
-        if let Some(increment) = self.state.window.release_recv_now(held) {
-            self.shared
-                .core
-                .write_frame(|out| encode_window_update(out, self.id, increment));
-        }
-        self.shared.core.release_stream_credit(held);
+        self.shared
+            .core
+            .release_held_credit(self.id, &self.state.window, held);
     }
 
-    /// A gRPC message, encoded straight into the connection's output when it
-    /// can all go at once; framed apart otherwise, and then sent from its own
-    /// buffer rather than copied in, if large enough.
+    /// A gRPC message: see [`crate::grpc::write_message`]. Held to the
+    /// deadline, and to the stream's failing, as any write.
     #[cfg(feature = "grpc")]
     pub(crate) async fn write_message<M: prost::Message>(
         &self,
         message: &M,
         end_stream: bool,
     ) -> io::Result<()> {
-        self.writable()?;
-        let len = message.encoded_len();
-        let in_place = self.shared.core.try_write_data_in_place(
-            self.id,
-            &*self.state,
-            crate::grpc::PREFIX_LEN + len,
-            end_stream,
-            |out| crate::grpc::put_message(out, message, len),
-        );
-        if !in_place {
-            return self
-                .write_owned(crate::grpc::frame_message(message), end_stream)
-                .await;
-        }
-        if end_stream {
-            self.state.end_output();
-            self.shared.retire_if_closed(self.id.into());
-        }
-        Ok(())
+        self.within(async {
+            self.writable()?;
+            self.drive_write(
+                crate::grpc::write_message(
+                    &self.shared.core,
+                    self.id,
+                    &*self.state,
+                    message,
+                    end_stream,
+                ),
+                end_stream,
+            )
+            .await
+        })
+        .await
     }
 
     /// §8.1.

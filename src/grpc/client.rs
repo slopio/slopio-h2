@@ -249,13 +249,10 @@ impl Call {
         let http_status = response.status();
         let fields = response.into_parts().0.headers;
 
-        // §9.1: a status in the head is a Trailers-Only response, with no
-        // messages coming. The stream judged the head the same way when it
-        // chose to gather messages.
-        if let Some(status) = Status::of(&fields) {
+        // By the rule the stream chose by: a head that settles the call has
+        // no messages coming.
+        if let Some(status) = Status::settled_by_head(http_status, &fields) {
             self.settle(status);
-        } else if !http_status.is_success() {
-            self.settle(Status::of_http(http_status));
         }
 
         *self.head.borrow_mut() = Some(fields);

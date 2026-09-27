@@ -1,4 +1,4 @@
-use http::{HeaderMap, HeaderValue};
+use http::{HeaderMap, HeaderValue, StatusCode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Code {
@@ -125,6 +125,15 @@ impl Status {
             .map(percent_decode)
             .unwrap_or_default();
         Some(Self::new(code, message))
+    }
+
+    /// §9.1: what a response head alone says of the call: the status it
+    /// carries (Trailers-Only), or a failed HTTP status. `None`: the outcome
+    /// is in the trailers, and messages may come. The one rule both the
+    /// client's stream, choosing to gather messages, and its `Call`, reading
+    /// the head, go by.
+    pub(crate) fn settled_by_head(status: StatusCode, fields: &HeaderMap) -> Option<Self> {
+        Self::of(fields).or_else(|| (!status.is_success()).then(|| Self::of_http(status)))
     }
 
     /// §9.1's table, for a response that carried no `grpc-status`. A `200`

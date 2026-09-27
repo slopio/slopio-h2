@@ -12,6 +12,8 @@ use crate::shared::codec::frames::{
 };
 use crate::shared::connection::STREAM_ID;
 use crate::shared::connection::output::{ATTACH_MIN, Chunk, Output};
+#[cfg(feature = "grpc")]
+use crate::shared::connection::stream_window::StreamWindow;
 use crate::shared::hpack::{Encoder, Header};
 
 /// §6.9.2: SETTINGS never moves the connection window — only a WINDOW_UPDATE
@@ -375,6 +377,20 @@ impl SharedConnection {
             }
         })
         .await
+    }
+
+    /// Credit a stream held back while its reader was behind, returned at
+    /// once rather than accumulated: the peer was made to wait on exactly
+    /// this. Stream and connection both. When to call it is each side's own
+    /// to judge; this is only how.
+    #[cfg(feature = "grpc")]
+    pub fn release_held_credit(&self, stream_id: StreamId, window: &StreamWindow, held: u32) {
+        if let Some(increment) = window.release_recv_now(held) {
+            self.write_frame(|out| encode_window_update(out, stream_id, increment));
+        }
+        if held > 0 {
+            self.release_stream_credit(held);
+        }
     }
 
     /// §6.9.1: every frame is debited from both the stream's and the

@@ -1,4 +1,6 @@
 use super::prefix::PREFIX_LEN;
+use crate::shared::codec::frames::stream_id::StreamId;
+use crate::shared::connection::{SendSide, SharedConnection};
 
 /// The flag is always 0. Compressing a response would mean agreeing an
 /// encoding with the peer first, through `grpc-accept-encoding`, and this end
@@ -10,11 +12,35 @@ pub fn frame_message<M: prost::Message>(message: &M) -> Vec<u8> {
     out
 }
 
-/// The prefix and the message after it, appended to `out`: where the message
-/// is encoded when it goes straight into a connection's output. `len` is its
+/// A message on its way, client's or server's: encoded straight into the
+/// connection's output when it can all go at once; framed apart otherwise,
+/// and sent from its own buffer rather than copied in, if large enough.
+pub(crate) async fn write_message<S: SendSide, M: prost::Message>(
+    connection: &SharedConnection,
+    stream_id: StreamId,
+    stream: &S,
+    message: &M,
+    end_stream: bool,
+) {
+    let len = message.encoded_len();
+    let in_place = connection.try_write_data_in_place(
+        stream_id,
+        stream,
+        PREFIX_LEN + len,
+        end_stream,
+        |out| put_message(out, message, len),
+    );
+    if !in_place {
+        connection
+            .write_data_owned(stream_id, stream, frame_message(message).into(), end_stream)
+            .await;
+    }
+}
+
+/// The prefix and the message after it, appended to `out`. `len` is its
 /// `encoded_len`, asked once by the caller, which needed it to know whether
 /// it fits.
-pub(crate) fn put_message<M: prost::Message>(out: &mut Vec<u8>, message: &M, len: usize) {
+fn put_message<M: prost::Message>(out: &mut Vec<u8>, message: &M, len: usize) {
     out.push(0);
     out.extend_from_slice(&(len as u32).to_be_bytes());
     message.encode(out).expect("a `Vec` grows");

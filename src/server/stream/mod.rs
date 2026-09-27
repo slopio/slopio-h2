@@ -505,15 +505,12 @@ impl StreamState {
         matches!(&*self.input.borrow(), Input::Grpc(input) if input.has_ready())
     }
 
-    /// At once rather than accumulated, unlike [`release_recv`]: the peer was
-    /// made to wait on exactly this.
-    ///
-    /// [`release_recv`]: Self::release_recv
+    /// Everything held back, zeroed so it can only be given back once, with
+    /// the window it goes back to.
     #[cfg(feature = "grpc")]
     #[must_use]
-    pub fn release_held(&self) -> (u32, Option<u32>) {
-        let held = self.unreleased.replace(0);
-        (held, self.window.release_recv_now(held))
+    pub fn take_held(&self) -> (u32, &StreamWindow) {
+        (self.unreleased.replace(0), &self.window)
     }
 
     fn wake(&self) {
@@ -648,30 +645,11 @@ impl Stream {
     }
 
     /// No `_final`: a gRPC response always ends with its trailers, never with
-    /// END_STREAM on DATA. Encoded straight into the output when it can all
-    /// go at once; framed apart otherwise, and then sent from its own buffer
-    /// rather than copied in, if large enough.
+    /// END_STREAM on DATA. See [`crate::grpc::write_message`].
     #[cfg(feature = "grpc")]
     pub async fn write_message<M: prost::Message>(&self, message: &M) {
-        let len = message.encoded_len();
-        let in_place = self.token.shared().try_write_data_in_place(
-            self.id(),
-            self.state(),
-            crate::grpc::PREFIX_LEN + len,
-            false,
-            |out| crate::grpc::put_message(out, message, len),
-        );
-        if !in_place {
-            self.token
-                .shared()
-                .write_data_owned(
-                    self.id(),
-                    self.state(),
-                    crate::grpc::frame_message(message).into(),
-                    false,
-                )
-                .await;
-        }
+        crate::grpc::write_message(self.token.shared(), self.id(), self.state(), message, false)
+            .await;
     }
 
     pub async fn write_data_final(self, data: &[u8]) {

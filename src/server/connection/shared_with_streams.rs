@@ -129,13 +129,8 @@ impl SharedConnection {
 
     #[cfg(feature = "grpc")]
     pub fn release_held(&self, stream_id: StreamId, stream: &StreamState) {
-        let (held, increment) = stream.release_held();
-        if let Some(increment) = increment {
-            self.write_frame(|out| encode_window_update(out, stream_id, increment));
-        }
-        if held > 0 {
-            self.release_stream_credit(held);
-        }
+        let (held, window) = stream.take_held();
+        self.release_held_credit(stream_id, window, held);
     }
 
     /// Credits both the stream and the connection, §6.9.1 having debited both.
