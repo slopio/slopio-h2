@@ -6,10 +6,18 @@ use super::prefix::PREFIX_LEN;
 pub fn frame_message<M: prost::Message>(message: &M) -> Vec<u8> {
     let len = message.encoded_len();
     let mut out = Vec::with_capacity(PREFIX_LEN + len);
+    put_message(&mut out, message, len);
+    out
+}
+
+/// The prefix and the message after it, appended to `out`: where the message
+/// is encoded when it goes straight into a connection's output. `len` is its
+/// `encoded_len`, asked once by the caller, which needed it to know whether
+/// it fits.
+pub(crate) fn put_message<M: prost::Message>(out: &mut Vec<u8>, message: &M, len: usize) {
     out.push(0);
     out.extend_from_slice(&(len as u32).to_be_bytes());
-    message.encode(&mut out).expect("a `Vec` grows");
-    out
+    message.encode(out).expect("a `Vec` grows");
 }
 
 #[cfg(test)]

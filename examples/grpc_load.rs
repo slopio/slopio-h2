@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use popple_h2::client;
+use popple_h2::client::PlainTextClient;
 use popple_h2::grpc::{Code, GrpcClient};
 use runtime::{main_thread_with, thread_per_core_with};
 
@@ -80,27 +80,20 @@ async fn run(settings: Settings) {
     let started = Instant::now();
     let deadline = started + settings.duration;
 
+    let origin = format!("http://{}", settings.addr);
+    let uri = origin.parse().expect("an origin");
     for n in 0..settings.connections {
-        let client = match client::connect::<LoadRing>(settings.addr).await {
-            Ok(client) => client,
-            Err(e) => return eprintln!("connection {n}: {e}"),
-        };
-
-        // §5.1.2: the peer's limit is the peer's to set.
-        let allowed = client
-            .peer_settings()
-            .max_concurrent_streams
-            .unwrap_or(u32::MAX) as usize;
-        let concurrency = settings.concurrency.min(allowed);
-        if n == 0 && concurrency < settings.concurrency {
-            println!(
-                "  the server allows {allowed} streams per connection; using that instead of {}",
-                settings.concurrency
-            );
+        // A client each, held to one connection: one client would spread the
+        // calls as it saw fit, and this measures a fixed number of them. Calls
+        // past the server's `max_concurrent_streams` (§5.1.2) are refused,
+        // and counted as failures.
+        let client = PlainTextClient::plaintext::<LoadRing>().with_max_connections(1);
+        if let Err(e) = client.preconnect(&uri).await {
+            return eprintln!("connection {n}: {e}");
         }
 
-        let grpc = Rc::new(GrpcClient::new(client));
-        for _ in 0..concurrency {
+        let grpc = Rc::new(GrpcClient::new(client, &origin).expect("an http origin"));
+        for _ in 0..settings.concurrency {
             let grpc = Rc::clone(&grpc);
             let outcomes = Rc::clone(&outcomes);
             workers.push(runtime::spawn(async move {

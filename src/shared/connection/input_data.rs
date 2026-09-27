@@ -21,8 +21,10 @@ pub struct BodyOverflow {
 }
 
 impl InputData {
-    /// A bound on memory: this much is buffered per stream before the handler
-    /// sees any of it, and `MAX_CONCURRENT_STREAMS` times it per connection.
+    /// A bound on memory: this much is buffered per stream before whoever
+    /// reads the body sees any of it, and `MAX_CONCURRENT_STREAMS` times it
+    /// per connection. The server's request bodies and the client's response
+    /// bodies alike.
     pub const ONESHOT_LIMIT: usize = 16384;
 
     const DRAINED_CAPACITY: usize = 16384;
@@ -114,6 +116,15 @@ impl InputData {
         }
     }
 
+    /// Everything buffered, handed over whole: the allocation moves, nothing
+    /// is copied. Always empty for `Capped`, which `into_oneshot` delivers.
+    pub fn take_available(&mut self) -> Vec<u8> {
+        match self {
+            Self::Capped { .. } => Vec::new(),
+            Self::BufferedCapped { data, .. } | Self::Uncapped { data } => std::mem::take(data),
+        }
+    }
+
     pub fn into_oneshot(self) -> Option<Box<[u8]>> {
         match self {
             // Full by now (checked against `len` at END_STREAM), so length
@@ -156,6 +167,22 @@ mod tests {
         assert!(body.push(declared - 5, &[0; 6]).is_err());
         assert_eq!(body.available().len(), 0, "nothing of it was taken");
         assert_eq!(body.push(declared - 5, &[0; 5]), Ok(()));
+    }
+
+    #[test]
+    fn taking_what_is_buffered_moves_it_all_out() {
+        let mut body = InputData::new(None);
+        assert_eq!(body.push(0, b"ab"), Ok(()));
+        assert_eq!(body.push(2, b"cd"), Ok(()));
+        assert_eq!(body.take_available(), b"abcd");
+        assert!(body.available().is_empty());
+
+        let mut whole = InputData::new(Some(2));
+        assert_eq!(whole.push(0, b"ab"), Ok(()));
+        assert!(
+            whole.take_available().is_empty(),
+            "delivered by into_oneshot"
+        );
     }
 
     #[test]

@@ -6,10 +6,11 @@ use runtime_core::deterministic_testing::{FakeRing, ReadEvent, Scripted, simulat
 use runtime_core::runtime::RuntimeInner;
 use runtime_core::runtime::time::timeout;
 
-use super::Connection;
-use crate::client::{Client, Unavailable};
+use super::Driver;
+use crate::client::{Body, Connection, PlainText, Unavailable};
 use crate::shared::codec::frames::CLIENT_PREFACE;
 use crate::shared::connection::DEADLINE_TICK;
+use crate::shared::connection::input_data::InputData;
 use crate::shared::connection::settings::Settings;
 use crate::shared::transport::PlainMessages;
 
@@ -84,9 +85,9 @@ fn handshake(mut inbound: Vec<ReadEvent>) -> (io::Result<Settings>, Vec<u8>) {
             // Spawned: a root future that yields with an empty task list puts
             // the runtime to sleep with nothing armed to wake it.
             runtime_core::runtime::spawn(async move {
-                Connection::handshake(PlainMessages::<TestRing, false>::new(socket))
+                Driver::handshake(PlainMessages::<TestRing, false>::new(socket))
                     .await
-                    .map(|conn| conn.client().peer_settings())
+                    .map(|conn| conn.connection().peer_settings())
             })
             .await
         },
@@ -101,7 +102,7 @@ fn handshake(mut inbound: Vec<ReadEvent>) -> (io::Result<Settings>, Vec<u8>) {
 /// a time the request will comfortably precede.
 fn with_client<F, Fut, R>(inbound: Vec<Scripted>, app: F) -> (R, Vec<u8>)
 where
-    F: FnOnce(Client) -> Fut + 'static,
+    F: FnOnce(Connection<PlainText>) -> Fut + 'static,
     Fut: Future<Output = R>,
     R: 'static,
 {
@@ -113,7 +114,7 @@ where
     let result = RuntimeInner::simulated(fake).block_on::<TestRing, _>(
         async move {
             runtime_core::runtime::spawn(async move {
-                let conn = Connection::handshake(PlainMessages::<TestRing, false>::new(socket))
+                let conn = Driver::handshake(PlainMessages::<TestRing, false>::new(socket))
                     .await
                     .expect("the handshake completed");
                 app(conn.spawn()).await
@@ -276,7 +277,7 @@ fn a_silent_server_does_not_hold_the_connection_for_ever() {
             runtime_core::runtime::spawn(async move {
                 timeout(
                     CONNECT_TIMEOUT,
-                    Connection::handshake(PlainMessages::<TestRing, false>::new(socket)),
+                    Driver::handshake(PlainMessages::<TestRing, false>::new(socket)),
                 )
                 .await
                 .is_err()
@@ -339,6 +340,29 @@ fn a_request_opens_stream_one_and_carries_its_pseudo_headers() {
     );
 }
 
+/// §8.3.1: `:scheme` is never omitted, so a bare path takes the transport's.
+#[test]
+fn a_request_with_no_scheme_takes_the_connections() {
+    let ((), written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Eof.after(Duration::from_millis(100)),
+        ],
+        |client| async move {
+            let request = http::Request::get("/hello").body(()).unwrap();
+            let _stream = client.send_request(&request, true).expect("a stream");
+            settle().await;
+        },
+    );
+
+    let head = frames(&written)
+        .into_iter()
+        .find(|f| f.kind == HEADERS)
+        .expect("a HEADERS frame went out");
+    let decoded = decode_block(&head.payload);
+    assert_eq!(decoded.get(":scheme").map(String::as_str), Some("http"));
+}
+
 /// §5.1.2.
 #[test]
 fn no_stream_is_opened_past_the_peers_concurrency_limit() {
@@ -397,6 +421,133 @@ fn a_response_and_its_body_reach_the_stream() {
     assert_eq!(seen.1, b"hello world");
 }
 
+/// A response head declaring `length`, and its body in two DATA frames that
+/// arrive apart.
+fn declared_in_two_frames(length: Option<&str>) -> Vec<Scripted> {
+    let block = match length {
+        Some(length) => head_with_length(STATUS_200[0], length),
+        None => STATUS_200.to_vec(),
+    };
+    let mut first = frame(HEADERS, FLAG_END_HEADERS, 1, &block);
+    first.extend_from_slice(&frame(DATA, 0, 1, b"hello "));
+    vec![
+        ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+        ReadEvent::Data(first).after(Duration::from_millis(10)),
+        ReadEvent::Data(frame(DATA, FLAG_END_STREAM, 1, b"world")).after(Duration::from_millis(20)),
+        ReadEvent::Eof.after(Duration::from_millis(200)),
+    ]
+}
+
+#[test]
+fn a_short_declared_body_comes_whole() {
+    let (body, _) = with_client(declared_in_two_frames(Some("11")), |client| async move {
+        let request = http::Request::get("http://example.test/").body(()).unwrap();
+        let stream = client.send_request(&request, true).expect("a stream");
+        stream.response().await.expect("a response");
+        let body = stream.body().await.expect("a body");
+        let after = stream.read().await.expect("nothing more");
+        (body, after)
+    });
+
+    assert_eq!(body.0, Body::Complete(Box::from(&b"hello world"[..])));
+    assert_eq!(body.1, None, "it was all taken");
+}
+
+/// Read rather than taken whole, it still comes in one piece, once complete.
+#[test]
+fn a_short_declared_body_is_one_read() {
+    let (chunks, _) = with_client(declared_in_two_frames(Some("11")), |client| async move {
+        let request = http::Request::get("http://example.test/").body(()).unwrap();
+        let stream = client.send_request(&request, true).expect("a stream");
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.read().await.expect("a body") {
+            chunks.push(chunk);
+        }
+        chunks
+    });
+
+    assert_eq!(chunks, vec![b"hello world".to_vec()]);
+}
+
+#[test]
+fn a_body_of_no_declared_length_streams() {
+    let (seen, _) = with_client(declared_in_two_frames(None), |client| async move {
+        let request = http::Request::get("http://example.test/").body(()).unwrap();
+        let stream = client.send_request(&request, true).expect("a stream");
+        let body = stream.body().await.expect("a body");
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.read().await.expect("a body") {
+            chunks.push(chunk);
+        }
+        (body, chunks)
+    });
+
+    assert_eq!(seen.0, Body::Streaming);
+    assert_eq!(
+        seen.1,
+        vec![b"hello ".to_vec(), b"world".to_vec()],
+        "each as it came"
+    );
+}
+
+/// Past `ONESHOT_LIMIT` nothing is gathered, however exact the length.
+#[test]
+fn a_long_declared_body_streams() {
+    let long = InputData::ONESHOT_LIMIT + 1;
+    let mut head = frame(
+        HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &head_with_length(STATUS_200[0], &long.to_string()),
+    );
+    head.extend_from_slice(&frame(DATA, 0, 1, &[7; 1000]));
+
+    let (body, _) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(head).after(Duration::from_millis(10)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let request = http::Request::get("http://example.test/").body(()).unwrap();
+            let stream = client.send_request(&request, true).expect("a stream");
+            let body = stream.body().await.expect("a body");
+            let first = stream.read().await.expect("some of it");
+            (body, first.map(|chunk| chunk.len()))
+        },
+    );
+
+    assert_eq!(body.0, Body::Streaming);
+    assert_eq!(body.1, Some(1000), "readable before the rest arrives");
+}
+
+/// RFC 9110 §9.3.2: the length a HEAD's response declares is not its body's.
+#[test]
+fn a_head_requests_body_is_whole_and_empty() {
+    let answer = frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &head_with_length(STATUS_200[0], "1000"),
+    );
+    let (body, _) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(answer).after(Duration::from_millis(10)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let request = http::Request::head("http://example.test/")
+                .body(())
+                .unwrap();
+            let stream = client.send_request(&request, true).expect("a stream");
+            stream.body().await.expect("a body")
+        },
+    );
+
+    assert_eq!(body, Body::Complete(Box::default()));
+}
+
 /// §8.1.
 #[test]
 fn a_request_body_goes_out_as_data_frames() {
@@ -439,6 +590,49 @@ fn a_request_body_goes_out_as_data_frames() {
         body[1].flags & FLAG_END_STREAM,
         FLAG_END_STREAM,
         "the last write ends the request"
+    );
+}
+
+/// A buffer handed over goes out as a lent one does: framed at
+/// `max_frame_size`, whole, and ended by its last frame. Whether it was
+/// copied is `shared_connection`'s tests' to see; the wire cannot tell.
+#[test]
+fn an_owned_body_goes_out_whole() {
+    let response = frame(HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, STATUS_200);
+    let body: Vec<u8> = (0..40_000u32).map(|i| i as u8).collect();
+    let expected = body.clone();
+
+    let (status, written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(response).after(Duration::from_millis(50)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let request = http::Request::post("http://example.test/upload")
+                .body(())
+                .unwrap();
+            let stream = client.send_request(&request, false).expect("a stream");
+            stream.write_owned(body, true).await.expect("written");
+            let head = stream.response().await.expect("a response");
+            head.status().as_u16()
+        },
+    );
+
+    assert_eq!(status, 200);
+    let data: Vec<Frame> = frames(&written)
+        .into_iter()
+        .filter(|f| f.kind == DATA)
+        .collect();
+    assert_eq!(
+        data.iter().map(|f| f.payload.len()).collect::<Vec<_>>(),
+        [16_384, 16_384, 7_232]
+    );
+    let sent: Vec<u8> = data.iter().flat_map(|f| f.payload.clone()).collect();
+    assert_eq!(sent, expected);
+    assert_eq!(
+        data.last().expect("a frame").flags & FLAG_END_STREAM,
+        FLAG_END_STREAM
     );
 }
 

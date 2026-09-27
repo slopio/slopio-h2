@@ -7,7 +7,7 @@ use runtime::runtime::time::timeout;
 use runtime_streams::StreamExt;
 
 use crate::client::shared::ClientShared;
-use crate::client::{CONNECTION_RECV_WINDOW, Client, STREAM_RECV_WINDOW};
+use crate::client::{CONNECTION_RECV_WINDOW, Connection, STREAM_RECV_WINDOW};
 use crate::shared::codec::frames::{
     CLIENT_PREFACE, DECODE_MAX_HEADER_LIST_SIZE, FrameDecoder,
     encode::{encode_ping, encode_settings, encode_window_update},
@@ -15,7 +15,7 @@ use crate::shared::codec::frames::{
 };
 use crate::shared::codec::types::{NO_ERROR, Setting};
 use crate::shared::connection::{CONNECTION_INITIAL_WINDOW_SIZE, DEADLINE_TICK};
-use crate::shared::transport::{RecvError, Transport};
+use crate::shared::transport::{RecvError, Security, Transport};
 
 mod keepalive;
 mod protocol;
@@ -66,20 +66,23 @@ fn finished(shared: &Rc<ClientShared>) -> bool {
     Rc::strong_count(shared) == 1 || (shared.is_closing() && shared.streams.len() == 0)
 }
 
-pub struct Connection<T: Transport> {
+/// A connection from its handshake until [`Driver::spawn`] hands its loop to
+/// a task and its handle to the caller.
+pub(crate) struct Driver<T: Transport> {
     transport: T,
     decoder: FrameDecoder,
     protocol: Protocol,
 }
 
-impl<T: Transport> Connection<T> {
+impl<T: Transport> Driver<T> {
     /// §3.4: the preface is immediately followed by a SETTINGS frame.
-    pub async fn handshake(transport: T) -> io::Result<Self> {
+    pub(crate) async fn handshake(transport: T) -> io::Result<Self> {
+        let shared = ClientShared::new(CONNECTION_RECV_WINDOW, T::Security::scheme());
         let mut conn = Self {
             transport,
             // A server sends no preface, so the decoder starts past that check.
             decoder: FrameDecoder::client(),
-            protocol: Protocol::new(Rc::new(ClientShared::new(CONNECTION_RECV_WINDOW))),
+            protocol: Protocol::new(Rc::new(shared)),
         };
 
         conn.protocol.write_frame(|out| {
@@ -125,23 +128,24 @@ impl<T: Transport> Connection<T> {
         Ok(conn)
     }
 
-    pub fn spawn(self) -> Client
+    pub(crate) fn spawn(self) -> Connection<T::Security>
     where
         T: 'static,
     {
         let shared = Rc::clone(&self.protocol.shared);
-        Client::new(shared, Some(runtime::spawn(self.run())))
+        Connection::new(shared, Some(runtime::spawn(self.run())))
     }
 
-    /// Test-only: a `Client` with no task to wait on.
-    pub(crate) fn client(&self) -> Client {
-        Client::new(Rc::clone(&self.protocol.shared), None)
+    /// Test-only: a handle with no task to wait on.
+    #[cfg(test)]
+    pub(crate) fn connection(&self) -> Connection<T::Security> {
+        Connection::new(Rc::clone(&self.protocol.shared), None)
     }
 
     /// Must wake on application writes as well as inbound chunks: a loop that
     /// only flushed after a read would hold a request until the server spoke,
     /// which it never will.
-    pub async fn run(mut self) -> io::Result<()> {
+    async fn run(mut self) -> io::Result<()> {
         // Silence starts after the handshake, which was the peer talking.
         self.protocol.keepalive.heard(runtime::runtime::now());
         let ended = loop {
@@ -288,6 +292,6 @@ impl<T: Transport> Connection<T> {
     }
 }
 
-fn handshake_failed<T: Transport>(conn: &Connection<T>, fallback: &'static str) -> io::Error {
+fn handshake_failed<T: Transport>(conn: &Driver<T>, fallback: &'static str) -> io::Error {
     io::Error::other(conn.protocol.failure.unwrap_or(fallback))
 }

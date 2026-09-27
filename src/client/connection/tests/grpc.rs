@@ -3,10 +3,18 @@ use std::time::Duration;
 use runtime_core::deterministic_testing::ReadEvent;
 
 use super::{
-    DATA, FLAG_END_HEADERS, FLAG_END_STREAM, HEADERS, STATUS_200, frame, literal, server_opening,
-    settle, with_client,
+    DATA, FLAG_END_HEADERS, FLAG_END_STREAM, HEADERS, STATUS_200, WINDOW_UPDATE, frame, literal,
+    server_opening, settle, with_client,
 };
+use crate::client::{Connection, PlainText, pool};
 use crate::grpc::{Code, GrpcClient};
+
+const ORIGIN: &str = "http://example.test";
+
+/// The scripted connection, behind the client API gRPC calls go through.
+fn over(connection: Connection<PlainText>) -> GrpcClient<PlainText> {
+    GrpcClient::new(pool::holding(connection, ORIGIN), ORIGIN).expect("a valid origin")
+}
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct HelloRequest {
@@ -60,7 +68,7 @@ fn a_unary_call_sends_a_message_and_reads_one_back() {
             ReadEvent::Eof.after(Duration::from_millis(500)),
         ],
         |client| async move {
-            let grpc = GrpcClient::new(client);
+            let grpc = over(client);
             let request = HelloRequest {
                 name: "world".into(),
             };
@@ -106,6 +114,190 @@ fn a_unary_call_sends_a_message_and_reads_one_back() {
     );
 }
 
+/// The message is gathered as its frames land, however they are cut, and
+/// decoded whole.
+#[test]
+fn a_message_cut_across_frames_is_gathered_whole() {
+    let reply = HelloReply {
+        message: "hello, world".into(),
+    };
+    let message = framed(&reply);
+    let (front, back) = message.split_at(3);
+
+    let mut first = grpc_head();
+    first.extend_from_slice(&frame(DATA, 0, 1, front));
+
+    let (outcome, _) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(first).after(Duration::from_millis(20)),
+            ReadEvent::Data(frame(DATA, 0, 1, back)).after(Duration::from_millis(30)),
+            ReadEvent::Data(status_trailers("0", None)).after(Duration::from_millis(40)),
+            ReadEvent::Eof.after(Duration::from_millis(500)),
+        ],
+        |client| async move {
+            let grpc = over(client);
+            grpc.unary::<_, HelloReply>(PATH, &HelloRequest::default())
+                .await
+        },
+    );
+
+    assert_eq!(outcome.expect("the call succeeded").message, "hello, world");
+}
+
+/// The DATA frames a unary call of a `size`-byte name goes out in, beside
+/// the bytes they must add up to.
+fn sent_for(size: usize) -> (Vec<super::Frame>, Vec<u8>) {
+    let request = HelloRequest {
+        name: "x".repeat(size),
+    };
+    let expected = framed(&request);
+    let mut response = grpc_head();
+    response.extend_from_slice(&frame(
+        DATA,
+        0,
+        1,
+        &framed(&HelloReply {
+            message: "ok".into(),
+        }),
+    ));
+    response.extend_from_slice(&status_trailers("0", None));
+
+    let (outcome, written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(response).after(Duration::from_millis(20)),
+            ReadEvent::Eof.after(Duration::from_millis(500)),
+        ],
+        move |client| async move {
+            let grpc = over(client);
+            let outcome = grpc.unary::<_, HelloReply>(PATH, &request).await;
+            settle().await;
+            outcome
+        },
+    );
+    outcome.expect("the call succeeded");
+
+    let data = super::frames(&written)
+        .into_iter()
+        .filter(|f| f.kind == DATA && f.stream_id == 1)
+        .collect();
+    (data, expected)
+}
+
+fn assert_whole(data: &[super::Frame], expected: &[u8]) {
+    let sent: Vec<u8> = data.iter().flat_map(|f| f.payload.clone()).collect();
+    assert_eq!(sent, expected, "the message, prefix and all");
+    let last = data.last().expect("a frame");
+    assert_eq!(
+        last.flags & FLAG_END_STREAM,
+        FLAG_END_STREAM,
+        "it ends the request"
+    );
+}
+
+/// Encoded straight into the connection's output: one frame.
+#[test]
+fn a_message_that_fits_a_frame_goes_as_one() {
+    let (data, expected) = sent_for(10);
+    assert_whole(&data, &expected);
+    assert_eq!(data.len(), 1);
+}
+
+/// Past `max_frame_size`: framed apart and cut, and arrives the same.
+#[test]
+fn a_message_past_a_frame_is_cut_and_arrives_whole() {
+    let (data, expected) = sent_for(20_000);
+    assert_whole(&data, &expected);
+    assert!(data.len() > 1, "cut at max_frame_size: {}", data.len());
+}
+
+/// Two whole replies in one DATA frame, still unread: the bytes they hold
+/// keep their credit until the call has taken them all. `taken` is how many
+/// the call takes; whether a WINDOW_UPDATE for the stream went out after.
+fn credit_after_taking(taken: usize) -> bool {
+    let mut both = framed(&HelloReply {
+        message: "first".into(),
+    });
+    both.extend_from_slice(&framed(&HelloReply {
+        message: "second".into(),
+    }));
+    let mut response = grpc_head();
+    response.extend_from_slice(&frame(DATA, 0, 1, &both));
+
+    let ((), written) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(response).after(Duration::from_millis(20)),
+            ReadEvent::Eof.after(Duration::from_millis(500)),
+        ],
+        move |client| async move {
+            let grpc = over(client);
+            let call = grpc.call(PATH).await.expect("a call");
+            call.write_message_final(&HelloRequest::default())
+                .await
+                .expect("sent");
+            for _ in 0..taken {
+                call.message::<HelloReply>()
+                    .await
+                    .expect("a reply")
+                    .expect("one");
+            }
+            settle().await;
+        },
+    );
+
+    super::frames(&written)
+        .iter()
+        .any(|f| f.kind == WINDOW_UPDATE && f.stream_id == 1)
+}
+
+/// Released on the first take, the queue could grow by one per take.
+#[test]
+fn a_waiting_message_keeps_the_credit_held() {
+    assert!(!credit_after_taking(1), "one still waits");
+}
+
+#[test]
+fn the_held_credit_goes_back_once_none_waits() {
+    assert!(credit_after_taking(2));
+}
+
+/// Only a gRPC call's stream gathers messages: one sent as plain HTTP, as a
+/// proxy relaying gRPC would, reads the same response as bytes.
+#[test]
+fn a_plain_request_reads_a_grpc_response_as_bytes() {
+    let message = framed(&HelloReply {
+        message: "relayed".into(),
+    });
+    let mut response = grpc_head();
+    response.extend_from_slice(&frame(DATA, 0, 1, &message));
+    response.extend_from_slice(&status_trailers("0", None));
+    let expected = message.clone();
+
+    let (body, _) = with_client(
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Data(response).after(Duration::from_millis(20)),
+            ReadEvent::Eof.after(Duration::from_millis(500)),
+        ],
+        |client| async move {
+            let request = http::Request::post("http://example.test/helloworld.Greeter/SayHello")
+                .header("content-type", "application/grpc+proto")
+                .body(())
+                .unwrap();
+            let stream = client.send_request(&request, true).expect("a stream");
+            let mut body = Vec::new();
+            while let Some(chunk) = stream.read().await.expect("a body") {
+                body.extend_from_slice(&chunk);
+            }
+            body
+        },
+    );
+
+    assert_eq!(body, expected, "the gRPC framing and all");
+}
+
 /// §9.1's Trailers-Only.
 #[test]
 fn a_trailers_only_response_is_the_whole_answer() {
@@ -122,7 +314,7 @@ fn a_trailers_only_response_is_the_whole_answer() {
             ReadEvent::Eof.after(Duration::from_millis(500)),
         ],
         |client| async move {
-            let grpc = GrpcClient::new(client);
+            let grpc = over(client);
             let outcome = grpc
                 .unary::<_, HelloReply>(PATH, &HelloRequest::default())
                 .await;
@@ -148,7 +340,7 @@ fn a_failed_call_carries_its_code_and_message_back() {
             ReadEvent::Eof.after(Duration::from_millis(500)),
         ],
         |client| async move {
-            let grpc = GrpcClient::new(client);
+            let grpc = over(client);
             let outcome = grpc
                 .unary::<_, HelloReply>(PATH, &HelloRequest::default())
                 .await;
@@ -183,8 +375,8 @@ fn a_streaming_response_arrives_message_by_message() {
             ReadEvent::Eof.after(Duration::from_millis(500)),
         ],
         |client| async move {
-            let grpc = GrpcClient::new(client);
-            let call = grpc.call(PATH).expect("a call");
+            let grpc = over(client);
+            let call = grpc.call(PATH).await.expect("a call");
             call.write_message_final(&HelloRequest::default())
                 .await
                 .expect("the request went");
@@ -220,7 +412,7 @@ fn a_response_with_no_status_is_not_a_success() {
             ReadEvent::Eof.after(Duration::from_millis(500)),
         ],
         |client| async move {
-            let grpc = GrpcClient::new(client);
+            let grpc = over(client);
             let outcome = grpc
                 .unary::<_, HelloReply>(PATH, &HelloRequest::default())
                 .await;
@@ -246,7 +438,7 @@ fn an_http_error_from_a_proxy_becomes_a_status() {
             ReadEvent::Eof.after(Duration::from_millis(500)),
         ],
         |client| async move {
-            let grpc = GrpcClient::new(client);
+            let grpc = over(client);
             let outcome = grpc
                 .unary::<_, HelloReply>(PATH, &HelloRequest::default())
                 .await;
@@ -293,7 +485,7 @@ fn the_second_call_to_a_path_does_not_spell_it_out_again() {
             ReadEvent::Eof.after(Duration::from_millis(500)),
         ],
         |client| async move {
-            let grpc = GrpcClient::new(client);
+            let grpc = over(client);
             for _ in 0..2 {
                 grpc.unary::<_, HelloReply>(PATH, &HelloRequest::default())
                     .await

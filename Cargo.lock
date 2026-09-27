@@ -11,7 +11,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "async_timers"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#9e3207b40ed3c16b9352dcf51bad3c1d8f4e6ef2"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#3820bc833803f95d5d58e79c7f1f15aab440a67f"
 
 [[package]]
 name = "aws-lc-rs"
@@ -123,7 +123,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -190,7 +190,7 @@ dependencies = [
 [[package]]
 name = "io_uring_rb"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#9e3207b40ed3c16b9352dcf51bad3c1d8f4e6ef2"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#3820bc833803f95d5d58e79c7f1f15aab440a67f"
 dependencies = [
  "io-uring",
  "rustix",
@@ -307,6 +307,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
+name = "popple-dns"
+version = "0.1.0"
+source = "git+ssh://git@github.com/saucisoupe/popple-dns.git#ca4c89f75865d541d9f94abb4fa9be532322af12"
+dependencies = [
+ "rand",
+ "runtime",
+ "runtime-streams",
+ "rustc-hash",
+]
+
+[[package]]
 name = "popple-h2"
 version = "0.1.0"
 dependencies = [
@@ -314,6 +325,7 @@ dependencies = [
  "fnv",
  "http",
  "libc",
+ "popple-dns",
  "popple-tls",
  "prost",
  "rcgen",
@@ -461,7 +473,7 @@ dependencies = [
 [[package]]
 name = "runtime"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#9e3207b40ed3c16b9352dcf51bad3c1d8f4e6ef2"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#3820bc833803f95d5d58e79c7f1f15aab440a67f"
 dependencies = [
  "libc",
  "mimalloc",
@@ -471,7 +483,7 @@ dependencies = [
 [[package]]
 name = "runtime-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#9e3207b40ed3c16b9352dcf51bad3c1d8f4e6ef2"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#3820bc833803f95d5d58e79c7f1f15aab440a67f"
 dependencies = [
  "async_timers",
  "bitfield-struct",
@@ -490,7 +502,7 @@ dependencies = [
 [[package]]
 name = "runtime-streams"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#9e3207b40ed3c16b9352dcf51bad3c1d8f4e6ef2"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#3820bc833803f95d5d58e79c7f1f15aab440a67f"
 
 [[package]]
 name = "rustc-hash"
@@ -508,7 +520,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use http::{HeaderMap, StatusCode};
-use popple_h2::client;
+use popple_h2::client::{self, PlainText};
 use popple_h2::grpc::{Code, GrpcCall, GrpcClient, Status, service};
 use popple_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 use runtime::main_thread_with;
@@ -96,6 +96,21 @@ fn flatten(status: Status) -> (Code, String) {
     (status.code, status.message)
 }
 
+/// Once the server is up: it binds inside its own task, so the first
+/// attempts may land before it does.
+async fn connect(port: u16) -> GrpcClient<PlainText> {
+    let origin = format!("http://127.0.0.1:{port}");
+    let uri = origin.parse().unwrap();
+    let client = client::PlainTextClient::plaintext::<ClientRing>();
+    for _ in 0..50 {
+        if client.preconnect(&uri).await.is_ok() {
+            return GrpcClient::new(client, &origin).expect("an http origin");
+        }
+        Sleep::during(Duration::from_millis(20)).await;
+    }
+    panic!("the server never came up");
+}
+
 #[test]
 fn the_client_and_the_server_agree_over_a_real_socket() {
     let port = pick_port();
@@ -113,21 +128,7 @@ fn the_client_and_the_server_agree_over_a_real_socket() {
 
     let client = thread::spawn(move || {
         main_thread_with::<ClientRing, _>(async move {
-            let addr = format!("127.0.0.1:{port}").parse().unwrap();
-
-            // The listener binds inside the server's own task, so the first
-            // attempts may arrive before it does.
-            let mut connected = None;
-            for _ in 0..50 {
-                match client::connect::<ClientRing>(addr).await {
-                    Ok(client) => {
-                        connected = Some(client);
-                        break;
-                    }
-                    Err(_) => Sleep::during(Duration::from_millis(20)).await,
-                }
-            }
-            let grpc = GrpcClient::new(connected.expect("the server came up"));
+            let grpc = connect(port).await;
 
             let unary = grpc
                 .unary::<_, HelloReply>(
@@ -143,6 +144,7 @@ fn the_client_and_the_server_agree_over_a_real_socket() {
             let streamed = async {
                 let call = grpc
                     .call(STREAM)
+                    .await
                     .map_err(|e| (Code::Unavailable, e.to_string()))?;
                 call.write_message_final(&HelloRequest::default())
                     .await
@@ -222,20 +224,9 @@ fn a_status_sent_before_the_upload_ends_is_the_one_reported() {
 
     let client = thread::spawn(move || {
         main_thread_with::<ClientRing, _>(async move {
-            let addr = format!("127.0.0.1:{port}").parse().unwrap();
-            let mut connected = None;
-            for _ in 0..50 {
-                match client::connect::<ClientRing>(addr).await {
-                    Ok(client) => {
-                        connected = Some(client);
-                        break;
-                    }
-                    Err(_) => Sleep::during(Duration::from_millis(20)).await,
-                }
-            }
-            let grpc = GrpcClient::new(connected.expect("the server came up"));
+            let grpc = connect(port).await;
 
-            let call = grpc.call(REJECTS).expect("a call");
+            let call = grpc.call(REJECTS).await.expect("a call");
             call.write_message(&HelloRequest {
                 name: "first of many".into(),
             })

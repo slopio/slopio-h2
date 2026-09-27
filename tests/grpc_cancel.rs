@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use http::{HeaderMap, StatusCode};
-use popple_h2::client;
+use popple_h2::client::{self, PlainText};
 use popple_h2::grpc::{Code, GrpcCall, GrpcClient, Status, service};
 use popple_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 use runtime::main_thread_with;
@@ -106,15 +106,25 @@ fn serve(port: u16) {
     });
 }
 
-async fn connect(port: u16) -> client::Client {
-    let addr = format!("127.0.0.1:{port}").parse().unwrap();
+/// One connection at most: the server counts resets per connection, and these
+/// tests follow that one connection's life.
+async fn connect(port: u16) -> GrpcClient<PlainText> {
+    let origin = format!("http://127.0.0.1:{port}");
+    let uri = origin.parse().unwrap();
+    let client = client::PlainTextClient::plaintext::<ClientRing>().with_max_connections(1);
     for _ in 0..50 {
-        if let Ok(client) = client::connect::<ClientRing>(addr).await {
-            return client;
+        if client.preconnect(&uri).await.is_ok() {
+            return GrpcClient::new(client, &origin).expect("an http origin");
         }
         Sleep::during(Duration::from_millis(20)).await;
     }
     panic!("the server never came up");
+}
+
+/// The client would open another in its place, so a test that follows the
+/// first one must ask before each call whether it is still there.
+fn still_connected(grpc: &GrpcClient<PlainText>) -> bool {
+    grpc.client().connections(grpc.origin()) == 1
 }
 
 #[derive(Debug, Default)]
@@ -139,15 +149,18 @@ fn cancelling_calls_at_random_leaves_the_connection_working() {
 
     thread::spawn(move || {
         main_thread_with::<ClientRing, _>(async move {
-            let inner = connect(port).await;
-            let grpc = GrpcClient::new(inner);
+            let grpc = connect(port).await;
             let mut rng = Rng(seed);
             let mut run = Run::default();
 
             // Driven by the number of *cancellations*, not of calls: a fixed
             // call count would drift towards `FAULT_LIMIT` on some seeds.
             while run.cancelled < CANCELLATIONS {
-                let call = match grpc.call(STREAM) {
+                if !still_connected(&grpc) {
+                    run.broken.push("the connection went away".into());
+                    break;
+                }
+                let call = match grpc.call(STREAM).await {
                     Ok(call) => call,
                     Err(e) => {
                         run.broken.push(format!("could not open: {e}"));
@@ -199,8 +212,8 @@ fn cancelling_calls_at_random_leaves_the_connection_working() {
                 }
             }
 
-            run.live_streams_at_end = grpc.connection().live_streams();
-            run.connection_closed = grpc.connection().is_closed();
+            run.live_streams_at_end = grpc.client().live_streams(grpc.origin());
+            run.connection_closed = !still_connected(&grpc);
             run.still_usable = grpc
                 .unary::<_, Reply>(UNARY, &Request::default())
                 .await
@@ -255,14 +268,17 @@ fn a_hundred_cancellations_end_the_connection() {
 
     thread::spawn(move || {
         main_thread_with::<ClientRing, _>(async move {
-            let grpc = GrpcClient::new(connect(port).await);
+            let grpc = connect(port).await;
 
             let mut cancelled = 0;
             let refused = loop {
                 if cancelled > FAULT_LIMIT * 2 {
                     break None;
                 }
-                match grpc.call(STREAM) {
+                if !still_connected(&grpc) {
+                    break Some(Code::Unavailable);
+                }
+                match grpc.call(STREAM).await {
                     Ok(call) => {
                         let _ = call.write_message_final(&Request::default()).await;
                         cancelled += 1;
@@ -280,6 +296,7 @@ fn a_hundred_cancellations_end_the_connection() {
             let refused = match refused {
                 Some(code) => Some(code),
                 // The connection may instead die while a call is in flight.
+                None if !still_connected(&grpc) => Some(Code::Unavailable),
                 None => grpc
                     .unary::<_, Reply>(UNARY, &Request::default())
                     .await
@@ -314,11 +331,15 @@ fn a_client_that_finishes_its_work_may_keep_cancelling() {
 
     thread::spawn(move || {
         main_thread_with::<ClientRing, _>(async move {
-            let grpc = GrpcClient::new(connect(port).await);
+            let grpc = connect(port).await;
             let mut cancelled = 0;
             let mut failed = false;
 
             while cancelled < FAULT_LIMIT * 3 {
+                if !still_connected(&grpc) {
+                    failed = true;
+                    break;
+                }
                 if grpc
                     .unary::<_, Reply>(UNARY, &Request::default())
                     .await
@@ -327,7 +348,11 @@ fn a_client_that_finishes_its_work_may_keep_cancelling() {
                     failed = true;
                     break;
                 }
-                match grpc.call(STREAM) {
+                if !still_connected(&grpc) {
+                    failed = true;
+                    break;
+                }
+                match grpc.call(STREAM).await {
                     Ok(call) => {
                         let _ = call.write_message_final(&Request::default()).await;
                         cancelled += 1;

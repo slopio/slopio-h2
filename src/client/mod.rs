@@ -1,13 +1,18 @@
-//! HTTP/2 client. Cleartext with prior knowledge only (§3.4).
+//! HTTP/2 client: cleartext with prior knowledge (§3.4), or TLS with ALPN
+//! (§3.3). Which one is in the type: [`PlainTextClient`] or [`TlsClient`].
+//!
+//! A [`Client`] holds connections by origin and opens them as requests need
+//! them; a single connection is not something an application handles.
 //!
 //! The connection loop and every handle share state through an `Rc`, so
-//! nothing here is `Send`: a connection belongs to one thread.
+//! nothing here is `Send`: a client belongs to one thread.
 //!
 //! No request deadline is imposed; that is the application's, via
 //! [`Stream::with_deadline`].
 
 use std::cell::RefCell;
 use std::io;
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
@@ -17,6 +22,7 @@ use runtime::net::{BufRingSpec, connect_tcp};
 use runtime::runtime::time::timeout;
 
 use crate::client::shared::ClientShared;
+#[cfg(test)]
 use crate::shared::connection::settings::Settings;
 use crate::shared::transport::PlainMessages;
 #[cfg(feature = "tls")]
@@ -24,12 +30,20 @@ use crate::shared::transport::{ALPN_H2, KtlsTransport};
 
 mod connection;
 mod lifecycle;
+pub(crate) mod pool;
 mod shared;
 mod stream;
 
-pub use connection::Connection;
+pub use crate::shared::connection::output::ATTACH_MIN;
+pub use crate::shared::transport::{PlainText, Security, Tls};
+use connection::Driver;
+pub use pool::{
+    Client, ClientError, MAX_CONNECTIONS_PER_ORIGIN, Origin, PlainTextClient, TlsClient,
+};
+/// Re-exported: what [`Client::with_dns`] takes.
+pub use popple_dns::DnsClient;
 pub use shared::Unavailable;
-pub use stream::Stream;
+pub use stream::{Body, Stream};
 
 /// Our `SETTINGS_INITIAL_WINDOW_SIZE`. Credit goes back only for bytes the
 /// application has read, so this bounds how much one response can pile up
@@ -41,8 +55,8 @@ pub const STREAM_RECV_WINDOW: u32 = 1024 * 1024;
 /// bounded by the requests the application chose to make.
 pub const CONNECTION_RECV_WINDOW: u32 = i32::MAX as u32;
 
-/// One bound over the whole of [`connect`]. Without it the handshake is
-/// unbounded: a peer that accepts and then sends nothing, or a non-HTTP/2
+/// One bound over opening a connection, TCP, TLS and HTTP/2 handshakes
+/// together. Without it the handshake is unbounded: a peer that accepts and then sends nothing, or a non-HTTP/2
 /// listener, would hang us for ever.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -60,70 +74,93 @@ pub const IDLE_PING_TICKS: u32 = 12;
 /// on. Only one probe is outstanding at a time, so this is the full budget.
 pub const PING_TIMEOUT_TICKS: u32 = 4;
 
+/// One connection. `S` is the transport it runs over, fixed by what made it.
+///
 /// Dropping it does not close the connection while streams are still running;
 /// the last handle of any kind going away ends it with a GOAWAY (§6.8).
-pub struct Client {
+pub(crate) struct Connection<S: Security> {
     shared: Rc<ClientShared>,
     /// Owned rather than detached so the connection's end is observable.
     /// Dropping the handle detaches the task rather than killing it. `None`
     /// only in tests.
     task: RefCell<Option<Handle<io::Result<()>>>>,
+    security: PhantomData<S>,
 }
 
-impl Client {
+impl<S: Security> Connection<S> {
+    /// `shared` must have been made with `S::scheme()`.
     pub(crate) fn new(shared: Rc<ClientShared>, task: Option<Handle<io::Result<()>>>) -> Self {
+        debug_assert_eq!(*shared.scheme(), S::scheme());
         Self {
             shared,
             task: RefCell::new(task),
+            security: PhantomData,
         }
     }
 
-    pub fn peer_settings(&self) -> Settings {
+    #[cfg(test)]
+    pub(crate) fn peer_settings(&self) -> Settings {
         self.shared.peer_settings()
     }
 
-    pub fn send_request(
+    #[cfg(test)]
+    pub(crate) fn send_request(
         &self,
         request: &http::Request<()>,
         end_stream: bool,
     ) -> Result<Stream, Unavailable> {
-        self.shared.send_request(request, end_stream)
+        self.open(request, end_stream, false)
     }
 
-    pub fn is_closed(&self) -> bool {
+    /// `grpc`: a gRPC call, whose response is gathered message by message
+    /// rather than as bytes.
+    pub(crate) fn open(
+        &self,
+        request: &http::Request<()>,
+        end_stream: bool,
+        grpc: bool,
+    ) -> Result<Stream, Unavailable> {
+        self.shared.send_request(request, end_stream, grpc)
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
         self.shared.is_closing()
     }
 
     /// Graceful shutdown (§6.8): nothing in flight is cancelled.
-    pub fn close(&self) {
+    pub(crate) fn close(&self) {
         self.shared.stop_opening();
         // The loop is parked on the socket, which will not tell it this.
         self.shared.core.wake_flusher();
     }
 
-    /// Waits; does not close. Without [`Client::close`] first this waits for
-    /// the peer to go. The end is handed over once; a second call errors.
-    pub async fn closed(&self) -> io::Result<()> {
+    /// Waits; does not close. Without [`Connection::close`] first this waits
+    /// for the peer to go. The end is handed over once; a second call errors.
+    /// Holds no borrow of the handle, so a client can wait on all of its
+    /// connections at once.
+    pub(crate) fn closed(&self) -> impl Future<Output = io::Result<()>> + use<S> {
         let task = self.task.borrow_mut().take();
-        match task {
-            Some(task) => task.await,
-            None => Err(io::Error::other(
-                "this client does not own the connection loop",
-            )),
+        async move {
+            match task {
+                Some(task) => task.await,
+                None => Err(io::Error::other(
+                    "this handle does not own the connection loop",
+                )),
+            }
         }
     }
 
     /// Against the peer's `max_concurrent_streams` (§5.1.2).
-    pub fn live_streams(&self) -> usize {
+    pub(crate) fn live_streams(&self) -> usize {
         self.shared.streams.len()
     }
 
-    pub fn index_request_paths(&self, repeated: bool) {
+    pub(crate) fn index_request_paths(&self, repeated: bool) {
         self.shared.core.index_request_paths(repeated);
     }
 }
 
-impl Drop for Client {
+impl<S: Security> Drop for Connection<S> {
     /// The parked loop cannot see a handle go away; waking it lets it notice
     /// it may be the last thing holding the connection.
     fn drop(&mut self) {
@@ -133,7 +170,9 @@ impl Drop for Client {
 
 /// Returns only once both ends have exchanged and acknowledged SETTINGS, so
 /// the peer's limits are known before the first request.
-pub async fn connect<U: BufRingSpec + 'static>(addr: SocketAddr) -> io::Result<Client> {
+pub(crate) async fn connect<U: BufRingSpec + 'static>(
+    addr: SocketAddr,
+) -> io::Result<Connection<PlainText>> {
     let connection = match timeout(CONNECT_TIMEOUT, establish::<U>(addr)).await {
         Ok(connection) => connection?,
         // Dropping the attempt cancels it: `ConnectTcp::drop` cancels the op
@@ -154,11 +193,11 @@ pub async fn connect<U: BufRingSpec + 'static>(addr: SocketAddr) -> io::Result<C
 /// host, not the address. §3.3: a server that does not agree to `h2` via ALPN
 /// is refused.
 #[cfg(feature = "tls")]
-pub async fn connect_tls<U: BufRingSpec + 'static>(
+pub(crate) async fn connect_tls<U: BufRingSpec + 'static>(
     addr: SocketAddr,
     server_name: popple_tls::ServerName<'static>,
     config: popple_tls::ClientConfig,
-) -> io::Result<Client> {
+) -> io::Result<Connection<Tls>> {
     if !popple_tls::ktls_available() {
         return Err(io::Error::other(
             "this kernel has no kTLS: `modprobe tls`, or build without the tls feature",
@@ -177,7 +216,7 @@ pub async fn connect_tls<U: BufRingSpec + 'static>(
                 "the server did not agree to h2 (§3.3: ALPN is not optional over TLS)",
             ));
         }
-        Connection::handshake(transport).await
+        Driver::handshake(transport).await
     })
     .await;
 
@@ -192,7 +231,7 @@ pub async fn connect_tls<U: BufRingSpec + 'static>(
 
 async fn establish<U: BufRingSpec + 'static>(
     addr: SocketAddr,
-) -> io::Result<Connection<PlainMessages<U, false>>> {
+) -> io::Result<Driver<PlainMessages<U, false>>> {
     let socket = connect_tcp(addr).await?;
-    Connection::handshake(PlainMessages::new(socket)).await
+    Driver::handshake(PlainMessages::new(socket)).await
 }

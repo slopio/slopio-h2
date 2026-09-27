@@ -274,19 +274,21 @@ impl FrameHandler for Protocol {
 
         let received = state.recv_data(payload, end);
 
-        // Padding (and a dropped frame) never reaches the application, so its
-        // credit must go back now or the window shrinks for good and stalls.
+        // Padding (and a dropped frame) never reaches the application, nor
+        // does what was consumed on landing, so their credit must go back now
+        // or the window shrinks for good and stalls.
         let padding = padded_len - payload.len() as u32;
-        self.shared.core.release_stream_credit(match received {
-            Ok(()) => padding,
+        let released = match received {
+            Ok(consumed) => padding + consumed,
             Err(_) => padded_len,
-        });
+        };
+        self.shared.core.release_stream_credit(released);
 
         // Likewise for the stream's window, except on a stream just finished.
         if received.is_ok()
             && !end
-            && padding > 0
-            && let Some(increment) = state.release_recv(padding)
+            && released > 0
+            && let Some(increment) = state.release_recv(released)
         {
             self.shared
                 .core
@@ -295,8 +297,8 @@ impl FrameHandler for Protocol {
 
         match received {
             Err(violation) => self.fail_stream(stream_id, violation),
-            Ok(()) if end => self.shared.retire_if_closed(raw),
-            Ok(()) => {}
+            Ok(_) if end => self.shared.retire_if_closed(raw),
+            Ok(_) => {}
         }
     }
 

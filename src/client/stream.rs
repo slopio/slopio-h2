@@ -1,23 +1,25 @@
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::io;
 use std::pin::pin;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 use std::time::{Duration, SystemTime};
 
+use bytes::Bytes;
 use http::HeaderMap;
 use runtime::runtime::time::timeout;
 
 use crate::client::STREAM_RECV_WINDOW;
 use crate::client::lifecycle::{Inbound, Lifecycle, Outbound};
 use crate::client::shared::ClientShared;
+#[cfg(feature = "grpc")]
+use crate::grpc::{GrpcError, GrpcFormat, GrpcFrame, GrpcInput, Status};
 use crate::shared::codec::frames::{
     encode::encode_window_update, headers::content_length, stream_id::StreamId,
 };
 use crate::shared::codec::types::{CANCEL, StreamViolation};
 use crate::shared::connection::{
-    MAX_SLEEP, SendSide, settings::Settings, stream_window::StreamWindow,
+    MAX_SLEEP, SendSide, input_data::InputData, settings::Settings, stream_window::StreamWindow,
 };
 
 /// A value rather than an `io::Error`: set from the connection loop, where an
@@ -44,6 +46,15 @@ impl Failure {
     }
 }
 
+/// What a response's body is gathered into, chosen by its head.
+enum Input {
+    Bytes(InputData),
+    /// A gRPC call's messages, gathered straight from the frames that carry
+    /// them, each decoded from the buffer it was gathered in.
+    #[cfg(feature = "grpc")]
+    Messages(GrpcInput),
+}
+
 pub(crate) struct StreamState {
     id: StreamId,
     window: StreamWindow,
@@ -51,13 +62,23 @@ pub(crate) struct StreamState {
     /// Emptied by the handle, so it says nothing about whether a head came:
     /// that is `lifecycle`'s.
     response: RefCell<Option<http::Response<()>>>,
-    /// Bounded by the receive window: no credit goes back until the
-    /// application takes a chunk.
-    chunks: RefCell<VecDeque<Vec<u8>>>,
+    /// Made with the head. Bytes: gathered whole when its `content-length`
+    /// is small, drained as they arrive otherwise, as the server does with a
+    /// request's; no credit goes back until the application takes them.
+    /// Messages, for a gRPC call: credited as they land, unless a whole one
+    /// is waiting to be taken. `None` before the head, and once a whole body
+    /// is taken.
+    input: RefCell<Option<Input>>,
+    /// Body bytes landed so far: `InputData` judges each push against the
+    /// declared length by it.
+    landed: Cell<u64>,
     trailers: RefCell<Option<HeaderMap>>,
     /// RFC 9110 §9.3.2: a HEAD response's `content-length` is not a promise
     /// about this stream.
     head_request: bool,
+    /// A gRPC call, whose response a `Call` reads message by message.
+    #[cfg_attr(not(feature = "grpc"), allow(dead_code))]
+    grpc: bool,
     /// Received bytes still holding flow-control credit.
     unreleased: Cell<u32>,
     sent: Cell<u64>,
@@ -74,15 +95,18 @@ impl StreamState {
         settings: &Settings,
         end_stream: bool,
         head_request: bool,
+        grpc: bool,
     ) -> Self {
         Self {
             id,
             window: StreamWindow::new(settings, STREAM_RECV_WINDOW),
             lifecycle: Cell::new(Lifecycle::new(end_stream)),
             response: RefCell::new(None),
-            chunks: RefCell::new(VecDeque::new()),
+            input: RefCell::new(None),
+            landed: Cell::new(0),
             trailers: RefCell::new(None),
             head_request,
+            grpc,
             unreleased: Cell::new(0),
             sent: Cell::new(0),
             recv_waker: RefCell::new(None),
@@ -145,15 +169,49 @@ impl StreamState {
             .inbound()
             .on_head(declared.filter(|_| !bodiless), end_stream)?;
 
+        // A body known to be empty is a whole one, of nothing.
+        let body = match bodiless || end_stream {
+            true => Some(0),
+            false => declared,
+        };
+        let input = self
+            .messages(&response, end_stream)
+            .unwrap_or_else(|| Input::Bytes(InputData::new(body)));
+        *self.input.borrow_mut() = Some(input);
         *self.response.borrow_mut() = Some(response);
         self.set_inbound(inbound);
         self.wake_recv();
         Ok(())
     }
 
+    /// As a `Call` reads the head: a status in it (Trailers-Only, §9.1), a
+    /// failed HTTP status or no gRPC content-type means no messages.
+    #[cfg(feature = "grpc")]
+    fn messages(&self, response: &http::Response<()>, end_stream: bool) -> Option<Input> {
+        let fields = response.headers();
+        if !self.grpc
+            || end_stream
+            || !response.status().is_success()
+            || Status::of(fields).is_some()
+        {
+            return None;
+        }
+        GrpcFormat::of_response(fields)
+            .map(|format| Input::Messages(GrpcInput::new(format, fields)))
+    }
+
+    #[cfg(not(feature = "grpc"))]
+    fn messages(&self, _: &http::Response<()>, _: bool) -> Option<Input> {
+        None
+    }
+
     /// §8.1.
     pub(crate) fn recv_trailers(&self, fields: HeaderMap) -> Result<(), StreamViolation> {
         let inbound = self.inbound().on_trailers()?;
+        #[cfg(feature = "grpc")]
+        if let Some(Input::Messages(input)) = self.input.borrow_mut().as_mut() {
+            input.end();
+        }
         *self.trailers.borrow_mut() = Some(fields);
         self.set_inbound(inbound);
         self.wake_recv();
@@ -168,23 +226,56 @@ impl StreamState {
         self.inbound().is_ended()
     }
 
-    /// The payload is copied: the decoder's buffer is owed back to the ring
-    /// the moment this returns. Judged before anything is kept.
+    /// The payload is copied, once, into what gathers it: the decoder's
+    /// buffer is owed back to the ring the moment this returns. Judged before
+    /// anything is kept. A body gathered whole wakes its reader once, when it
+    /// is complete.
+    ///
+    /// `Ok(n)`: how much was consumed on the spot and owes the peer its credit
+    /// back now, which is the caller's to give.
     pub(crate) fn recv_data(
         &self,
         payload: &[u8],
         end_stream: bool,
-    ) -> Result<(), StreamViolation> {
+    ) -> Result<u32, StreamViolation> {
         let inbound = self.inbound().on_data(payload.len() as u64, end_stream)?;
-        if !payload.is_empty() {
-            self.chunks.borrow_mut().push_back(payload.to_vec());
-            // Bounded by the receive window, so it cannot outgrow a u32.
-            self.unreleased
-                .set(self.unreleased.get() + payload.len() as u32);
-        }
+        let mut input = self.input.borrow_mut();
+        // `on_data` refuses DATA before the head, which is what makes it.
+        let input = input.as_mut().ok_or(StreamViolation::MalformedResponse)?;
+        let len = payload.len() as u32;
+
+        let (wake, consumed) = match input {
+            Input::Bytes(input) => {
+                if !payload.is_empty() {
+                    // Past what `on_data` checked only for a body known to be
+                    // empty whatever its `content-length` said, as a HEAD's.
+                    input
+                        .push(self.landed.get(), payload)
+                        .map_err(|_| StreamViolation::ContentLengthMismatch)?;
+                    self.landed.set(self.landed.get() + payload.len() as u64);
+                }
+                (end_stream || input.wakes_per_frame(), 0)
+            }
+            #[cfg(feature = "grpc")]
+            Input::Messages(input) => {
+                let wake = input.push(payload);
+                if end_stream {
+                    input.end();
+                }
+                // While a whole message waits, the call is behind, and these
+                // bytes keep their credit until it takes one.
+                let consumed = if input.has_ready() { 0 } else { len };
+                (wake || end_stream, consumed)
+            }
+        };
+
+        // Bounded by the receive window, so it cannot outgrow a u32.
+        self.unreleased.set(self.unreleased.get() + len - consumed);
         self.set_inbound(inbound);
-        self.wake_recv();
-        Ok(())
+        if wake {
+            self.wake_recv();
+        }
+        Ok(consumed)
     }
 
     /// §6.9.1. Split from `recv_data` because an overrun here is a connection
@@ -275,6 +366,34 @@ impl SendSide for StreamState {
     }
 }
 
+/// A body gathered whole, taken out of its slot.
+fn take_whole(input: &mut Option<Input>) -> Option<Box<[u8]>> {
+    match input.take() {
+        Some(Input::Bytes(gathered)) => gathered.into_oneshot(),
+        #[cfg(feature = "grpc")]
+        Some(Input::Messages(messages)) => {
+            *input = Some(Input::Messages(messages));
+            None
+        }
+        None => None,
+    }
+}
+
+#[cfg(feature = "grpc")]
+fn read_as_messages() -> io::Error {
+    io::Error::other("a gRPC call's response is read message by message")
+}
+
+/// What [`Stream::body`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Body {
+    /// The whole body, whose length the response declared and small enough
+    /// to be gathered: one allocation, moved out.
+    Complete(Box<[u8]>),
+    /// Any other body: [`Stream::read`] takes it as it arrives.
+    Streaming,
+}
+
 /// Dropping it closes the stream, with a RST_STREAM if the exchange was not
 /// finished (§8.1).
 pub struct Stream {
@@ -311,15 +430,44 @@ impl Stream {
         self.within(self.write_body(data, end_stream)).await
     }
 
+    /// As [`Stream::write`], for a buffer handed over rather than lent: from
+    /// [`ATTACH_MIN`](crate::client::ATTACH_MIN) bytes up it is sent as it
+    /// is, never copied into the connection's output.
+    /// `Vec<u8>`, `Box<[u8]>`, `Bytes` and `&'static [u8]` all become one
+    /// without a copy.
+    pub async fn write_owned(&self, data: impl Into<Bytes>, end_stream: bool) -> io::Result<()> {
+        let data = data.into();
+        self.within(self.write_owned_body(data, end_stream)).await
+    }
+
     async fn write_body(&self, data: &[u8], end_stream: bool) -> io::Result<()> {
         self.writable()?;
+        self.drive_write(
+            self.shared
+                .core
+                .write_data(self.id, &*self.state, data, end_stream),
+            end_stream,
+        )
+        .await
+    }
 
-        let mut writing = pin!(self.shared.core.write_data(
-            self.id,
-            &*self.state,
-            data,
-            end_stream
-        ));
+    async fn write_owned_body(&self, data: Bytes, end_stream: bool) -> io::Result<()> {
+        self.writable()?;
+        self.drive_write(
+            self.shared
+                .core
+                .write_data_owned(self.id, &*self.state, data, end_stream),
+            end_stream,
+        )
+        .await
+    }
+
+    async fn drive_write(
+        &self,
+        writing: impl Future<Output = ()>,
+        end_stream: bool,
+    ) -> io::Result<()> {
+        let mut writing = pin!(writing);
         // A stream reset while the write is parked on flow control is credited
         // by nothing, so the failure must be checked beside it; `fail` wakes
         // the send waker the write registered.
@@ -362,19 +510,84 @@ impl Stream {
         .await
     }
 
-    /// Taking a chunk is what returns its credit (§6.9.1), so nothing is
-    /// buffered beyond one receive window. Whatever arrived is delivered
-    /// before any failure is reported.
+    /// The body whole, if the response declared a length of at most
+    /// [`InputData::ONESHOT_LIMIT`]: gathered in one allocation as it arrived,
+    /// and handed over when complete. Otherwise [`Body::Streaming`], as soon
+    /// as the head is in: the body is then [`Stream::read`]'s.
+    pub async fn body(&self) -> io::Result<Body> {
+        self.within(self.whole_body()).await
+    }
+
+    async fn whole_body(&self) -> io::Result<Body> {
+        let body = std::future::poll_fn(|cx| {
+            let inbound = self.state.inbound();
+            if let Inbound::Failed(failure) = inbound {
+                return Poll::Ready(Err(failure.error()));
+            }
+            let mut input = self.state.input.borrow_mut();
+            let gathered = match input.as_ref() {
+                Some(Input::Bytes(gathered)) => gathered,
+                #[cfg(feature = "grpc")]
+                Some(Input::Messages(_)) => return Poll::Ready(Err(read_as_messages())),
+                None => {
+                    return match inbound {
+                        Inbound::AwaitingHead => {
+                            self.state.register_recv_waker(cx.waker());
+                            Poll::Pending
+                        }
+                        _ => Poll::Ready(Err(io::Error::other("the body was already taken"))),
+                    };
+                }
+            };
+            if gathered.wakes_per_frame() {
+                return Poll::Ready(Ok(Body::Streaming));
+            }
+            if inbound != Inbound::Ended {
+                self.state.register_recv_waker(cx.waker());
+                return Poll::Pending;
+            }
+            let whole = take_whole(&mut input);
+            Poll::Ready(Ok(Body::Complete(whole.unwrap_or_default())))
+        })
+        .await?;
+
+        if let Body::Complete(bytes) = &body {
+            self.release(bytes.len() as u32);
+        }
+        Ok(body)
+    }
+
+    /// Whatever has arrived since the last read, in one piece: its bytes
+    /// moved out, not copied. A body gathered whole comes in one read, once
+    /// complete. Taking bytes is what returns their credit (§6.9.1), so
+    /// nothing is buffered beyond one receive window. Whatever arrived is
+    /// delivered before any failure is reported.
     pub async fn read(&self) -> io::Result<Option<Vec<u8>>> {
         self.within(self.next_chunk()).await
     }
 
     async fn next_chunk(&self) -> io::Result<Option<Vec<u8>>> {
         let chunk = std::future::poll_fn(|cx| {
-            if let Some(chunk) = self.state.chunks.borrow_mut().pop_front() {
-                return Poll::Ready(Ok(Some(chunk)));
+            let inbound = self.state.inbound();
+            let mut input = self.state.input.borrow_mut();
+            match input.as_mut() {
+                Some(Input::Bytes(gathered)) if gathered.wakes_per_frame() => {
+                    let chunk = gathered.take_available();
+                    if !chunk.is_empty() {
+                        return Poll::Ready(Ok(Some(chunk)));
+                    }
+                }
+                Some(Input::Bytes(_)) if inbound == Inbound::Ended => {
+                    let whole = take_whole(&mut input);
+                    if let Some(whole) = whole.filter(|whole| !whole.is_empty()) {
+                        return Poll::Ready(Ok(Some(whole.into_vec())));
+                    }
+                }
+                #[cfg(feature = "grpc")]
+                Some(Input::Messages(_)) => return Poll::Ready(Err(read_as_messages())),
+                Some(Input::Bytes(_)) | None => {}
             }
-            match self.state.inbound() {
+            match inbound {
                 Inbound::Failed(failure) => Poll::Ready(Err(failure.error())),
                 Inbound::Ended => Poll::Ready(Ok(None)),
                 Inbound::AwaitingHead | Inbound::Body(_) => {
@@ -389,6 +602,94 @@ impl Stream {
             self.release(chunk.len() as u32);
         }
         Ok(chunk)
+    }
+
+    /// The next whole message of a gRPC call, decoded from nothing but the
+    /// buffer it was gathered in. `None` once the response ends, or at once
+    /// if it carries no messages. Messages that arrived are delivered before
+    /// a failure is reported.
+    #[cfg(feature = "grpc")]
+    pub(crate) async fn message(&self) -> io::Result<Option<Result<GrpcFrame, GrpcError>>> {
+        self.within(self.next_message()).await
+    }
+
+    #[cfg(feature = "grpc")]
+    async fn next_message(&self) -> io::Result<Option<Result<GrpcFrame, GrpcError>>> {
+        let (taken, drained) = std::future::poll_fn(|cx| {
+            let inbound = self.state.inbound();
+            match self.state.input.borrow_mut().as_mut() {
+                Some(Input::Messages(input)) => {
+                    if let Some(taken) = input.take() {
+                        return Poll::Ready(Ok((Some(taken), !input.has_ready())));
+                    }
+                }
+                Some(Input::Bytes(_)) => return Poll::Ready(Ok((None, false))),
+                None => {}
+            }
+            match inbound {
+                Inbound::Failed(failure) => Poll::Ready(Err(failure.error())),
+                Inbound::Ended => Poll::Ready(Ok((None, false))),
+                Inbound::AwaitingHead | Inbound::Body(_) => {
+                    self.state.register_recv_waker(cx.waker());
+                    Poll::Pending
+                }
+            }
+        })
+        .await?;
+
+        // Only once none waits: while one does, the call is still behind, and
+        // the window is what holds the peer back. Released per message
+        // instead, it would let the queue grow by one each time.
+        if drained && let Some(Ok(_)) = &taken {
+            self.release_held();
+        }
+        Ok(taken)
+    }
+
+    /// At once rather than accumulated: the peer was made to wait on exactly
+    /// the bytes the waiting messages held.
+    #[cfg(feature = "grpc")]
+    fn release_held(&self) {
+        let held = self.state.release(u32::MAX);
+        if held == 0 {
+            return;
+        }
+        if let Some(increment) = self.state.window.release_recv_now(held) {
+            self.shared
+                .core
+                .write_frame(|out| encode_window_update(out, self.id, increment));
+        }
+        self.shared.core.release_stream_credit(held);
+    }
+
+    /// A gRPC message, encoded straight into the connection's output when it
+    /// can all go at once; framed apart otherwise, and then sent from its own
+    /// buffer rather than copied in, if large enough.
+    #[cfg(feature = "grpc")]
+    pub(crate) async fn write_message<M: prost::Message>(
+        &self,
+        message: &M,
+        end_stream: bool,
+    ) -> io::Result<()> {
+        self.writable()?;
+        let len = message.encoded_len();
+        let in_place = self.shared.core.try_write_data_in_place(
+            self.id,
+            &*self.state,
+            crate::grpc::PREFIX_LEN + len,
+            end_stream,
+            |out| crate::grpc::put_message(out, message, len),
+        );
+        if !in_place {
+            return self
+                .write_owned(crate::grpc::frame_message(message), end_stream)
+                .await;
+        }
+        if end_stream {
+            self.state.end_output();
+            self.shared.retire_if_closed(self.id.into());
+        }
+        Ok(())
     }
 
     /// §8.1.

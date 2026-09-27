@@ -13,6 +13,8 @@ pub use frame::{
     MessageError, UncompressedGrpcFrame,
 };
 pub use encode::frame_message;
+pub(crate) use encode::put_message;
+pub(crate) use prefix::PREFIX_LEN;
 pub use input::{GrpcError, GrpcInput};
 pub use request::GrpcFormat;
 pub use call::{GrpcCall, service};

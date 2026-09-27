@@ -8,18 +8,14 @@ use http::StatusCode;
 use crate::grpc::{GrpcError, GrpcFormat, GrpcFrame, GrpcInput};
 use crate::server::connection::shared_with_streams::StreamToken;
 use crate::shared::codec::frames::stream_id::StreamId;
-use crate::{
-    server::stream::input_data::InputData,
-    shared::{
-        codec::{
-            frames::headers::{Headers, content_length},
-            types::StreamViolation,
-        },
-        connection::{settings::Settings, stream_window::StreamWindow},
+use crate::shared::{
+    codec::{
+        frames::headers::{Headers, content_length},
+        types::StreamViolation,
     },
+    connection::{input_data::InputData, settings::Settings, stream_window::StreamWindow},
 };
 
-mod input_data;
 mod lifecycle;
 
 pub(crate) use lifecycle::{Farewell, Lifecycle};
@@ -503,6 +499,12 @@ impl StreamState {
         })
     }
 
+    /// Whether a whole message is still waiting to be taken.
+    #[cfg(feature = "grpc")]
+    pub fn message_waiting(&self) -> bool {
+        matches!(&*self.input.borrow(), Input::Grpc(input) if input.has_ready())
+    }
+
     /// At once rather than accumulated, unlike [`release_recv`]: the peer was
     /// made to wait on exactly this.
     ///
@@ -594,14 +596,17 @@ impl Stream {
     }
 
     /// Only while a whole message is waiting here do the bytes after it keep
-    /// their credit, and taking a message is what lets go of it.
+    /// their credit, and taking the last one waiting is what lets go of it.
     #[cfg(feature = "grpc")]
     pub async fn message(&self) -> Option<Result<GrpcFrame, GrpcError>> {
         let taken = self.state().message().await;
         // Once input has ended, held connection credit goes back when the
-        // stream retires.
+        // stream retires. While another message waits, the handler is still
+        // behind and the window is what holds the peer back: released per
+        // message instead, the queue could grow by one each time.
         if let Some(Ok(_)) = &taken
             && !self.state().input_ended()
+            && !self.state().message_waiting()
         {
             self.token.shared().release_held(self.id(), self.state());
         }
@@ -643,10 +648,30 @@ impl Stream {
     }
 
     /// No `_final`: a gRPC response always ends with its trailers, never with
-    /// END_STREAM on DATA.
+    /// END_STREAM on DATA. Encoded straight into the output when it can all
+    /// go at once; framed apart otherwise, and then sent from its own buffer
+    /// rather than copied in, if large enough.
     #[cfg(feature = "grpc")]
     pub async fn write_message<M: prost::Message>(&self, message: &M) {
-        self.write_data(&crate::grpc::frame_message(message)).await;
+        let len = message.encoded_len();
+        let in_place = self.token.shared().try_write_data_in_place(
+            self.id(),
+            self.state(),
+            crate::grpc::PREFIX_LEN + len,
+            false,
+            |out| crate::grpc::put_message(out, message, len),
+        );
+        if !in_place {
+            self.token
+                .shared()
+                .write_data_owned(
+                    self.id(),
+                    self.state(),
+                    crate::grpc::frame_message(message).into(),
+                    false,
+                )
+                .await;
+        }
     }
 
     pub async fn write_data_final(self, data: &[u8]) {

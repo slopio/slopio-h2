@@ -409,6 +409,45 @@ fn a_call_inside_its_deadline_keeps_its_own_status() {
     );
 }
 
+/// Two whole messages in one frame, and the handler takes only the first:
+/// the second still waits, so nothing held goes back yet.
+#[test]
+fn a_waiting_message_keeps_the_credit_held() {
+    let mut both = framed(
+        &HealthCheckRequest {
+            service: "a".repeat(30),
+        }
+        .encode_to_vec(),
+    );
+    both.extend_from_slice(&framed(
+        &HealthCheckRequest {
+            service: "b".repeat(30),
+        }
+        .encode_to_vec(),
+    ));
+    let mut opening = opening();
+    opening.extend_from_slice(&frame(DATA, 0, 1, &both));
+
+    let written = run_connection_with(
+        vec![
+            ReadEvent::Data(opening).into(),
+            ReadEvent::Eof.after(Duration::from_secs(1)),
+        ],
+        |_, _| {},
+        |stream: Stream| async move {
+            stream.message().await.expect("one").expect("a request");
+            stream.write_headers_final(http::StatusCode::OK, &http::HeaderMap::new());
+        },
+    );
+
+    assert!(
+        !written
+            .iter()
+            .any(|f| f.kind == WINDOW_UPDATE && f.stream_id == 1),
+        "the second still waits"
+    );
+}
+
 /// A peer still sending is credited for every message taken, at once: hold
 /// it back and a large message behind a small one never completes.
 #[test]

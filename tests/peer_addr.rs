@@ -45,28 +45,28 @@ fn a_handler_sees_the_address_its_peer_connected_from() {
 
     let client = thread::spawn(move || {
         main_thread_with::<ClientRing, _>(async move {
-            let addr = format!("127.0.0.1:{port}").parse().unwrap();
+            let uri: http::Uri = format!("http://127.0.0.1:{port}/").parse().unwrap();
+            let client = client::PlainTextClient::plaintext::<ClientRing>();
 
             // The server binds inside its own task, so the first attempts may
             // land before the listener does.
-            let mut client = None;
+            let mut up = false;
             for _ in 0..50 {
-                match client::connect::<ClientRing>(addr).await {
-                    Ok(c) => {
-                        client = Some(c);
-                        break;
-                    }
-                    Err(_) => Sleep::during(Duration::from_millis(20)).await,
+                if client.preconnect(&uri).await.is_ok() {
+                    up = true;
+                    break;
                 }
+                Sleep::during(Duration::from_millis(20)).await;
             }
-            let Some(client) = client else {
+            if !up {
                 return done_tx.send(Err("never connected".into())).unwrap();
-            };
+            }
 
-            let request = http::Request::get("http://localhost/").body(()).unwrap();
+            let request = http::Request::get(uri).body(()).unwrap();
             let outcome = async {
                 let stream = client
                     .send_request(&request, true)
+                    .await
                     .map_err(|e| e.to_string())?;
                 stream.response().await.map_err(|e| e.to_string())?;
                 let mut body = Vec::new();

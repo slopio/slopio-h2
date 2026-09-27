@@ -43,6 +43,7 @@ http = "1"
 prost = { version = "0.14", default-features = false, features = [
     "std",
 ], optional = true }
+popple-dns = { git = "ssh://git@github.com/saucisoupe/popple-dns.git" }
 popple-tls = { git = "ssh://git@github.com/saucisoupe/popple-tls.git", optional = true }
 runtime = { git = "ssh://git@github.com/saucisoupe/runtime.git", version = "0.1.0" }
 runtime-streams = { git = "ssh://git@github.com/saucisoupe/runtime.git" }

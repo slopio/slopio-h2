@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use http::HeaderName;
+use http::uri::Scheme;
 
 use crate::client::stream::{Failure, Stream, StreamState};
 use crate::shared::codec::frames::{encode::encode_rst_stream, stream_id::StreamId};
@@ -46,10 +47,13 @@ pub(crate) struct ClientShared {
     peer_settings: RefCell<Settings>,
     /// Set once this connection can take no more streams.
     closing: Cell<bool>,
+    /// `https` over TLS, `http` otherwise: what the transport carries, not
+    /// what a request asks for.
+    scheme: Scheme,
 }
 
 impl ClientShared {
-    pub(crate) fn new(recv_window: u32) -> Self {
+    pub(crate) fn new(recv_window: u32, scheme: Scheme) -> Self {
         // §6.5.2 defaults until the peer's SETTINGS arrives.
         let peer_settings = Settings::default();
         Self {
@@ -63,7 +67,12 @@ impl ClientShared {
             next_stream_id: Cell::new(FIRST_CLIENT_STREAM),
             peer_settings: RefCell::new(peer_settings),
             closing: Cell::new(false),
+            scheme,
         }
+    }
+
+    pub(crate) fn scheme(&self) -> &Scheme {
+        &self.scheme
     }
 
     /// A copy: the borrow must not escape across an `await`, where the loop
@@ -99,10 +108,13 @@ impl ClientShared {
         self.closing.set(true);
     }
 
+    /// `grpc`: the stream is a gRPC call, whose response a `Call` reads
+    /// message by message; any other is read as bytes, whatever it carries.
     pub(crate) fn send_request(
         self: &Rc<Self>,
         request: &http::Request<()>,
         end_stream: bool,
+        grpc: bool,
     ) -> Result<Stream, Unavailable> {
         if self.closing.get() {
             return Err(Unavailable::Closed);
@@ -127,11 +139,11 @@ impl ClientShared {
         let id = StreamId::from(raw);
 
         let head = request.method() == http::Method::HEAD;
-        let state = Rc::new(StreamState::new(id, &settings, end_stream, head));
+        let state = Rc::new(StreamState::new(id, &settings, end_stream, head, grpc));
         self.streams.insert(raw, Rc::clone(&state), ());
 
         self.core
-            .write_headers(id, request_headers(request), end_stream);
+            .write_headers(id, request_headers(request, &self.scheme), end_stream);
 
         Ok(Stream::new(id, state, Rc::clone(self)))
     }
@@ -215,14 +227,16 @@ impl ClientShared {
     }
 }
 
-/// §8.3: every pseudo-header must come before every ordinary field.
-fn request_headers(
-    request: &http::Request<()>,
-) -> impl Iterator<Item = Header<Option<HeaderName>>> + '_ {
+/// §8.3: every pseudo-header must come before every ordinary field. A URI
+/// with no scheme (a bare path, as gRPC's) takes the connection's.
+fn request_headers<'r>(
+    request: &'r http::Request<()>,
+    scheme: &Scheme,
+) -> impl Iterator<Item = Header<Option<HeaderName>>> + use<'r> {
     let uri = request.uri();
     let pseudo = [
         Header::Method(request.method().clone()),
-        Header::Scheme(BytesStr::from(uri.scheme_str().unwrap_or("http"))),
+        Header::Scheme(BytesStr::from(uri.scheme_str().unwrap_or(scheme.as_str()))),
         Header::Path(BytesStr::from(
             uri.path_and_query().map_or("/", |p| p.as_str()),
         )),

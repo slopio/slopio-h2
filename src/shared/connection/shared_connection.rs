@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::task::{Poll, Waker};
 
+use bytes::Bytes;
 use http::{HeaderMap, HeaderName};
 
 use crate::shared::codec::frames::{
@@ -10,7 +11,7 @@ use crate::shared::codec::frames::{
     stream_id::StreamId,
 };
 use crate::shared::connection::STREAM_ID;
-use crate::shared::connection::output::Output;
+use crate::shared::connection::output::{ATTACH_MIN, Chunk, Output};
 use crate::shared::hpack::{Encoder, Header};
 
 /// §6.9.2: SETTINGS never moves the connection window — only a WINDOW_UPDATE
@@ -238,6 +239,144 @@ impl SharedConnection {
         self.write_headers(stream_id, headers, true);
     }
 
+    /// One DATA frame whose payload `encode` writes straight into the output:
+    /// no buffer of its own, no copy. Exactly `len` bytes, which is what is
+    /// debited and announced. Only when all of it can go now, in one frame
+    /// the stream and the connection have credit for and the open segment has
+    /// room for; `false` and nothing written otherwise, for the caller to go
+    /// through [`write_data`](Self::write_data).
+    pub fn try_write_data_in_place<S: SendSide>(
+        &self,
+        stream_id: StreamId,
+        stream: &S,
+        len: usize,
+        end_stream: bool,
+        encode: impl FnOnce(&mut Vec<u8>),
+    ) -> bool {
+        let credit = stream.available_send().min(self.window.available_send()) as usize;
+        // SAFETY: the reference dies with the expression, and `data_room`
+        // cannot re-enter.
+        let room = unsafe { (*self.output.get()).data_room() };
+        if len > credit.min(room).min(self.max_frame_size.get() as usize) {
+            return false;
+        }
+
+        stream
+            .debit_send(len as u32)
+            .expect("len is within the stream window");
+        self.window
+            .debit_send(len as u32)
+            .expect("len is within the connection window");
+        self.write_frame(|out| {
+            encode_data_header(out, stream_id, len, end_stream);
+            let before = out.len();
+            encode(out);
+            debug_assert_eq!(
+                out.len() - before,
+                len,
+                "the payload is the length announced"
+            );
+        });
+        stream.note_sent(len);
+        true
+    }
+
+    /// As [`write_data`](Self::write_data), for a buffer handed over whole:
+    /// each frame's header is written into the output and its payload is a
+    /// slice of `payload`, sent as it is, with no copy. Held to the same
+    /// credit, frame size and high-water mark, so a buffer past any of them
+    /// goes in slices, each waiting its turn.
+    ///
+    /// Judged frame by frame: one that could only carry less than
+    /// [`ATTACH_MIN`] is copied in, as the whole buffer is when it is that
+    /// small. A slice forces the next write into a fresh segment, so a peer
+    /// crediting a byte at a time must not get one per byte.
+    pub async fn write_data_owned<S: SendSide>(
+        &self,
+        stream_id: StreamId,
+        stream: &S,
+        payload: Bytes,
+        end_stream: bool,
+    ) {
+        if payload.len() < ATTACH_MIN {
+            return self
+                .write_data(stream_id, stream, &payload, end_stream)
+                .await;
+        }
+
+        let mut sent = 0usize;
+        std::future::poll_fn(move |cx| {
+            loop {
+                let remaining = payload.len() - sent;
+                let credit = stream.available_send().min(self.window.available_send()) as usize;
+                let frame = remaining
+                    .min(self.max_frame_size.get() as usize)
+                    .min(credit);
+                // SAFETY: the references die with their expressions, and
+                // neither method can re-enter.
+                let (attach_room, data_room) = unsafe {
+                    let output = &*self.output.get();
+                    (output.attach_room(), output.data_room())
+                };
+                let attached = frame.min(attach_room);
+                let quota = match attached >= ATTACH_MIN {
+                    true => attached,
+                    false => frame.min(data_room),
+                };
+
+                if quota == 0 {
+                    // As `write_data`: park on whichever of credit and room
+                    // is the empty one.
+                    if credit == 0 {
+                        stream.register_send_waker(cx.waker());
+                        self.window.wait_send(cx.waker());
+                        if self.credit_closed.get() {
+                            self.wake_flusher();
+                        }
+                    }
+                    if frame > 0 {
+                        // SAFETY: the reference dies with the expression;
+                        // cloning a waker cannot re-enter.
+                        unsafe { (*self.output.get()).wait_room(cx.waker()) }
+                    }
+                    return Poll::Pending;
+                }
+
+                let last = quota == remaining;
+                stream
+                    .debit_send(quota as u32)
+                    .expect("quota is within the stream window");
+                self.window
+                    .debit_send(quota as u32)
+                    .expect("quota is within the connection window");
+                let piece = &payload[sent..sent + quota];
+                if attached >= ATTACH_MIN {
+                    // The header first: `attach` puts the slice after
+                    // whatever was written last.
+                    self.write_frame(|out| {
+                        encode_data_header(out, stream_id, quota, end_stream && last);
+                    });
+                    let slice = payload.slice(sent..sent + quota);
+                    // SAFETY: the reference dies with the expression, and
+                    // `attach` cannot re-enter.
+                    unsafe { (*self.output.get()).attach(slice) }
+                } else {
+                    self.write_frame(|out| {
+                        encode_data_header(out, stream_id, quota, end_stream && last);
+                        out.extend_from_slice(piece);
+                    });
+                }
+                sent += quota;
+                stream.note_sent(quota);
+
+                if last {
+                    return Poll::Ready(());
+                }
+            }
+        })
+        .await
+    }
+
     /// §6.9.1: every frame is debited from both the stream's and the
     /// connection's send window.
     ///
@@ -362,13 +501,13 @@ impl SharedConnection {
 
     /// The segments are owed back to `restore_output` once sent; they stay
     /// counted against the high-water mark until then.
-    pub(crate) fn take_output(&self) -> Vec<Vec<u8>> {
+    pub(crate) fn take_output(&self) -> Vec<Chunk> {
         // SAFETY: the reference dies with the expression, and the chain is
         // handed back owned.
         unsafe { (*self.output.get()).take() }
     }
 
-    pub(crate) fn restore_output(&self, sent: Vec<Vec<u8>>) {
+    pub(crate) fn restore_output(&self, sent: Vec<Chunk>) {
         // SAFETY: the reference dies with the expression. `restore` wakes the
         // writers waiting for room, and a wake queues a task rather than
         // running one, so nothing re-enters here.
@@ -416,5 +555,174 @@ impl SharedConnection {
         // SAFETY: the reference dies with the expression, and setting a flag
         // cannot re-enter.
         unsafe { (*self.encoder.get()).index_paths(on) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::pin;
+    use std::task::Context;
+
+    use runtime::net::IoBuf;
+
+    use super::*;
+    use crate::shared::codec::types::HEADER_LEN;
+    use crate::shared::connection::output::OUTPUT_HIGH_WATER;
+
+    /// A stream with all the credit asked of it.
+    struct Unmetered;
+
+    impl SendSide for Unmetered {
+        fn available_send(&self) -> u32 {
+            u32::MAX >> 1
+        }
+
+        fn debit_send(&self, _: u32) -> Result<(), ()> {
+            Ok(())
+        }
+
+        fn register_send_waker(&self, _: &Waker) {}
+
+        fn note_sent(&self, _: usize) {}
+    }
+
+    /// A stream whose credit the test hands out.
+    struct Metered(Cell<u32>);
+
+    impl SendSide for Metered {
+        fn available_send(&self) -> u32 {
+            self.0.get()
+        }
+
+        fn debit_send(&self, len: u32) -> Result<(), ()> {
+            self.0.set(self.0.get() - len);
+            Ok(())
+        }
+
+        fn register_send_waker(&self, _: &Waker) {}
+
+        fn note_sent(&self, _: usize) {}
+    }
+
+    fn connection(credit: u32) -> SharedConnection {
+        let connection = SharedConnection::new(4096, 16_384, 65_535, None);
+        connection
+            .window
+            .credit_send(credit)
+            .expect("within 2^31-1");
+        connection
+    }
+
+    fn poll(connection: &SharedConnection, payload: &Bytes) -> Poll<()> {
+        let mut writing =
+            pin!(connection.write_data_owned(StreamId::from(1), &Unmetered, payload.clone(), true));
+        writing
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    /// The point of it: what goes to the kernel is the application's own
+    /// memory, cut into frames around it.
+    #[test]
+    fn an_owned_buffer_is_sent_from_its_own_memory() {
+        let connection = connection(1 << 20);
+        let payload = Bytes::from(vec![7; 40_000]);
+        assert!(poll(&connection, &payload).is_ready());
+
+        let chain = connection.take_output();
+        let slices: Vec<&Bytes> = chain
+            .iter()
+            .filter_map(|chunk| match chunk {
+                Chunk::Attached(bytes) => Some(bytes),
+                Chunk::Segment(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            slices.iter().map(|s| s.len()).collect::<Vec<_>>(),
+            [16_384, 16_384, 7_232],
+            "cut at max_frame_size"
+        );
+        let mut at = payload.as_ptr();
+        for slice in slices {
+            assert_eq!(slice.as_ptr(), at, "not a copy: the payload itself");
+            at = at.wrapping_add(slice.len());
+        }
+        let headers = chain.len() - 3;
+        assert_eq!(headers, 3, "a header before each slice");
+    }
+
+    #[test]
+    fn a_small_owned_buffer_is_copied_in() {
+        let connection = connection(1 << 20);
+        let payload = Bytes::from(vec![7; ATTACH_MIN - 1]);
+        assert!(poll(&connection, &payload).is_ready());
+
+        let chain = connection.take_output();
+        assert!(chain.iter().all(|chunk| matches!(chunk, Chunk::Segment(_))));
+        let total: usize = chain
+            .iter()
+            .map(|chunk| match chunk {
+                Chunk::Segment(segment) => segment.len(),
+                Chunk::Attached(_) => 0,
+            })
+            .sum();
+        assert_eq!(total, HEADER_LEN + ATTACH_MIN - 1);
+    }
+
+    /// Past the high-water mark it waits for a send, as a copied body does.
+    #[test]
+    fn a_large_owned_buffer_goes_no_further_than_the_high_water_mark() {
+        let connection = connection(1 << 24);
+        let payload = Bytes::from(vec![7; OUTPUT_HIGH_WATER * 2]);
+        let mut writing =
+            pin!(connection.write_data_owned(StreamId::from(1), &Unmetered, payload, true));
+        let mut cx = Context::from_waker(Waker::noop());
+
+        assert!(writing.as_mut().poll(&mut cx).is_pending());
+        let first = connection.take_output();
+        let queued: usize = first.iter().map(IoBuf::bytes_init).sum();
+        assert!(
+            queued <= OUTPUT_HIGH_WATER + 16 * HEADER_LEN + 16_384,
+            "bounded: {queued}"
+        );
+
+        // A send completing is what makes room.
+        connection.restore_output(first);
+        let mut rounds = 1;
+        while writing.as_mut().poll(&mut cx).is_pending() {
+            let sent = connection.take_output();
+            connection.restore_output(sent);
+            rounds += 1;
+            assert!(rounds < 10, "it moves on as sends complete");
+        }
+        assert!(rounds >= 2, "it could not all go at once");
+    }
+
+    /// A peer crediting a byte at a time gets bytes copied into one segment,
+    /// not a slice each with a fresh 16 KiB segment for its header.
+    #[test]
+    fn a_trickle_of_credit_is_copied_not_attached() {
+        let connection = connection(1 << 20);
+        let stream = Metered(Cell::new(0));
+        let mut writing = pin!(connection.write_data_owned(
+            StreamId::from(1),
+            &stream,
+            Bytes::from(vec![7; 40_000]),
+            true
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+
+        for _ in 0..100 {
+            stream.0.set(1);
+            assert!(writing.as_mut().poll(&mut cx).is_pending());
+        }
+
+        let chain = connection.take_output();
+        assert!(
+            chain.iter().all(|chunk| matches!(chunk, Chunk::Segment(_))),
+            "nothing attached"
+        );
+        assert_eq!(chain.len(), 1, "a hundred one-byte frames, one segment");
+        assert_eq!(chain[0].bytes_init(), 100 * (HEADER_LEN + 1));
     }
 }

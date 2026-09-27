@@ -5,16 +5,48 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use http::uri::Scheme;
 use runtime::io_driver::operations::sockets::multi_recv::{CompletionError, Continuation};
 use runtime::io_driver::operations::sockets::send_vectored::send_vectored_all;
 use runtime::io_driver::operations::sockets::send_vectored_zc::send_vectored_all_zc;
 use runtime::net::{BorrowedBuffer, BufRingSpec, IoBuf, MultiRecv, SocketWrapper};
 use runtime_streams::Stream;
 
+/// What a transport is, as a type: [`PlainText`] or [`Tls`]. Sealed, since the
+/// scheme a connection claims must be the one it runs.
+pub trait Security: sealed::Sealed + 'static {
+    fn scheme() -> Scheme;
+}
+
+/// `http`.
+pub enum PlainText {}
+
+/// `https`.
+pub enum Tls {}
+
+impl Security for PlainText {
+    fn scheme() -> Scheme {
+        Scheme::HTTP
+    }
+}
+
+impl Security for Tls {
+    fn scheme() -> Scheme {
+        Scheme::HTTPS
+    }
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::PlainText {}
+    impl Sealed for super::Tls {}
+}
+
 /// Chunk boundaries carry no meaning — the frame decoder reassembles across
 /// them.
 pub trait Transport: Stream<Item = Result<Self::Buf, RecvError>> + Unpin {
     type Buf: AsRef<[u8]>;
+    type Security: Security;
 
     /// The `Vec` is handed back for io_uring cancel-safety.
     ///
@@ -72,6 +104,7 @@ impl<R: BufRingSpec, const ZC: bool> Stream for PlainMessages<R, ZC> {
 /// send's future for the zero-copy one.
 impl<R: BufRingSpec> Transport for PlainMessages<R, false> {
     type Buf = BorrowedBuffer<R>;
+    type Security = PlainText;
 
     fn send<B: IoBuf>(
         &mut self,
@@ -84,6 +117,7 @@ impl<R: BufRingSpec> Transport for PlainMessages<R, false> {
 
 impl<R: BufRingSpec> Transport for PlainMessages<R, true> {
     type Buf = BorrowedBuffer<R>;
+    type Security = PlainText;
 
     fn send<B: IoBuf>(
         &mut self,
@@ -138,6 +172,7 @@ impl<R: BufRingSpec, S> Stream for KtlsTransport<R, S> {
 #[cfg(feature = "tls")]
 impl<R: BufRingSpec, S> Transport for KtlsTransport<R, S> {
     type Buf = popple_tls::Frame<R>;
+    type Security = Tls;
 
     /// `may_hold` is ignored: kTLS zero-copy only takes the runtime's
     /// registered buffers.

@@ -17,8 +17,8 @@ use http::{HeaderMap, StatusCode};
 use popple_h2::client;
 use popple_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 use popple_tls::{
-    Config, ServerName, ServerSettings as TlsServerSettings,
-    client_config_dangerous_no_verification, server_config,
+    Config, ServerSettings as TlsServerSettings, client_config_dangerous_no_verification,
+    server_config,
 };
 use rcgen::{CertificateParams, KeyPair};
 use runtime::main_thread_with;
@@ -97,31 +97,30 @@ fn a_request_and_its_response_cross_a_tls_connection() {
         main_thread_with::<ClientRing, _>(async move {
             init_provider();
             let config = client_config_dangerous_no_verification(Some(H2)).expect("client config");
-            let addr = format!("127.0.0.1:{port}").parse().unwrap();
-            let name = ServerName::try_from("localhost").unwrap();
+            // An address, not `localhost`: the client has no DNS. The
+            // certificate is not checked, so its name does not matter.
+            let uri: http::Uri = format!("https://127.0.0.1:{port}/hello").parse().unwrap();
+            let client = client::TlsClient::tls::<ClientRing>(config);
 
             // The server binds inside its own task, so the first attempts may
             // land before the listener does.
-            let mut client = None;
+            let mut up = false;
             for _ in 0..50 {
-                match client::connect_tls::<ClientRing>(addr, name.clone(), config.clone()).await {
-                    Ok(c) => {
-                        client = Some(c);
-                        break;
-                    }
-                    Err(_) => Sleep::during(Duration::from_millis(20)).await,
+                if client.preconnect(&uri).await.is_ok() {
+                    up = true;
+                    break;
                 }
+                Sleep::during(Duration::from_millis(20)).await;
             }
-            let Some(client) = client else {
+            if !up {
                 return done_tx.send(Err("never connected".into())).unwrap();
-            };
+            }
 
-            let request = http::Request::get("https://localhost/hello")
-                .body(())
-                .unwrap();
+            let request = http::Request::get(uri).body(()).unwrap();
             let outcome = async {
                 let stream = client
                     .send_request(&request, true)
+                    .await
                     .map_err(|e| e.to_string())?;
                 let response = stream.response().await.map_err(|e| e.to_string())?;
                 let mut body = Vec::new();

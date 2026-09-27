@@ -1,44 +1,81 @@
 use std::cell::{Cell, RefCell};
 
+use http::uri::{Authority, Scheme, Uri};
 use http::{HeaderMap, HeaderValue, Method, header};
 
-use super::encode::frame_message;
-use super::input::{GrpcError, GrpcInput};
-use super::request::GrpcFormat;
+use super::input::GrpcError;
 use super::status::{Code, Status};
-use crate::client::{self, Unavailable};
+use crate::client::{self, ClientError, Origin, Security};
 
 const CONTENT_TYPE: HeaderValue = HeaderValue::from_static("application/grpc+proto");
 
 /// §4.1 requires `te: trailers` of a client.
 const TE_TRAILERS: HeaderValue = HeaderValue::from_static("trailers");
 
-pub struct Client {
-    inner: client::Client,
+/// Calls to one origin, over a [`client::Client`] that opens the connections
+/// they need. `S` is its transport, as there.
+pub struct Client<S: Security> {
+    inner: client::Client<S>,
+    origin: Origin,
+    /// A call names only its method's path (§4.1); these make the rest of its
+    /// URI, as given, so `:authority` is what the caller wrote.
+    scheme: Scheme,
+    authority: Authority,
 }
 
-impl Client {
-    pub fn new(inner: client::Client) -> Self {
+impl<S: Security> Client<S> {
+    /// `origin` is where the calls go, as `https://api.example.com` or
+    /// `http://10.0.0.1:50051`. Its scheme must be `inner`'s transport.
+    pub fn new(inner: client::Client<S>, origin: &str) -> Result<Self, ClientError> {
+        let uri: Uri = origin
+            .parse()
+            .map_err(|_| ClientError::InvalidUri("the origin is not a URI"))?;
+        let parsed = Origin::of(&uri).map_err(ClientError::InvalidUri)?;
+        if *parsed.scheme() != S::scheme() {
+            return Err(ClientError::InvalidUri(
+                "the origin's scheme is not the client's transport",
+            ));
+        }
+        let parts = uri.into_parts();
+        let (Some(scheme), Some(authority)) = (parts.scheme, parts.authority) else {
+            unreachable!("`Origin::of` found both");
+        };
+
         inner.index_request_paths(true);
-        Self { inner }
+        Ok(Self {
+            inner,
+            origin: parsed,
+            scheme,
+            authority,
+        })
     }
 
-    pub fn connection(&self) -> &client::Client {
+    pub fn client(&self) -> &client::Client<S> {
         &self.inner
     }
 
-    pub fn call(&self, path: &str) -> Result<Call, Unavailable> {
-        self.call_with(path, &HeaderMap::new())
+    pub fn origin(&self) -> &Origin {
+        &self.origin
+    }
+
+    pub async fn call(&self, path: &str) -> Result<Call, ClientError> {
+        self.call_with(path, &HeaderMap::new()).await
     }
 
     /// The fields the protocol requires win over anything `metadata` carries
-    /// by the same name.
-    pub fn call_with(&self, path: &str, metadata: &HeaderMap) -> Result<Call, Unavailable> {
+    /// by the same name. Awaits only when a connection must be opened.
+    pub async fn call_with(&self, path: &str, metadata: &HeaderMap) -> Result<Call, ClientError> {
+        let uri = Uri::builder()
+            .scheme(self.scheme.clone())
+            .authority(self.authority.clone())
+            .path_and_query(path)
+            .build()
+            .map_err(|_| ClientError::InvalidUri("the method's path is not a URI path"))?;
         let mut request = http::Request::builder()
             .method(Method::POST)
-            .uri(path)
+            .uri(uri)
             .body(())
-            .map_err(|_| Unavailable::Closed)?;
+            .map_err(|_| ClientError::InvalidUri("the method's path is not a URI path"))?;
 
         let fields = request.headers_mut();
         for (name, value) in metadata {
@@ -49,7 +86,7 @@ impl Client {
 
         // The head alone never ends a gRPC request (§4.1): even a call with no
         // messages ends with an empty DATA frame.
-        let stream = self.inner.send_request(&request, false)?;
+        let stream = self.inner.send_call(&request, false).await?;
         Ok(Call::new(stream))
     }
 
@@ -60,8 +97,9 @@ impl Client {
         Req: prost::Message,
         Resp: prost::Message + Default,
     {
-        let call = self.call(path).map_err(|e| match e {
-            Unavailable::AtLimit | Unavailable::Closed => {
+        let call = self.call(path).await.map_err(|e| match e {
+            ClientError::InvalidUri(_) => Status::new(Code::Internal, e.to_string()),
+            ClientError::Unavailable(_) | ClientError::Connect(_) => {
                 Status::new(Code::Unavailable, e.to_string())
             }
         })?;
@@ -83,11 +121,13 @@ impl Client {
 }
 
 /// Dropping it cancels the call: the stream is reset with CANCEL (§8.1).
+///
+/// Its messages are gathered by the stream itself, as they land, and each is
+/// decoded from the buffer it was gathered in.
 pub struct Call {
     stream: client::Stream,
     /// Taken from the stream exactly once.
     head: RefCell<Option<HeaderMap>>,
-    input: RefCell<Option<GrpcInput>>,
     status: RefCell<Option<Status>>,
     ended: Cell<bool>,
 }
@@ -97,7 +137,6 @@ impl Call {
         Self {
             stream,
             head: RefCell::new(None),
-            input: RefCell::new(None),
             status: RefCell::new(None),
             ended: Cell::new(false),
         }
@@ -124,7 +163,7 @@ impl Call {
 
     async fn write<M: prost::Message>(&self, message: &M, last: bool) -> Result<(), Status> {
         self.stream
-            .write(&frame_message(message), last)
+            .write_message(message, last)
             .await
             .map_err(|e| sending_failed(&e))
     }
@@ -141,40 +180,24 @@ impl Call {
 
     pub async fn frame(&self) -> Result<Option<super::GrpcFrame>, Status> {
         self.receive_head().await?;
+        if self.ended.get() {
+            return Ok(None);
+        }
 
-        loop {
-            if let Some(input) = self.input.borrow_mut().as_mut()
-                && let Some(ready) = input.take()
-            {
-                return ready.map(Some).map_err(from_input);
+        // A response that announced no gRPC content-type carries no
+        // messages, whatever its body holds: the stream says `None` at once.
+        match self.stream.message().await {
+            Ok(Some(message)) => message.map(Some).map_err(from_input),
+            Ok(None) => {
+                self.ended.set(true);
+                self.take_trailers();
+                Ok(None)
             }
-            if self.ended.get() {
-                return Ok(None);
-            }
-
-            match self.stream.read().await {
-                Ok(Some(chunk)) => {
-                    let mut input = self.input.borrow_mut();
-                    let Some(input) = input.as_mut() else {
-                        // A response that announced no gRPC content-type is
-                        // not carrying messages, whatever its body holds.
-                        return Ok(None);
-                    };
-                    input.push(&chunk);
-                }
-                Ok(None) => {
-                    self.ended.set(true);
-                    if let Some(input) = self.input.borrow_mut().as_mut() {
-                        input.end();
-                    }
-                    self.take_trailers();
-                }
-                Err(e) => {
-                    self.ended.set(true);
-                    let status = receiving_failed(&e);
-                    self.settle(status.clone());
-                    return Err(status);
-                }
+            Err(e) => {
+                self.ended.set(true);
+                let status = receiving_failed(&e);
+                self.settle(status.clone());
+                Err(status)
             }
         }
     }
@@ -226,13 +249,12 @@ impl Call {
         let fields = response.into_parts().0.headers;
 
         // §9.1: a status in the head is a Trailers-Only response, with no
-        // messages coming.
+        // messages coming. The stream judged the head the same way when it
+        // chose to gather messages.
         if let Some(status) = Status::of(&fields) {
             self.settle(status);
         } else if !http_status.is_success() {
             self.settle(Status::of_http(http_status));
-        } else if let Some(format) = GrpcFormat::of_response(&fields) {
-            *self.input.borrow_mut() = Some(GrpcInput::new(format, &fields));
         }
 
         *self.head.borrow_mut() = Some(fields);
