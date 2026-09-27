@@ -98,9 +98,12 @@ impl<S: Security> Client<S> {
         Resp: prost::Message + Default,
     {
         let call = self.call(path).await.map_err(|e| match e {
-            ClientError::InvalidUri(_) => Status::new(Code::Internal, e.to_string()),
-            ClientError::Unavailable(_) | ClientError::Connect(_) => {
-                Status::new(Code::Unavailable, e.to_string())
+            ClientError::InvalidUri(reason) => Status::new(Code::Internal, reason),
+            ClientError::Unavailable(unavailable) => {
+                Status::new(Code::Unavailable, unavailable.reason())
+            }
+            ClientError::Connect(_) => {
+                Status::new(Code::Unavailable, "no connection could be opened")
             }
         })?;
 
@@ -175,7 +178,7 @@ impl Call {
         frame
             .decode::<M>()
             .map(Some)
-            .map_err(|e| Status::new(Code::Internal, format!("undecodable response: {e:?}")))
+            .map_err(|_| Status::new(Code::Internal, "undecodable response message"))
     }
 
     pub async fn frame(&self) -> Result<Option<super::GrpcFrame>, Status> {
@@ -280,30 +283,30 @@ impl Call {
     }
 }
 
+/// The deadline's own error says nothing a status would not.
+const DEADLINE_PASSED: &str = "the deadline on this call passed";
+
 fn sending_failed(e: &std::io::Error) -> Status {
     match e.kind() {
-        std::io::ErrorKind::TimedOut => Status::new(Code::DeadlineExceeded, e.to_string()),
-        _ => Status::new(
-            Code::Unavailable,
-            format!("the request could not be sent: {e}"),
-        ),
+        std::io::ErrorKind::TimedOut => Status::new(Code::DeadlineExceeded, DEADLINE_PASSED),
+        _ => Status::new(Code::Unavailable, "the request could not be sent"),
     }
 }
 
 fn receiving_failed(e: &std::io::Error) -> Status {
     match e.kind() {
-        std::io::ErrorKind::TimedOut => Status::new(Code::DeadlineExceeded, e.to_string()),
-        _ => Status::new(Code::Unavailable, format!("the call ended early: {e}")),
+        std::io::ErrorKind::TimedOut => Status::new(Code::DeadlineExceeded, DEADLINE_PASSED),
+        _ => Status::new(Code::Unavailable, "the call ended early"),
     }
 }
 
 fn from_input(e: GrpcError) -> Status {
     match e {
-        GrpcError::MessageTooLarge { declared } => Status::resource_exhausted(format!(
-            "the server sent a message of {declared} bytes, past what this client will hold"
-        )),
-        GrpcError::InvalidCompressedFlag(byte) => {
-            Status::internal(format!("Compressed-Flag was {byte}, not 0 or 1"))
+        GrpcError::MessageTooLarge { .. } => {
+            Status::resource_exhausted("the server sent a message past what this client will hold")
+        }
+        GrpcError::InvalidCompressedFlag(_) => {
+            Status::internal("a Compressed-Flag that is neither 0 nor 1")
         }
         GrpcError::CompressedWithoutEncoding => {
             Status::internal("a compressed message on a response announcing no grpc-encoding")
@@ -311,6 +314,9 @@ fn from_input(e: GrpcError) -> Status {
         GrpcError::UnsupportedEncoding => Status::unimplemented(
             "the response is compressed with an encoding this client has no name for",
         ),
-        other => Status::internal(format!("malformed response: {other:?}")),
+        GrpcError::TooManyMessages => {
+            Status::resource_exhausted("too many messages waiting to be read")
+        }
+        GrpcError::Truncated => Status::internal("the response body ended inside a message"),
     }
 }

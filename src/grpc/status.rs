@@ -139,15 +139,18 @@ impl Status {
     /// §9.1's table, for a response that carried no `grpc-status`. A `200`
     /// without one is INTERNAL: a well-formed call always ends in a status.
     pub fn of_http(status: http::StatusCode) -> Self {
-        let code = match status.as_u16() {
-            400 => Code::Internal,
-            401 => Code::Unauthenticated,
-            403 => Code::PermissionDenied,
-            404 => Code::Unimplemented,
-            429 | 502 | 503 | 504 => Code::Unavailable,
-            _ => Code::Internal,
+        let (code, message) = match status.as_u16() {
+            400 => (Code::Internal, "no grpc-status; HTTP 400"),
+            401 => (Code::Unauthenticated, "no grpc-status; HTTP 401"),
+            403 => (Code::PermissionDenied, "no grpc-status; HTTP 403"),
+            404 => (Code::Unimplemented, "no grpc-status; HTTP 404"),
+            429 => (Code::Unavailable, "no grpc-status; HTTP 429"),
+            502 => (Code::Unavailable, "no grpc-status; HTTP 502"),
+            503 => (Code::Unavailable, "no grpc-status; HTTP 503"),
+            504 => (Code::Unavailable, "no grpc-status; HTTP 504"),
+            _ => (Code::Internal, "no grpc-status"),
         };
-        Self::new(code, format!("no grpc-status; HTTP {}", status.as_u16()))
+        Self::new(code, message)
     }
 
     pub(crate) fn fields(&self) -> HeaderMap {

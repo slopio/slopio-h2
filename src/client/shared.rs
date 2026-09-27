@@ -25,12 +25,18 @@ pub enum Unavailable {
     Closed,
 }
 
+impl Unavailable {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::AtLimit => "the peer's concurrent stream limit is reached",
+            Self::Closed => "the connection can carry no more requests",
+        }
+    }
+}
+
 impl std::fmt::Display for Unavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AtLimit => f.write_str("the peer's concurrent stream limit is reached"),
-            Self::Closed => f.write_str("the connection can carry no more requests"),
-        }
+        f.write_str(self.reason())
     }
 }
 

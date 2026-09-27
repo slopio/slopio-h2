@@ -22,6 +22,19 @@ use crate::shared::connection::{
     MAX_SLEEP, SendSide, input_data::InputData, settings::Settings, stream_window::StreamWindow,
 };
 
+/// A peer's RST_STREAM, as an error: its code is written out when the error is
+/// shown, not when it is made.
+#[derive(Debug)]
+struct StreamReset(u32);
+
+impl std::fmt::Display for StreamReset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stream reset by peer (code {:#x})", self.0)
+    }
+}
+
+impl std::error::Error for StreamReset {}
+
 /// A value rather than an `io::Error`: set from the connection loop, where an
 /// allocation per reset stream is a cost a peer controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +49,7 @@ pub(crate) enum Failure {
 impl Failure {
     fn error(self) -> io::Error {
         match self {
-            Self::Reset(code) => io::Error::other(format!("stream reset by peer (code {code:#x})")),
+            Self::Reset(code) => io::Error::other(StreamReset(code)),
             Self::Gone(reason) => io::Error::other(reason),
             Self::Expired => io::Error::new(
                 io::ErrorKind::TimedOut,

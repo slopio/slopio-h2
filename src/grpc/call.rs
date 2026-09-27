@@ -124,13 +124,13 @@ impl GrpcCall {
 impl From<MessageError> for Status {
     fn from(e: MessageError) -> Self {
         match e {
-            MessageError::Compressed(encoding) => Status::unimplemented(format!(
-                "messages compressed with {encoding:?} are not decompressed by this server"
-            )),
-            MessageError::NotProto(format) => {
-                Status::internal(format!("{format:?} messages are not decoded by this server"))
+            MessageError::Compressed(_) => {
+                Status::unimplemented("compressed messages are not decompressed by this server")
             }
-            MessageError::Decode(e) => Status::invalid_argument(format!("{e}")),
+            MessageError::NotProto(_) => {
+                Status::internal("only proto messages are decoded by this server")
+            }
+            MessageError::Decode(_) => Status::invalid_argument("the message could not be decoded"),
         }
     }
 }
@@ -138,8 +138,8 @@ impl From<MessageError> for Status {
 impl From<GrpcError> for Status {
     fn from(e: GrpcError) -> Self {
         match e {
-            GrpcError::MessageTooLarge { declared } => {
-                Status::resource_exhausted(format!("message of {declared} bytes is too large"))
+            GrpcError::MessageTooLarge { .. } => {
+                Status::resource_exhausted("a message past what this server will hold")
             }
             GrpcError::TooManyMessages => {
                 Status::resource_exhausted("too many messages waiting to be read")
@@ -150,8 +150,8 @@ impl From<GrpcError> for Status {
             GrpcError::CompressedWithoutEncoding => {
                 Status::internal("a compressed message on a request that announced no grpc-encoding")
             }
-            GrpcError::InvalidCompressedFlag(flag) => {
-                Status::internal(format!("compressed flag {flag} is neither 0 nor 1"))
+            GrpcError::InvalidCompressedFlag(_) => {
+                Status::internal("a Compressed-Flag that is neither 0 nor 1")
             }
             GrpcError::Truncated => Status::internal("the request body ended inside a message"),
         }

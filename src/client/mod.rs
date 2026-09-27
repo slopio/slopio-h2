@@ -208,7 +208,7 @@ pub(crate) async fn connect_tls<U: BufRingSpec + 'static>(
         let socket = connect_tcp(addr).await?;
         let ktls = popple_tls::handshake_client(socket, server_name, config, CONNECT_TIMEOUT)
             .await
-            .map_err(|e| io::Error::other(format!("TLS handshake: {e}")))?;
+            .map_err(|e| io::Error::other(TlsHandshake(e)))?;
 
         let transport = KtlsTransport::<U, _>::new(ktls.into_messages::<U>());
         if transport.alpn() != Some(ALPN_H2) {
@@ -226,6 +226,25 @@ pub(crate) async fn connect_tls<U: BufRingSpec + 'static>(
             io::ErrorKind::TimedOut,
             "no usable connection within CONNECT_TIMEOUT",
         )),
+    }
+}
+
+/// The handshake's own error, kept whole and said when shown.
+#[cfg(feature = "tls")]
+#[derive(Debug)]
+struct TlsHandshake(popple_tls::HandshakeError);
+
+#[cfg(feature = "tls")]
+impl std::fmt::Display for TlsHandshake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TLS handshake: {}", self.0)
+    }
+}
+
+#[cfg(feature = "tls")]
+impl std::error::Error for TlsHandshake {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
     }
 }
 

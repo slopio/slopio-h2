@@ -14,6 +14,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::task::{Poll, Waker};
 
 use http::uri::{Scheme, Uri};
@@ -166,7 +167,7 @@ impl Client<Tls> {
             let host = origin.bare_host().to_owned();
             Box::pin(async move {
                 let name = popple_tls::ServerName::try_from(host)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
                 crate::client::connect_tls::<U>(addr, name, config).await
             })
         }))
@@ -397,7 +398,7 @@ impl<S: Security> Client<S> {
                 None => {
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
-                        format!("{host} is a name, and this client has no DNS client"),
+                        "the host is a name, and this client has no DNS client",
                     ));
                 }
             },
@@ -423,7 +424,7 @@ impl<D: BufRingSpec> Resolve for DnsClient<D> {
         Box::pin(async move {
             let name: Name = host
                 .parse()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{host}: {e}")))?;
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
             let found = match DnsClient::resolve(self, name.clone(), IpVersion::V4).await {
                 Err(ResolveError::NoAddress) => DnsClient::resolve(self, name, IpVersion::V6).await,
                 found => found,
@@ -433,7 +434,7 @@ impl<D: BufRingSpec> Resolve for DnsClient<D> {
                     ResolveError::NotFound | ResolveError::NoAddress => io::ErrorKind::NotFound,
                     _ => io::ErrorKind::Other,
                 };
-                io::Error::new(kind, format!("{host}: {e}"))
+                io::Error::new(kind, e)
             })
         })
     }
@@ -494,9 +495,7 @@ impl<S: Security> Connections<S> {
     async fn opened_elsewhere(&self) -> Option<Result<(), ClientError>> {
         let opening = self.opening.borrow().clone()?;
         Some(match opening.finished().await {
-            Outcome::Failed(kind, reason) => {
-                Err(ClientError::Connect(io::Error::new(kind, reason)))
-            }
+            Outcome::Failed(failure) => Err(ClientError::Connect(failure.to_io())),
             Outcome::Opened | Outcome::Abandoned => Ok(()),
         })
     }
@@ -524,11 +523,15 @@ impl<S: Security> Connections<S> {
             outcome: Some(Outcome::Abandoned),
         };
 
-        let result = connect.await;
-        done.outcome = Some(match &result {
-            Ok(_) => Outcome::Opened,
-            Err(e) => Outcome::Failed(e.kind(), e.to_string()),
+        let result = connect.await.map_err(|e| {
+            let failure = SharedFailure(Arc::new(e));
+            let own = failure.to_io();
+            done.outcome = Some(Outcome::Failed(failure));
+            own
         });
+        if result.is_ok() {
+            done.outcome = Some(Outcome::Opened);
+        }
         drop(done);
         result
     }
@@ -537,9 +540,32 @@ impl<S: Security> Connections<S> {
 #[derive(Clone)]
 enum Outcome {
     Opened,
-    /// `io::Error` is not `Clone`, so each waiter gets its own.
-    Failed(io::ErrorKind, String),
+    Failed(SharedFailure),
     Abandoned,
+}
+
+/// One failed opening, told to the request that paid for it and to every one
+/// that waited on it: `io::Error` is not `Clone`, so it is shared, not copied
+/// out as text.
+#[derive(Clone, Debug)]
+struct SharedFailure(Arc<io::Error>);
+
+impl SharedFailure {
+    fn to_io(&self) -> io::Error {
+        io::Error::new(self.0.kind(), self.clone())
+    }
+}
+
+impl std::fmt::Display for SharedFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for SharedFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
 }
 
 #[derive(Default)]
