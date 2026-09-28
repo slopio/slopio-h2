@@ -6,6 +6,8 @@ edition = "2024"
 [features]
 default = ["grpc"]
 grpc = ["dep:prost"]
+# A span collector exporting the runtime's tracing over OTLP/gRPC.
+otlp = ["grpc", "prost/derive", "runtime/tracing"]
 
 # Off by default: rustls and aws-lc-rs are the largest thing this would compile.
 tls = ["dep:popple-tls"]

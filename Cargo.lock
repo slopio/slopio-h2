@@ -11,7 +11,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "async_timers"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#3820bc833803f95d5d58e79c7f1f15aab440a67f"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#e502f504aeacd18b7d7f4833546fff0f27b81ac0"
 
 [[package]]
 name = "aws-lc-rs"
@@ -73,9 +73,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cc"
-version = "1.4.7"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54413ede23c2daf518f35156dfde027feb2374004d63bd497f983c8db9c0e313"
+checksum = "f360145194ee8e21db5ee7f3fcd4fe52210864c75c985dae33218202c8bbe040"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -123,14 +123,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.13"
+version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef25905e51abafe4dcea6c15fec58c57b601cdbd0ee53d22ea1d3016c587d39b"
+checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
 name = "fnv"
@@ -190,7 +190,7 @@ dependencies = [
 [[package]]
 name = "io_uring_rb"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#3820bc833803f95d5d58e79c7f1f15aab440a67f"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#e502f504aeacd18b7d7f4833546fff0f27b81ac0"
 dependencies = [
  "io-uring",
  "rustix",
@@ -348,7 +348,7 @@ dependencies = [
 [[package]]
 name = "popple-tls"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/popple-tls.git#fb980c4152127a83ce3e85bfcd7d15117548a926"
+source = "git+ssh://git@github.com/saucisoupe/popple-tls.git#d042b87af0e97cbc4436216fe8e809be612e5b31"
 dependencies = [
  "libc",
  "runtime",
@@ -480,7 +480,7 @@ dependencies = [
 [[package]]
 name = "runtime"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#3820bc833803f95d5d58e79c7f1f15aab440a67f"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#e502f504aeacd18b7d7f4833546fff0f27b81ac0"
 dependencies = [
  "libc",
  "mimalloc",
@@ -490,7 +490,7 @@ dependencies = [
 [[package]]
 name = "runtime-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#3820bc833803f95d5d58e79c7f1f15aab440a67f"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#e502f504aeacd18b7d7f4833546fff0f27b81ac0"
 dependencies = [
  "async_timers",
  "bitfield-struct",
@@ -509,7 +509,7 @@ dependencies = [
 [[package]]
 name = "runtime-streams"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#3820bc833803f95d5d58e79c7f1f15aab440a67f"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#e502f504aeacd18b7d7f4833546fff0f27b81ac0"
 
 [[package]]
 name = "rustc-hash"
@@ -527,7 +527,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -600,9 +600,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.16.1"
+version = "1.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
+checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 
 [[package]]
 name = "socket2"
@@ -787,18 +787,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.58"
+version = "0.8.59"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c17e8fafad82b542ff3717217ecdc736231b59e387768c9630123b4ce4d2db44"
+checksum = "6df92bf3d9227be3d53173901ddbffac2babc27ae50f397776ffd6dc33f800cb"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.58"
+version = "0.8.59"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "595f56e044df4f46a0c9a626f65c3d99eb8488f7e8a8baa12dd76326d9710bf2"
+checksum = "ac4f328cf2f05d084e496c3e9c3f33ed0a183656a16e1fcec4d464d8373aec82"
 dependencies = [
  "proc-macro2",
  "quote",
