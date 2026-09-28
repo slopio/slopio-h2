@@ -94,6 +94,16 @@ pub const PARTIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// the stream whose peer sends nothing at all.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Flushes a turn may take before handing back to the loop. Two carry a
+/// request's whole answer: the first sends what the decode queued and lets
+/// the handlers it woke run, the second sends what they wrote.
+///
+/// Not until the output is empty: a writer with credit refills it every
+/// round, and that kept the loop from reading — the peer's RST_STREAM, its
+/// WINDOW_UPDATEs, its next requests — and from checking its deadlines for
+/// as long as the peer kept crediting.
+const DRAIN_ROUNDS: usize = 2;
+
 enum Event<B> {
     Inbound(B),
     Flush,
@@ -237,21 +247,33 @@ impl<T: Transport, H: Handler> Connection<T, H> {
                 break;
             }
         }
+        // The streams go before the last flush, and with nothing awaited in
+        // between: no task gets a turn to write past the GOAWAY, and a writer
+        // with credit cannot hold the connection open past its deadline.
+        self.protocol.end_streams();
         // An invalid preface queued nothing, so it closes in silence (§3.4).
-        let _ = self.drain().await;
+        let _ = self.flush().await;
         let _ = self.transport.shutdown().await;
     }
 
     /// One flush is not enough: a task may have parked on a full buffer, and
-    /// only a flush gives it room again.
+    /// only a flush gives it room again. What is left after
+    /// [`DRAIN_ROUNDS`] goes out on later turns, between reads.
+    ///
+    /// Nothing once the connection is closing: the loop ends it before any
+    /// task writes again.
     async fn drain(&mut self) -> io::Result<()> {
-        loop {
+        for _ in 0..DRAIN_ROUNDS {
+            if self.protocol.phase() == Phase::Closing {
+                return Ok(());
+            }
             self.flush().await?;
             runtime::yield_now().await;
             if self.protocol.shared().output_is_empty() {
                 return Ok(());
             }
         }
+        Ok(())
     }
 
     /// Clocks that step backwards floor at zero, so an adjustment cannot close
@@ -344,6 +366,9 @@ impl<T: Transport, H: Handler> Connection<T, H> {
 
     /// A handler writing between polls is caught by `write_frame` waking the
     /// waker parked below.
+    ///
+    /// Reads before it flushes: output a writer keeps refilling must not keep
+    /// the peer's frames waiting. Every inbound turn flushes on its way out.
     fn next_event(&mut self) -> impl Future<Output = Event<T::Buf>> + '_ {
         let Self {
             transport,
@@ -360,11 +385,13 @@ impl<T: Transport, H: Handler> Connection<T, H> {
                 *shutdown_seen = true;
                 return Poll::Ready(Event::Shutdown(until));
             }
-            if !shared.output_is_empty() {
-                return Poll::Ready(Event::Flush);
-            }
             match Pin::new(&mut *transport).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Event::Inbound(chunk)),
+                // An empty ring holds up reading, not writing; the next poll
+                // retries the read.
+                Poll::Ready(Some(Err(RecvError::Later))) if !shared.output_is_empty() => {
+                    Poll::Ready(Event::Flush)
+                }
                 Poll::Ready(Some(Err(RecvError::Later))) => Poll::Ready(Event::Retry),
                 Poll::Ready(Some(Err(RecvError::Fatal(_)))) => Poll::Ready(Event::Failed),
                 Poll::Ready(None) => Poll::Ready(Event::Closed),

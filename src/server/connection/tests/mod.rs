@@ -527,3 +527,83 @@ fn a_ring_out_of_buffers_does_not_end_the_connection() {
     );
     assert_eq!(&goaway.payload[8..], b"idle too long");
 }
+
+/// A peer that credits everything, so the download never waits: the
+/// SETTINGS and the connection WINDOW_UPDATE that open both windows to
+/// 2^31-1, then a GET.
+fn a_get_with_all_the_credit() -> Vec<u8> {
+    let mut bytes = PREFACE.to_vec();
+    let mut settings = vec![0x00, 0x04]; // INITIAL_WINDOW_SIZE
+    settings.extend_from_slice(&0x7fff_ffffu32.to_be_bytes());
+    bytes.extend_from_slice(&frame(SETTINGS, 0, 0, &settings));
+    bytes.extend_from_slice(&frame(
+        WINDOW_UPDATE,
+        0,
+        0,
+        &(0x7fff_ffff - 65_535u32).to_be_bytes(),
+    ));
+    bytes.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        GET_BLOCK,
+    ));
+    bytes
+}
+
+/// 4 MiB, in writes that never wait for credit.
+async fn a_download(stream: crate::server::Stream) {
+    stream.write_headers(http::StatusCode::OK, &http::HeaderMap::new());
+    let chunk = vec![7u8; 16_384];
+    for _ in 0..256 {
+        stream.write_data(&chunk).await;
+    }
+    stream.write_data_final(b"").await;
+}
+
+/// The loop reads while a download with credit keeps the output full: the
+/// peer's PING, already waiting, is answered before the download ends.
+#[test]
+fn a_download_with_credit_does_not_stop_the_loop_reading() {
+    let written = run_connection_with(
+        vec![
+            ReadEvent::Data(a_get_with_all_the_credit()).into(),
+            ReadEvent::Data(frame(PING, 0, 0, b"are you?")).into(),
+            ReadEvent::Eof.after(Duration::from_secs(1)),
+        ],
+        |_, _| {},
+        a_download,
+    );
+
+    let answer = written
+        .iter()
+        .position(|f| f.kind == PING && f.flags & FLAG_ACK != 0)
+        .expect("the PING is answered");
+    let last_data = written
+        .iter()
+        .rposition(|f| f.kind == DATA && f.stream_id == 1)
+        .expect("the download went out");
+    assert_eq!(written[last_data].flags & FLAG_END_STREAM, FLAG_END_STREAM);
+    assert!(answer < last_data, "the PING waited for the whole download");
+}
+
+/// A connection error ends the streams with it: nothing follows the
+/// GOAWAY, however much credit a writer still had.
+#[test]
+fn nothing_is_written_after_the_goaway() {
+    let written = run_connection_with(
+        vec![
+            ReadEvent::Data(a_get_with_all_the_credit()).into(),
+            // §6.7: a PING of 7 bytes is a connection FRAME_SIZE_ERROR.
+            ReadEvent::Data(frame(PING, 0, 0, b"short!!")).into(),
+            ReadEvent::Eof.after(Duration::from_secs(1)),
+        ],
+        |_, _| {},
+        a_download,
+    );
+
+    let last = written.last().expect("the connection says why it ends");
+    assert_eq!(last.kind, GOAWAY, "the GOAWAY is the last frame");
+    let data = written.iter().filter(|f| f.kind == DATA).count();
+    assert!(data < 256, "the download was cut: {data} DATA frames");
+}

@@ -322,19 +322,24 @@ impl<F: Future<Output = ()>> Future for ContainPanic<F> {
     }
 }
 
-impl<H: Handler> Drop for Streams<H> {
-    /// A handle merely dropped detaches its task rather than stopping it: it
-    /// parks on the bounded output, is never woken or dropped, and leaks the
-    /// whole connection state. So streams are killed here.
-    ///
+impl<H: Handler> Streams<H> {
     /// Safe for the same reason [`Streams::remove`] is: the one task running
     /// is the connection's, so no stream task holds a borrow or a
     /// half-written frame.
-    fn drop(&mut self) {
+    fn kill_all(&mut self) {
         for (stream, handle) in self.streams.take_all() {
             stream.retire();
             handle.kill();
         }
+    }
+}
+
+impl<H: Handler> Drop for Streams<H> {
+    /// A handle merely dropped detaches its task rather than stopping it: it
+    /// parks on the bounded output, is never woken or dropped, and leaks the
+    /// whole connection state. So streams are killed here.
+    fn drop(&mut self) {
+        self.kill_all();
     }
 }
 
@@ -425,6 +430,13 @@ impl<H: Handler> Protocol<H> {
             // Bounded already, and a GOAWAY changes nothing for either.
             Phase::HalfClosed { .. } | Phase::Closing => {}
         }
+    }
+
+    /// The connection is over: whatever its streams were doing stops here,
+    /// not when the connection is dropped. Resets nothing, since the GOAWAY
+    /// already speaks for them.
+    pub(super) fn end_streams(&mut self) {
+        self.streams.kill_all();
     }
 
     pub(super) fn peer_closed(&mut self) {
