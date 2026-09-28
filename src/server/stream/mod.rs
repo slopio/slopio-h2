@@ -221,6 +221,16 @@ impl StreamState {
         Ok(())
     }
 
+    /// Connection credit after the connection window was spent. Only a writer
+    /// parked for want of credit that has some of its own was waiting on the
+    /// connection's; the rest are left alone, the slot being the body
+    /// reader's too.
+    pub fn wake_sender(&self) {
+        if self.send_blocked_since.get().is_some() && self.available_send() > 0 {
+            self.wake();
+        }
+    }
+
     /// §6.9.2: the peer's initial window changed.
     pub fn adjust_send(&self, delta: i32) -> Result<(), ()> {
         self.window.adjust_send(delta)?;

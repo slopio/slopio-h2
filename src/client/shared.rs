@@ -220,6 +220,15 @@ impl ClientShared {
         }
     }
 
+    /// Connection credit after the window was spent. Only walked when a
+    /// writer can have been waiting, so a stream gone holds nothing to wake.
+    pub(crate) fn wake_senders(&self) {
+        let _ = self.streams.try_for_each(|state| {
+            state.wake_sender();
+            Ok::<(), ()>(())
+        });
+    }
+
     /// §6.9.2. The first overflow stops the walk; the connection is over.
     pub(crate) fn adjust_send_windows(&self, delta: i32) -> Result<(), ()> {
         self.streams.try_for_each(|state| state.adjust_send(delta))

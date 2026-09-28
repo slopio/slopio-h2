@@ -306,6 +306,14 @@ impl StreamState {
         Ok(())
     }
 
+    /// Connection credit after the connection window was spent: only a
+    /// writer with credit of its own was waiting on it.
+    pub(crate) fn wake_sender(&self) {
+        if self.window.available_send() > 0 {
+            self.wake_send();
+        }
+    }
+
     /// §6.9.2.
     pub(crate) fn adjust_send(&self, delta: i32) -> Result<(), ()> {
         self.window.adjust_send(delta)?;

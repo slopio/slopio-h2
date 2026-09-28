@@ -1912,3 +1912,49 @@ fn a_deadline_longer_than_one_tick_is_still_one_deadline() {
         http::StatusCode::OK
     );
 }
+
+/// An upload larger than the connection window: the writer parks on the
+/// spent window, in its stream's slot, and goes on when stream 0 is credited.
+#[test]
+fn a_writer_parked_on_the_connection_window_goes_on_when_it_is_credited() {
+    // MAX_CONCURRENT_STREAMS 100, and INITIAL_WINDOW_SIZE 1 MiB to take the
+    // stream window out of the way, so the connection's is what runs out.
+    let mut opening = frame(
+        SETTINGS,
+        0,
+        0,
+        &[0x00, 0x03, 0, 0, 0, 0x64, 0x00, 0x04, 0, 0x10, 0, 0],
+    );
+    opening.extend_from_slice(&frame(SETTINGS, FLAG_ACK, 0, &[]));
+    let credit = frame(WINDOW_UPDATE, 0, 0, &65_535u32.to_be_bytes());
+    let response = frame(HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, STATUS_200);
+
+    let (status, written) = with_client(
+        vec![
+            ReadEvent::Data(opening).after(Duration::from_millis(1)),
+            ReadEvent::Data(credit).after(Duration::from_millis(50)),
+            ReadEvent::Data(response).after(Duration::from_millis(100)),
+            ReadEvent::Eof.after(Duration::from_millis(200)),
+        ],
+        |client| async move {
+            let request = http::Request::post("http://example.test/upload")
+                .body(())
+                .unwrap();
+            let stream = client.send_request(&request, false).expect("a stream");
+            stream
+                .write(&vec![7u8; 100_000], true)
+                .await
+                .expect("written");
+            let head = stream.response().await.expect("a response");
+            head.status().as_u16()
+        },
+    );
+
+    assert_eq!(status, 200);
+    let sent: usize = frames(&written)
+        .iter()
+        .filter(|f| f.kind == DATA)
+        .map(|f| f.payload.len())
+        .sum();
+    assert_eq!(sent, 100_000, "the whole body, past the first 65 535 bytes");
+}

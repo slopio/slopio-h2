@@ -607,3 +607,40 @@ fn nothing_is_written_after_the_goaway() {
     let data = written.iter().filter(|f| f.kind == DATA).count();
     assert!(data < 256, "the download was cut: {data} DATA frames");
 }
+
+/// A response larger than the connection window: the writer parks on the
+/// spent window, in its stream's slot, and goes on when stream 0 is credited.
+#[test]
+fn a_writer_parked_on_the_connection_window_goes_on_when_it_is_credited() {
+    let mut first = PREFACE.to_vec();
+    // The stream window out of the way, so the connection's is what runs out.
+    let mut settings = vec![0x00, 0x04]; // INITIAL_WINDOW_SIZE
+    settings.extend_from_slice(&(1u32 << 20).to_be_bytes());
+    first.extend_from_slice(&frame(SETTINGS, 0, 0, &settings));
+    first.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        GET_BLOCK,
+    ));
+    let credit = frame(WINDOW_UPDATE, 0, 0, &65_535u32.to_be_bytes());
+
+    let written = run_connection_with(
+        vec![
+            ReadEvent::Data(first).into(),
+            ReadEvent::Data(credit).after(Duration::from_secs(1)),
+            ReadEvent::Eof.after(Duration::from_secs(1)),
+        ],
+        |_, _| {},
+        |stream: crate::server::Stream| async move {
+            stream.write_headers(http::StatusCode::OK, &http::HeaderMap::new());
+            stream.write_data_final(&vec![7u8; 100_000]).await;
+        },
+    );
+
+    let data: Vec<&Frame> = written.iter().filter(|f| f.kind == DATA).collect();
+    let sent: usize = data.iter().map(|f| f.payload.len()).sum();
+    assert_eq!(sent, 100_000, "the whole body, past the first 65 535 bytes");
+    let last = data.last().expect("the body went out");
+    assert_eq!(last.flags & FLAG_END_STREAM, FLAG_END_STREAM);
+}

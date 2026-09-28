@@ -31,6 +31,11 @@ pub trait SendSide {
     /// On `Err`, nothing is debited.
     fn debit_send(&self, len: u32) -> Result<(), ()>;
 
+    /// The one place a writer out of credit waits, whichever window ran out:
+    /// the stream's own WINDOW_UPDATE wakes it, and so does connection credit
+    /// arriving on a spent connection window, the connection walking its
+    /// streams for that. Nothing on the connection holds the waker, so
+    /// nothing outlives the stream.
     fn register_send_waker(&self, waker: &Waker);
 
     fn note_sent(&self, n: usize);
@@ -45,7 +50,6 @@ pub struct ConnectionWindow {
     /// Half the receive window: the peer keeps the other half to spend while
     /// our WINDOW_UPDATE is in flight, so it never stalls.
     release_threshold: u32,
-    send_waiters: RefCell<Vec<Waker>>,
 }
 
 impl ConnectionWindow {
@@ -55,24 +59,16 @@ impl ConnectionWindow {
     }
 
     /// §6.9.1: going past 2^31-1 (`i32::MAX`) is a connection error.
-    pub fn credit_send(&self, increment: u32) -> Result<(), ()> {
-        let credited = self
-            .to_send
-            .get()
-            .checked_add_unsigned(increment)
-            .ok_or(())?;
+    ///
+    /// `Ok(true)` when the window was spent: writers may be parked on it, each
+    /// in its own stream's slot, and the caller must walk its streams to wake
+    /// them. Otherwise nobody waits on it, since a writer takes what is left
+    /// before it parks, and a client crediting every few KiB costs nothing.
+    pub fn credit_send(&self, increment: u32) -> Result<bool, ()> {
+        let before = self.to_send.get();
+        let credited = before.checked_add_unsigned(increment).ok_or(())?;
         self.to_send.set(credited);
-        for waker in self.send_waiters.borrow_mut().drain(..) {
-            waker.wake();
-        }
-        Ok(())
-    }
-
-    fn wait_send(&self, waker: &Waker) {
-        let mut waiters = self.send_waiters.borrow_mut();
-        if !waiters.iter().any(|w| w.will_wake(waker)) {
-            waiters.push(waker.clone());
-        }
+        Ok(before <= 0)
     }
 
     /// §6.9.1: debits this window as well as the stream's. On `Err`, nothing
@@ -189,7 +185,6 @@ impl SharedConnection {
                 to_recv: Cell::new(CONNECTION_INITIAL_WINDOW_SIZE as i32),
                 pending_release: Cell::new(0),
                 release_threshold: recv_window / 2,
-                send_waiters: RefCell::new(Vec::new()),
             },
             output: UnsafeCell::new(Output::new()),
             flusher: RefCell::new(None),
@@ -332,7 +327,6 @@ impl SharedConnection {
                     // is the empty one.
                     if credit == 0 {
                         stream.register_send_waker(cx.waker());
-                        self.window.wait_send(cx.waker());
                         if self.credit_closed.get() {
                             self.wake_flusher();
                         }
@@ -432,11 +426,11 @@ impl SharedConnection {
                     .min(room);
 
                 if quota == 0 {
-                    // Credit and room open on different events, and either
-                    // window may be the empty one, so park on all that apply.
+                    // Credit and room open on different events, so park on
+                    // both when both are wanting. Credit is the stream's slot
+                    // whichever window is the empty one: see `SendSide`.
                     if credit == 0 {
                         stream.register_send_waker(cx.waker());
-                        self.window.wait_send(cx.waker());
                         // Nothing will ever wake this one; tell the loop,
                         // which can end the stream.
                         if self.credit_closed.get() {
@@ -741,5 +735,54 @@ mod tests {
         );
         assert_eq!(chain.len(), 1, "a hundred one-byte frames, one segment");
         assert_eq!(chain[0].bytes_init(), 100 * (HEADER_LEN + 1));
+    }
+
+    /// A waker the connection kept would outlive its stream and pin its task
+    /// until the peer next credited stream 0, which it need never do. The
+    /// stream's own slot is the only place a writer out of credit waits.
+    #[test]
+    fn a_writer_out_of_credit_leaves_nothing_on_the_connection() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Its references counted by the `Arc`, its wakes by itself.
+        struct Counted(AtomicUsize);
+        impl std::task::Wake for Counted {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let counted = Arc::new(Counted(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&counted));
+
+        // Out of stream credit, with connection credit to spare.
+        let connection = connection(1 << 20);
+        let stream = Metered(Cell::new(0));
+        {
+            let mut writing =
+                pin!(connection.write_data(StreamId::from(1), &stream, b"blocked", false));
+            let parked = writing.as_mut().poll(&mut Context::from_waker(&waker));
+            assert!(parked.is_pending());
+        }
+        drop(waker);
+        assert_eq!(Arc::strong_count(&counted), 1, "no copy of the waker held");
+
+        // Nor woken by credit: the writer is gone.
+        let _ = connection.window.credit_send(1);
+        assert_eq!(counted.0.load(Ordering::Relaxed), 0);
+    }
+
+    /// Only credit to a spent window can find a writer waiting on it.
+    #[test]
+    fn crediting_a_spent_window_says_so() {
+        let connection = connection(0);
+        assert_eq!(connection.window.credit_send(1), Ok(false));
+
+        connection
+            .window
+            .debit_send(connection.window.available_send())
+            .expect("all of it");
+        assert_eq!(connection.window.credit_send(1), Ok(true));
+        assert_eq!(connection.window.credit_send(1), Ok(false));
     }
 }

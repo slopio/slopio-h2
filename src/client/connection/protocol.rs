@@ -204,8 +204,12 @@ impl FrameHandler for Protocol {
             return;
         }
         if stream_id.is_zero() {
-            if self.shared.core.window.credit_send(increment).is_err() {
-                return self.fail(FLOW_CONTROL_ERROR, "connection send window exceeds 2^31-1");
+            match self.shared.core.window.credit_send(increment) {
+                Err(()) => {
+                    return self.fail(FLOW_CONTROL_ERROR, "connection send window exceeds 2^31-1");
+                }
+                Ok(true) => self.shared.wake_senders(),
+                Ok(false) => {}
             }
             return;
         }

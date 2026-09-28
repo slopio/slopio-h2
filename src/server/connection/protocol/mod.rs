@@ -274,6 +274,16 @@ impl<H: Handler> Streams<H> {
         Some(before)
     }
 
+    /// Connection credit after the window was spent. Bounded by
+    /// `MAX_CONCURRENT_STREAMS`, and only walked when a writer can have been
+    /// waiting, so a stream gone holds nothing to wake.
+    fn wake_senders(&self) {
+        let _ = self.streams.try_for_each(|stream| {
+            stream.wake_sender();
+            Ok::<(), ()>(())
+        });
+    }
+
     /// §6.9.2. The first overflow stops the walk: the connection is over.
     fn adjust_send_windows(&self, delta: i32) -> Result<(), ()> {
         self.streams
@@ -739,10 +749,16 @@ impl<H: Handler> FrameHandler for Protocol<H> {
     /// increment (§6.9.1), so `increment` is guaranteed in `1..=2^31-1`.
     fn on_window_update(&mut self, stream_id: StreamId, increment: u32) {
         if stream_id.is_zero() {
-            // §6.9.1: going past 2^31-1 is a connection error.
-            if self.shared.window.credit_send(increment).is_err() {
-                return self
-                    .fail_connection(FLOW_CONTROL_ERROR, "connection send window exceeds 2^31-1");
+            match self.shared.window.credit_send(increment) {
+                // §6.9.1: going past 2^31-1 is a connection error.
+                Err(()) => {
+                    return self.fail_connection(
+                        FLOW_CONTROL_ERROR,
+                        "connection send window exceeds 2^31-1",
+                    );
+                }
+                Ok(true) => self.streams.wake_senders(),
+                Ok(false) => {}
             }
             return;
         }
