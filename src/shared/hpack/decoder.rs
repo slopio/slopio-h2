@@ -1,6 +1,7 @@
 use crate::shared::hpack::Error;
 
 use super::{Header, header::BytesStr, huffman};
+use crate::shared::codec::ext::Protocol;
 
 use bytes::{Buf, Bytes, BytesMut};
 use http::header;
@@ -129,6 +130,29 @@ impl Entry {
         }
     }
 
+    /// A copy that owns its bytes, for the table. A decoded string is a slice
+    /// of a chunk shared with whatever was staged or decoded beside it, and a
+    /// table entry lives as long as the connection: as a slice, a 43-byte
+    /// `:authority` held a padded frame's whole 16 KiB chunk, a table's worth
+    /// of them about 1.5 MB. Ordinary fields need nothing: `http` copies
+    /// their names and values as it checks them.
+    fn detached(&self) -> Entry {
+        let owned = |value: &BytesStr| BytesStr::from(value.as_str());
+        match self {
+            Entry::Field(Header::Authority(value)) => Entry::Field(Header::Authority(owned(value))),
+            Entry::Field(Header::Scheme(value)) => Entry::Field(Header::Scheme(owned(value))),
+            Entry::Field(Header::Path(value)) => Entry::Field(Header::Path(owned(value))),
+            Entry::Field(Header::Protocol(value)) => {
+                Entry::Field(Header::Protocol(Protocol::from(value.as_str())))
+            }
+            Entry::Field(header) => Entry::Field(header.clone()),
+            Entry::Invalid { name, value } => Entry::Invalid {
+                name: Bytes::copy_from_slice(name),
+                value: Bytes::copy_from_slice(value),
+            },
+        }
+    }
+
     /// §4.1: whether we accepted it or not.
     fn len(&self) -> usize {
         match self {
@@ -198,7 +222,7 @@ impl Decoder {
                     can_resize = false;
                     let entry = self.decode_literal(src, true, &mut huff.0)?;
 
-                    self.table.insert(entry.clone());
+                    self.table.insert(entry.detached());
                     consume(src);
 
                     emit(entry);
@@ -1009,6 +1033,34 @@ mod test {
         assert!(
             matches!(&fields[..], [Header::Field { name, value }] if name == "x-bad" && value == "fine")
         );
+    }
+
+    #[test]
+    fn a_table_entry_owns_its_bytes() {
+        let raw = indexed_literal(b":authority", b"example.com");
+        // Name index 1, `:authority`; the value huffman-coded, so decoded
+        // into the worker's arena rather than sliced from the block.
+        let coded = huff_encode(b"example.com");
+        let mut huffman = vec![0x41, 0x80 | coded.len() as u8];
+        huffman.extend_from_slice(&coded);
+
+        for block in [raw, huffman] {
+            let mut de = Decoder::new(4096);
+            let (fields, res) = decode_block(&mut de, &block);
+            assert_eq!(res, Ok(()));
+            let [Header::Authority(given)] = &fields[..] else {
+                panic!("{fields:?}");
+            };
+            let Ok(Entry::Field(Header::Authority(kept))) = de.table.get(62) else {
+                panic!("the entry is in the table");
+            };
+            assert_eq!(kept.as_str(), "example.com");
+            assert_ne!(
+                kept.as_str().as_ptr(),
+                given.as_str().as_ptr(),
+                "a copy, not a slice of the chunk the block was decoded from"
+            );
+        }
     }
 
     #[test]
