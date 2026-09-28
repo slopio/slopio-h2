@@ -164,6 +164,26 @@ fn empty_data_flood() {
     assert_eq!(reason, "too many pointless frames");
 }
 
+/// CVE-2019-9518 again, the frames padded: a length that is all padding is
+/// still an empty body, and the padding's credit goes straight back.
+#[test]
+fn empty_data_flood_with_padding() {
+    let mut bytes = PREFACE.to_vec();
+    bytes.extend_from_slice(&frame(SETTINGS, 0, 0, &[]));
+    bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, GET_BLOCK));
+    for _ in 0..super::super::protocol::ODD_FRAME_BURST + 1 {
+        // PADDED (0x8), a pad length of zero, and nothing else.
+        bytes.extend_from_slice(&frame(0x0, 0x8, 1, &[0]));
+    }
+    let mut inbound = deliveries(&bytes);
+    inbound.push(ReadEvent::Eof);
+
+    let (code, reason) =
+        goaway(&run_connection(inbound, |_, _| {})).expect("the flood was answered with a GOAWAY");
+    assert_eq!(code, ENHANCE_YOUR_CALM);
+    assert_eq!(reason, "too many pointless frames");
+}
+
 /// CVE-2024-27316 — the CONTINUATION flood, with empty fragments.
 /// `max_header_block_size` counts bytes and an empty fragment adds none, so
 /// the budget is what catches this form.

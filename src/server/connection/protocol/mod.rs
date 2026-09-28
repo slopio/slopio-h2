@@ -58,25 +58,32 @@ enum FrameWorth {
 }
 
 impl FrameWorth {
-    fn of(kind: FrameKind, length: u32, flags: u8, stream_live: bool) -> Self {
+    /// Every kind but DATA, which [`Self::of_data`] judges.
+    fn of(kind: FrameKind, length: u32) -> Self {
         match kind {
-            // §6.1: END_STREAM is 0x1. Empty DATA without it is not progress, and
-            // flow control accounts nothing for it either (CVE-2019-9518). Only on a
-            // live stream: DATA on a gone one is dropped, and calling it progress let
-            // a peer clear both budgets for free.
-            FrameKind::Data if length > 0 || flags & 0x1 != 0 => match stream_live {
-                true => Self::Progress,
-                false => Self::Control,
-            },
             // An empty fragment never reaches `max_header_block_size` (CVE-2024-27316).
             FrameKind::Headers | FrameKind::Continuation if length > 0 => Self::Progress,
-            FrameKind::Data | FrameKind::Headers | FrameKind::Continuation => Self::Odd,
+            FrameKind::Headers | FrameKind::Continuation => Self::Odd,
             // PRIORITY is validated and ignored (CVE-2019-9513).
             FrameKind::Priority => Self::Odd,
             // §4.1: an unknown type MUST be ignored, which makes it free to send and
             // not free to receive.
             FrameKind::Unknown(_) => Self::Odd,
             _ => Self::Control,
+        }
+    }
+
+    /// By its body, not its length: padding costs the peer no credit it does
+    /// not get straight back, so a padded frame with nothing in it must not
+    /// clear the budgets. Empty DATA without END_STREAM is not progress, and
+    /// flow control accounts nothing for it either (CVE-2019-9518). Only on a
+    /// live stream: DATA on a gone one is dropped, and calling it progress let
+    /// a peer clear both budgets for free.
+    fn of_data(body: usize, end_stream: bool, stream_live: bool) -> Self {
+        match (body > 0 || end_stream, stream_live) {
+            (true, true) => Self::Progress,
+            (true, false) => Self::Control,
+            (false, _) => Self::Odd,
         }
     }
 }
@@ -499,8 +506,8 @@ impl<H: Handler> Protocol<H> {
 
     /// §5.4.1 for a peer that is not making requests. An odd frame spends both
     /// budgets, so the strict one runs out first.
-    fn count_frame(&mut self, kind: FrameKind, length: u32, flags: u8, stream_live: bool) {
-        match FrameWorth::of(kind, length, flags, stream_live) {
+    fn count_frame(&mut self, worth: FrameWorth) {
+        match worth {
             FrameWorth::Progress => {
                 self.control_frames = 0;
                 self.odd_frames = 0;
@@ -589,6 +596,11 @@ impl<H: Handler> FrameHandler for Protocol<H> {
     ) {
         // Bounded by max_frame_size, itself below 2^24.
         let padded_len = padded_len as u32;
+        let raw: STREAM_ID = stream_id.into();
+
+        // Once per piece of a frame cut by a read, each with a body.
+        let stream_live = self.streams.streams.get(raw).is_some();
+        self.count_frame(FrameWorth::of_data(payload.len(), end_stream, stream_live));
 
         // Debited before anything is decided: the peer spent that credit whatever
         // we make of the frame, or our accounting drifts from its own.
@@ -596,7 +608,6 @@ impl<H: Handler> FrameHandler for Protocol<H> {
             return self.fail_connection(FLOW_CONTROL_ERROR, "connection receive window exceeded");
         }
 
-        let raw: STREAM_ID = stream_id.into();
         let received = self
             .streams
             .recv_data(&self.shared, raw, payload, padded_len, end_stream);
@@ -789,10 +800,11 @@ impl<H: Handler> FrameHandler for Protocol<H> {
 
     /// §3.4: the first frame after the client preface must be its SETTINGS, and
     /// not an ACK.
-    fn on_frame(&mut self, kind: FrameKind, stream_id: StreamId, length: u32, flags: u8) {
-        let stream_live =
-            kind == FrameKind::Data && self.streams.streams.get(stream_id.into()).is_some();
-        self.count_frame(kind, length, flags, stream_live);
+    fn on_frame(&mut self, kind: FrameKind, _stream_id: StreamId, length: u32, flags: u8) {
+        // DATA is counted in `on_data`, where its padding is off.
+        if kind != FrameKind::Data {
+            self.count_frame(FrameWorth::of(kind, length));
+        }
 
         if self.greeting != Greeting::AwaitingSettings {
             return;
