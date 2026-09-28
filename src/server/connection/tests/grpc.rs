@@ -95,15 +95,23 @@ fn a_message_larger_than_the_window_is_credited_as_it_fills() {
     events.push(ReadEvent::Eof.after(Duration::from_secs(1)));
 
     let expected = request.clone();
-    let written = run_connection_with(events, |_, _| {}, move |stream: Stream| {
-        let expected = expected.clone();
-        async move {
-            let frame = stream.message().await.expect("a message").expect("well formed");
-            let decoded: HealthCheckRequest = frame.decode().unwrap();
-            assert_eq!(decoded.encode_to_vec(), expected);
-            stream.write_headers_final(http::StatusCode::OK, &http::HeaderMap::new());
-        }
-    });
+    let written = run_connection_with(
+        events,
+        |_, _| {},
+        move |stream: Stream| {
+            let expected = expected.clone();
+            async move {
+                let frame = stream
+                    .message()
+                    .await
+                    .expect("a message")
+                    .expect("well formed");
+                let decoded: HealthCheckRequest = frame.decode().unwrap();
+                assert_eq!(decoded.encode_to_vec(), expected);
+                stream.write_headers_final(http::StatusCode::OK, &http::HeaderMap::new());
+            }
+        },
+    );
 
     let credited: u32 = written
         .iter()
@@ -141,7 +149,11 @@ async fn health(stream: Stream) {
 
     stream
         .write_message(&HealthCheckResponse {
-            status: if request.service.is_empty() { SERVING } else { 0 },
+            status: if request.service.is_empty() {
+                SERVING
+            } else {
+                0
+            },
         })
         .await;
 
@@ -177,7 +189,9 @@ fn a_unary_call_is_read_decoded_and_answered() {
     // Not credited: its END_STREAM came with it, and a peer that has finished
     // sending has no use for a window.
     assert!(
-        !written.iter().any(|f| f.kind == WINDOW_UPDATE && f.stream_id == 1),
+        !written
+            .iter()
+            .any(|f| f.kind == WINDOW_UPDATE && f.stream_id == 1),
         "nothing left to credit: {written:?}"
     );
 
@@ -267,7 +281,11 @@ fn a_handler_chooses_its_own_metadata_reserved_names_included() {
     let mut bytes = opening();
     bytes.extend_from_slice(&frame(DATA, FLAG_END_STREAM, 1, &framed(&[])));
 
-    let written = run_connection_with(scripted(&bytes), |_, _| {}, service(echoes_its_metadata, not_grpc));
+    let written = run_connection_with(
+        scripted(&bytes),
+        |_, _| {},
+        service(echoes_its_metadata, not_grpc),
+    );
     let ours = on_stream_1(&written);
     assert_eq!(
         ours.iter().map(|f| f.kind).collect::<Vec<_>>(),
@@ -288,7 +306,9 @@ fn a_handler_chooses_its_own_metadata_reserved_names_included() {
 
     let trailers = decode_block(&ours[2].payload);
     assert_eq!(
-        trailers.get("x-grpc-test-echo-trailing-bin").map(String::as_str),
+        trailers
+            .get("x-grpc-test-echo-trailing-bin")
+            .map(String::as_str),
         Some("YWJjMTIz")
     );
     assert_eq!(
@@ -316,13 +336,20 @@ fn a_trailers_only_response_carries_the_heads_fields_too() {
     let mut bytes = opening();
     bytes.extend_from_slice(&frame(DATA, FLAG_END_STREAM, 1, &framed(&[])));
 
-    let written = run_connection_with(scripted(&bytes), |_, _| {}, service(fails_with_metadata, not_grpc));
+    let written = run_connection_with(
+        scripted(&bytes),
+        |_, _| {},
+        service(fails_with_metadata, not_grpc),
+    );
     let ours = on_stream_1(&written);
     assert_eq!(ours.iter().map(|f| f.kind).collect::<Vec<_>>(), [HEADERS]);
     assert_eq!(ours[0].flags & FLAG_END_STREAM, FLAG_END_STREAM);
 
     let fields = decode_block(&ours[0].payload);
-    assert_eq!(fields.get("x-request-id").map(String::as_str), Some("abc123"));
+    assert_eq!(
+        fields.get("x-request-id").map(String::as_str),
+        Some("abc123")
+    );
     assert_eq!(fields.get("grpc-status").map(String::as_str), Some("12"));
     assert_eq!(
         fields.get("content-type").map(String::as_str),
@@ -543,10 +570,7 @@ fn messages_split_across_data_frames_arrive_whole() {
         },
     );
 
-    assert!(
-        !written.iter().any(|f| f.kind == GOAWAY),
-        "{written:?}"
-    );
+    assert!(!written.iter().any(|f| f.kind == GOAWAY), "{written:?}");
     for n in 0..cuts.len() {
         let id = 1 + 2 * n as u32;
         assert!(

@@ -792,11 +792,7 @@ mod arena {
         poisoned.extend_from_slice(&[0xff; 5]);
         let mut attacker = Decoder::new(4096);
         let mut buf = block(&poisoned);
-        assert!(
-            attacker
-                .decode(&mut Cursor::new(&mut buf), |_| {})
-                .is_err()
-        );
+        assert!(attacker.decode(&mut Cursor::new(&mut buf), |_| {}).is_err());
 
         let mut honest = Vec::new();
         huffman::encode(b"/ok", &mut honest);

@@ -147,6 +147,10 @@ fn a_request_and_its_response_cross_a_tls_connection() {
 
     let (status, peer, body) = outcome.expect("the exchange completed");
     assert_eq!(status, 200);
-    assert_eq!(peer.as_deref(), Some("127.0.0.1"), "the handler saw its peer");
+    assert_eq!(
+        peer.as_deref(),
+        Some("127.0.0.1"),
+        "the handler saw its peer"
+    );
     assert_eq!(body, BODY, "the response body crossed intact");
 }

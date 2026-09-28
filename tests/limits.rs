@@ -24,7 +24,9 @@ fn run_refuses_limits_that_do_not_add_up() {
             max_concurrent_streams: 0,
             ..Limits::default()
         };
-        Server::new(settings).run::<ServerRing, _>(unreachable).await
+        Server::new(settings)
+            .run::<ServerRing, _>(unreachable)
+            .await
     })
     .expect_err("refused");
 

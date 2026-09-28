@@ -144,12 +144,7 @@ impl Encoder {
         }
     }
 
-    fn encode_header_without_name(
-        &mut self,
-        last: &Index,
-        value: &HeaderValue,
-        dst: &mut Vec<u8>,
-    ) {
+    fn encode_header_without_name(&mut self, last: &Index, value: &HeaderValue, dst: &mut Vec<u8>) {
         match *last {
             Index::Indexed(..)
             | Index::Name(..)
@@ -663,7 +658,10 @@ mod test {
             first, second,
             "the same literal, re-encoded and re-Huffman-coded every time"
         );
-        assert!(second.len() > 20, "the whole string is on the wire: {second:?}");
+        assert!(
+            second.len() > 20,
+            "the whole string is on the wire: {second:?}"
+        );
     }
 
     #[test]
@@ -695,7 +693,11 @@ mod test {
 
         encode(&mut encoder, one());
         encode(&mut encoder, two());
-        assert_eq!(encode(&mut encoder, one()).len(), 1, "the first is still there");
+        assert_eq!(
+            encode(&mut encoder, one()).len(),
+            1,
+            "the first is still there"
+        );
         assert_eq!(encode(&mut encoder, two()).len(), 1, "and so is the second");
     }
 

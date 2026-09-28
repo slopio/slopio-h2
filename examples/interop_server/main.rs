@@ -45,7 +45,10 @@ fn main() {
 
 async fn serve(port: u16) {
     let settings = ServerSettings::new(([0, 0, 0, 0], port), ServerTransport::Plain);
-    if let Err(e) = Server::new(settings).run::<MyBufRing, _>(service(route, plain_http)).await {
+    if let Err(e) = Server::new(settings)
+        .run::<MyBufRing, _>(service(route, plain_http))
+        .await
+    {
         eprintln!("server error: {e}");
     }
 }
@@ -131,7 +134,9 @@ async fn streaming_input(call: &GrpcCall) -> Status {
         {
             return refusal;
         }
-        total += request.payload.map_or(0, |payload| payload.body.len() as i32);
+        total += request
+            .payload
+            .map_or(0, |payload| payload.body.len() as i32);
     }
 
     call.write_message(&StreamingInputCallResponse {

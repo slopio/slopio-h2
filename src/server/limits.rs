@@ -112,25 +112,58 @@ mod tests {
     fn a_set_that_does_not_add_up_is_refused() {
         let refused = |limits: Limits| limits.validate().is_err();
         let base = Limits::default();
-        assert!(refused(Limits { max_concurrent_streams: 0, ..base }));
-        assert!(refused(Limits { stream_window: 65_534, ..base }));
-        assert!(refused(Limits { stream_window: 1 << 31, ..base }));
+        assert!(refused(Limits {
+            max_concurrent_streams: 0,
+            ..base
+        }));
+        assert!(refused(Limits {
+            stream_window: 65_534,
+            ..base
+        }));
+        assert!(refused(Limits {
+            stream_window: 1 << 31,
+            ..base
+        }));
         assert!(refused(Limits {
             max_concurrent_streams: 2048,
             stream_window: 1 << 20,
             ..base
         }));
-        assert!(refused(Limits { max_header_list_size: 0, ..base }));
-        assert!(refused(Limits { idle_timeout: Duration::from_secs(4), ..base }));
+        assert!(refused(Limits {
+            max_header_list_size: 0,
+            ..base
+        }));
+        assert!(refused(Limits {
+            idle_timeout: Duration::from_secs(4),
+            ..base
+        }));
         #[cfg(feature = "tls")]
         {
-            assert!(refused(Limits { tls_handshake_timeout: Duration::ZERO, ..base }));
-            assert!(refused(Limits { tls_handshake_timeout: MAX_SLEEP + Duration::from_secs(1), ..base }));
-            assert!(!refused(Limits { tls_handshake_timeout: MAX_SLEEP, ..base }));
+            assert!(refused(Limits {
+                tls_handshake_timeout: Duration::ZERO,
+                ..base
+            }));
+            assert!(refused(Limits {
+                tls_handshake_timeout: MAX_SLEEP + Duration::from_secs(1),
+                ..base
+            }));
+            assert!(!refused(Limits {
+                tls_handshake_timeout: MAX_SLEEP,
+                ..base
+            }));
         }
-        assert!(!refused(Limits { drain_timeout: Duration::ZERO, ..base }));
-        assert!(!refused(Limits { drain_timeout: MAX_SLEEP - DRAIN_GRACE, ..base }));
-        assert!(refused(Limits { drain_timeout: MAX_SLEEP, ..base }));
+        assert!(!refused(Limits {
+            drain_timeout: Duration::ZERO,
+            ..base
+        }));
+        assert!(!refused(Limits {
+            drain_timeout: MAX_SLEEP - DRAIN_GRACE,
+            ..base
+        }));
+        assert!(refused(Limits {
+            drain_timeout: MAX_SLEEP,
+            ..base
+        }));
         assert!(!refused(Limits {
             max_concurrent_streams: 1024,
             stream_window: 1 << 20,

@@ -3,10 +3,7 @@ use crate::shared::codec::frames::stream_id::StreamId;
 #[derive(Debug, Clone, Copy)]
 pub enum DecodeError {
     /// §5.4.1. Once reported, the decoder no-ops on subsequent `decode_with` calls.
-    Connection {
-        code: u32,
-        message: &'static str,
-    },
+    Connection { code: u32, message: &'static str },
     /// §5.4.2. Decoding continues with the next frame; the in-progress frame
     /// is discarded.
     Stream {
@@ -61,7 +58,9 @@ impl StreamViolation {
             Self::ZeroWindowIncrement => "WINDOW_UPDATE with zero increment",
             Self::StreamWindowOverflow => "stream send window exceeds 2^31-1",
             Self::PriorityLength => "PRIORITY frame must be 5 bytes",
-            Self::PrioritySelfDependency | Self::HeadersSelfDependency => "stream depends on itself",
+            Self::PrioritySelfDependency | Self::HeadersSelfDependency => {
+                "stream depends on itself"
+            }
             Self::MalformedMessage => "malformed message",
             Self::MalformedRequest => "malformed request",
             Self::MalformedResponse => "malformed response",

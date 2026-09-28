@@ -134,13 +134,7 @@ pub trait FrameHandler {
     /// Not once per frame: an unpadded DATA frame cut by a read comes one call
     /// per piece, each accounting for its own bytes; only the last carries
     /// `end_stream`. [`on_frame`](Self::on_frame) is still once per frame.
-    fn on_data(
-        &mut self,
-        stream_id: StreamId,
-        payload: &[u8],
-        padded_len: usize,
-        end_stream: bool,
-    );
+    fn on_data(&mut self, stream_id: StreamId, payload: &[u8], padded_len: usize, end_stream: bool);
 
     fn stream_error_scope(&self, _violation: StreamViolation) -> ErrorScope {
         ErrorScope::Stream
@@ -764,7 +758,9 @@ fn dispatch_frame<H: FrameHandler>(
                         PROTOCOL_ERROR,
                         "WINDOW_UPDATE with zero increment on connection",
                     ),
-                    false => report_violation(handler, stream_id, StreamViolation::ZeroWindowIncrement),
+                    false => {
+                        report_violation(handler, stream_id, StreamViolation::ZeroWindowIncrement)
+                    }
                 };
             }
             handler.on_window_update(stream_id, increment);
@@ -840,7 +836,11 @@ fn dispatch_frame<H: FrameHandler>(
             }
             let (dep_id, _exclusive) = StreamId::parse(&payload[..4]);
             if dep_id == stream_id {
-                return report_violation(handler, stream_id, StreamViolation::PrioritySelfDependency);
+                return report_violation(
+                    handler,
+                    stream_id,
+                    StreamViolation::PrioritySelfDependency,
+                );
             }
         }
 
@@ -964,13 +964,20 @@ mod tests {
             vec![(ENHANCE_YOUR_CALM, "header block exceeds maximum size")],
             "flood must raise exactly one ENHANCE_YOUR_CALM connection error",
         );
-        assert_eq!(rec.headers, 0, "block never completes, so no headers dispatched");
+        assert_eq!(
+            rec.headers, 0,
+            "block never completes, so no headers dispatched"
+        );
 
         // Poisoned: further flood is ignored, so memory cannot keep growing.
         let mut more = Vec::new();
         push_frame(&mut more, CONTINUATION, 0x0, 1, &frame_payload);
         decoder.decode_with(&more, &mut rec);
-        assert_eq!(rec.errors.len(), 1, "poisoned decoder raises no further errors");
+        assert_eq!(
+            rec.errors.len(),
+            1,
+            "poisoned decoder raises no further errors"
+        );
     }
 
     #[test]
@@ -988,8 +995,15 @@ mod tests {
         let mut decoder = FrameDecoder::new();
         decoder.decode_with(&input, &mut rec);
 
-        assert!(rec.errors.is_empty(), "valid small block must not error: {:?}", rec.errors);
-        assert_eq!(rec.headers, 1, "the reassembled block must be dispatched once");
+        assert!(
+            rec.errors.is_empty(),
+            "valid small block must not error: {:?}",
+            rec.errors
+        );
+        assert_eq!(
+            rec.headers, 1,
+            "the reassembled block must be dispatched once"
+        );
     }
     #[derive(Default)]
     struct DataRecorder {

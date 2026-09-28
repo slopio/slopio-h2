@@ -39,7 +39,9 @@ fn a_handler_sees_the_address_its_peer_connected_from() {
     thread::spawn(move || {
         main_thread_with::<ServerRing, _>(async move {
             let settings = ServerSettings::new(([127, 0, 0, 1], port), ServerTransport::Plain);
-            let _ = Server::new(settings).run::<ServerRing, _>(tell_the_peer).await;
+            let _ = Server::new(settings)
+                .run::<ServerRing, _>(tell_the_peer)
+                .await;
         });
     });
 

@@ -26,7 +26,9 @@ fn opened(streams: &[(u32, u8, &[u8])]) -> Vec<super::Scripted> {
 
 /// §6.5.1: six octets a setting, identifier then value.
 fn announced(written: &[Frame], id: u16) -> Option<u32> {
-    let preface = written.iter().find(|f| f.kind == SETTINGS && f.flags == 0)?;
+    let preface = written
+        .iter()
+        .find(|f| f.kind == SETTINGS && f.flags == 0)?;
     preface.payload.chunks_exact(6).find_map(|entry| {
         (u16::from_be_bytes([entry[0], entry[1]]) == id)
             .then(|| u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]))
@@ -97,9 +99,14 @@ fn a_header_list_past_max_header_list_size_is_refused() {
         echo,
     );
 
-    assert!(refused(&written, 1), "the large one was refused: {written:?}");
     assert!(
-        written.iter().any(|f| f.kind == HEADERS && f.stream_id == 3),
+        refused(&written, 1),
+        "the large one was refused: {written:?}"
+    );
+    assert!(
+        written
+            .iter()
+            .any(|f| f.kind == HEADERS && f.stream_id == 3),
         "the small one was served: {written:?}"
     );
 }

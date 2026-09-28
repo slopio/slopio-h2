@@ -386,8 +386,10 @@ impl<H: Handler> Protocol<H> {
     }
 
     pub(super) fn is_done(&self) -> bool {
-        matches!(self.phase, Phase::Draining { .. } | Phase::HalfClosed { .. })
-            && !self.has_live_streams()
+        matches!(
+            self.phase,
+            Phase::Draining { .. } | Phase::HalfClosed { .. }
+        ) && !self.has_live_streams()
     }
 
     pub(super) fn shared_handle(&self) -> Rc<SharedConnection> {

@@ -211,7 +211,13 @@ mod tests {
         assert_eq!(frame.missing(), 2, "nothing of it was taken");
 
         assert_eq!(frame.push(b"bc"), Ok(()));
-        assert_eq!(frame.push(b"d"), Err(FrameOverflow { missing: 0, pushed: 1 }));
+        assert_eq!(
+            frame.push(b"d"),
+            Err(FrameOverflow {
+                missing: 0,
+                pushed: 1
+            })
+        );
         assert_eq!(&*data_of(frame.finish().ok().unwrap()), b"abc");
     }
 
@@ -229,7 +235,10 @@ mod tests {
 
     #[test]
     fn an_empty_frame_finishes_at_once() {
-        let frame = Accumulating::new(0, None, GrpcFormat::Proto).finish().ok().unwrap();
+        let frame = Accumulating::new(0, None, GrpcFormat::Proto)
+            .finish()
+            .ok()
+            .unwrap();
         assert!(data_of(frame).is_empty());
     }
 
@@ -244,7 +253,11 @@ mod tests {
         assert_eq!(frame.bytes.capacity(), FIRST, "fits: nothing moves");
 
         frame.push(&[2]).unwrap();
-        assert_eq!(frame.bytes.capacity(), expected, "once, to exactly the announced length");
+        assert_eq!(
+            frame.bytes.capacity(),
+            expected,
+            "once, to exactly the announced length"
+        );
 
         frame.push(&vec![3; expected - FIRST - 1]).unwrap();
         assert_eq!(frame.bytes.capacity(), expected, "and never again");

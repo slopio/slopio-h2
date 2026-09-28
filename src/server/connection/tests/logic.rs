@@ -8,8 +8,8 @@ use runtime_core::runtime::time::Sleep;
 
 use super::{
     DATA, FLAG_END_HEADERS, FLAG_END_STREAM, Frame, GET_BLOCK, GOAWAY, HEADERS, PING, PREFACE,
-    RST_STREAM, SETTINGS, deliveries, frame, run_connection, run_connection_with,
-    run_connection_timed, run_connection_writes,
+    RST_STREAM, SETTINGS, deliveries, frame, run_connection, run_connection_timed,
+    run_connection_with, run_connection_writes,
 };
 
 const FLAG_PADDED: u8 = 0x8;
@@ -194,7 +194,10 @@ fn a_handler_slower_than_the_active_deadline_is_waited_for() {
         .iter()
         .position(|f| f.kind == HEADERS && f.stream_id == 1)
         .unwrap_or_else(|| panic!("the slow handler's response went out: {written:?}"));
-    assert!(probe < response, "asked while the handler worked: {written:?}");
+    assert!(
+        probe < response,
+        "asked while the handler worked: {written:?}"
+    );
     assert_eq!(status_of(&written[response]).as_deref(), Some("200"));
     assert!(
         !written[..response].iter().any(|f| f.kind == GOAWAY),
@@ -316,11 +319,15 @@ fn a_half_close_resets_the_bodies_it_cut_short() {
         crate::shared::codec::types::CANCEL
     );
     assert!(
-        !written.iter().any(|f| f.kind == HEADERS && f.stream_id == 1),
+        !written
+            .iter()
+            .any(|f| f.kind == HEADERS && f.stream_id == 1),
         "and its handler did not answer a body it never got: {written:?}"
     );
     assert!(
-        written.iter().any(|f| f.kind == HEADERS && f.stream_id == 3),
+        written
+            .iter()
+            .any(|f| f.kind == HEADERS && f.stream_id == 3),
         "the finished request beside it was answered: {written:?}"
     );
 }
@@ -355,7 +362,10 @@ fn a_half_closed_peer_is_not_waited_on_forever() {
         .iter()
         .find(|f| f.kind == GOAWAY)
         .unwrap_or_else(|| panic!("the connection was closed, and said so: {written:?}"));
-    assert_eq!(&goaway.payload[8..], b"peer half-closed, answers not finished");
+    assert_eq!(
+        &goaway.payload[8..],
+        b"peer half-closed, answers not finished"
+    );
     assert!(
         !written.iter().any(|f| f.kind == PING && f.flags & 0x1 == 0),
         "and nobody asked a peer that cannot answer: {written:?}"
@@ -595,13 +605,25 @@ fn a_refused_field_resets_its_stream_and_nothing_else() {
     // `x-ok: 1`, then `x-bad: a\r\nb`, both literals with incremental
     // indexing: x-bad is entry 62, x-ok entry 63.
     first.extend_from_slice(&[0x40, 4, b'x', b'-', b'o', b'k', 1, b'1']);
-    first.extend_from_slice(&[0x40, 5, b'x', b'-', b'b', b'a', b'd', 4, b'a', b'\r', b'\n', b'b']);
+    first.extend_from_slice(&[
+        0x40, 5, b'x', b'-', b'b', b'a', b'd', 4, b'a', b'\r', b'\n', b'b',
+    ]);
     let mut second = GET_BLOCK.to_vec();
     second.push(0x80 | 63);
 
     let mut bytes = preface();
-    bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, &first));
-    bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 3, &second));
+    bytes.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &first,
+    ));
+    bytes.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        3,
+        &second,
+    ));
 
     let written = run_connection(vec![ReadEvent::Data(bytes), ReadEvent::Eof], |_, _| {});
 
@@ -619,7 +641,9 @@ fn a_refused_field_resets_its_stream_and_nothing_else() {
         written.iter().find(|f| f.kind == GOAWAY)
     );
     assert!(
-        written.iter().any(|f| f.kind == HEADERS && f.stream_id == 3),
+        written
+            .iter()
+            .any(|f| f.kind == HEADERS && f.stream_id == 3),
         "and the next request, indexing past it, was served: {written:?}"
     );
 }
@@ -630,7 +654,12 @@ fn a_refused_field_resets_its_stream_and_nothing_else() {
 fn trailers_behind_a_malformed_request_do_not_end_the_connection() {
     let mut bytes = preface();
     // `:method GET` twice: decodes fine, and is malformed (§8.3).
-    bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, &[0x82, 0x82, 0x86, 0x84]));
+    bytes.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &[0x82, 0x82, 0x86, 0x84],
+    ));
     bytes.extend_from_slice(&frame(DATA, 0, 1, b"already on the wire"));
     // `x: y`, as a literal without indexing.
     bytes.extend_from_slice(&frame(
@@ -662,7 +691,9 @@ fn trailers_behind_a_malformed_request_do_not_end_the_connection() {
         "one reset, and the frames behind it ignored: {written:?}"
     );
     assert!(
-        written.iter().any(|f| f.kind == HEADERS && f.stream_id == 3),
+        written
+            .iter()
+            .any(|f| f.kind == HEADERS && f.stream_id == 3),
         "and the next request was served: {written:?}"
     );
 }
@@ -712,7 +743,12 @@ fn trailers_behind_a_refused_stream_do_not_end_the_connection() {
 fn a_body_in_flight_behind_a_malformed_request_does_not_end_the_connection() {
     let mut bytes = preface();
     // `:method GET` twice: decodes fine, and is malformed (§8.3).
-    bytes.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, &[0x82, 0x82, 0x86, 0x84]));
+    bytes.extend_from_slice(&frame(
+        HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &[0x82, 0x82, 0x86, 0x84],
+    ));
     bytes.extend_from_slice(&frame(DATA, FLAG_END_STREAM, 1, b"already on the wire"));
     bytes.extend_from_slice(&frame(
         HEADERS,
@@ -724,7 +760,9 @@ fn a_body_in_flight_behind_a_malformed_request_does_not_end_the_connection() {
     let written = run_connection(vec![ReadEvent::Data(bytes), ReadEvent::Eof], |_, _| {});
 
     assert!(
-        written.iter().any(|f| f.kind == RST_STREAM && f.stream_id == 1),
+        written
+            .iter()
+            .any(|f| f.kind == RST_STREAM && f.stream_id == 1),
         "the malformed request was reset: {written:?}"
     );
     assert!(
@@ -733,7 +771,9 @@ fn a_body_in_flight_behind_a_malformed_request_does_not_end_the_connection() {
         written.iter().find(|f| f.kind == GOAWAY)
     );
     assert!(
-        written.iter().any(|f| f.kind == HEADERS && f.stream_id == 3),
+        written
+            .iter()
+            .any(|f| f.kind == HEADERS && f.stream_id == 3),
         "and the next request was served: {written:?}"
     );
 }
@@ -765,7 +805,9 @@ fn an_early_response_does_not_strand_the_upload() {
     let reset = written
         .iter()
         .find(|f| f.kind == RST_STREAM && f.stream_id == 1)
-        .unwrap_or_else(|| panic!("60 KB into a 64 KB window, and the peer was told nothing: {written:?}"));
+        .unwrap_or_else(|| {
+            panic!("60 KB into a 64 KB window, and the peer was told nothing: {written:?}")
+        });
     assert_eq!(
         u32::from_be_bytes(reset.payload[..4].try_into().unwrap()),
         crate::shared::codec::types::NO_ERROR,
@@ -818,7 +860,9 @@ fn trailers_in_flight_after_an_early_response_do_not_end_the_connection() {
         written.iter().find(|f| f.kind == GOAWAY)
     );
     assert!(
-        written.iter().any(|f| f.kind == HEADERS && f.stream_id == 3),
+        written
+            .iter()
+            .any(|f| f.kind == HEADERS && f.stream_id == 3),
         "and the next request was served: {written:?}"
     );
 }
@@ -847,7 +891,10 @@ fn a_grpc_call_with_no_body_is_still_grpc() {
         |stream: crate::server::Stream| async move {
             assert!(stream.is_grpc());
             assert_eq!(stream.grpc_format(), Some(crate::grpc::GrpcFormat::Json));
-            assert!(stream.message().await.is_none(), "half-closed, nothing sent");
+            assert!(
+                stream.message().await.is_none(),
+                "half-closed, nothing sent"
+            );
 
             let mut fields = http::HeaderMap::new();
             fields.insert("grpc-status", http::HeaderValue::from_static("13"));
@@ -905,7 +952,9 @@ fn a_handler_that_panics_fails_its_stream_and_nothing_else() {
     assert_eq!(head(1).flags & FLAG_END_STREAM, FLAG_END_STREAM);
     assert_eq!(status_of(head(3)).as_deref(), Some("200"));
     assert!(
-        !written.iter().any(|f| f.kind == GOAWAY || f.kind == RST_STREAM),
+        !written
+            .iter()
+            .any(|f| f.kind == GOAWAY || f.kind == RST_STREAM),
         "{written:?}"
     );
 }

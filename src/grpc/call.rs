@@ -144,12 +144,12 @@ impl From<GrpcError> for Status {
             GrpcError::TooManyMessages => {
                 Status::resource_exhausted("too many messages waiting to be read")
             }
-            GrpcError::UnsupportedEncoding => {
-                Status::unimplemented("grpc-encoding names a compression this server has no name for")
-            }
-            GrpcError::CompressedWithoutEncoding => {
-                Status::internal("a compressed message on a request that announced no grpc-encoding")
-            }
+            GrpcError::UnsupportedEncoding => Status::unimplemented(
+                "grpc-encoding names a compression this server has no name for",
+            ),
+            GrpcError::CompressedWithoutEncoding => Status::internal(
+                "a compressed message on a request that announced no grpc-encoding",
+            ),
             GrpcError::InvalidCompressedFlag(_) => {
                 Status::internal("a Compressed-Flag that is neither 0 nor 1")
             }
@@ -184,8 +184,7 @@ where
             let status = match call.timeout {
                 None => grpc(&call).await,
                 Some(timeout) => {
-                    match runtime::runtime::select::select(grpc(&call), sleep(timeout)).await
-                    {
+                    match runtime::runtime::select::select(grpc(&call), sleep(timeout)).await {
                         runtime::runtime::select::SelectResult::First(status) => status,
                         runtime::runtime::select::SelectResult::Second(()) => {
                             Status::new(Code::DeadlineExceeded, "deadline exceeded")
