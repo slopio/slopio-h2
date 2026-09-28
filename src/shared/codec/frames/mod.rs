@@ -27,8 +27,8 @@ pub const DEFAULT_MAX_FRAME_SIZE: u32 = 16_384;
 /// §3.4.
 pub const CLIENT_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
-/// Limit on the *decompressed* header-list size (RFC 7541 §4.1: name + value
-/// + 32 octets per field); the compressed cap cannot see an HPACK bomb.
+/// Limit on the *decompressed* header-list size (RFC 7541 §4.1: name, value
+/// and 32 octets per field); the compressed cap cannot see an HPACK bomb.
 /// Decoding always runs to the end (HPACK state must stay in sync); fields past
 /// the limit are dropped and the block is flagged `is_over_size`.
 pub const DECODE_MAX_HEADER_LIST_SIZE: usize = 16 * 1024;
@@ -336,7 +336,6 @@ fn report_stream<H: FrameHandler>(
     handler.on_error(DecodeError::Stream {
         stream_id,
         violation,
-        code: violation.code(),
         message: violation.message(),
     });
     Ok(())
@@ -926,7 +925,9 @@ mod tests {
         fn on_error(&mut self, err: DecodeError) {
             match err {
                 DecodeError::Connection { code, message } => self.errors.push((code, message)),
-                DecodeError::Stream { code, message, .. } => self.errors.push((code, message)),
+                DecodeError::Stream {
+                    violation, message, ..
+                } => self.errors.push((violation.code(), message)),
             }
         }
     }
@@ -1040,7 +1041,9 @@ mod tests {
         fn on_error(&mut self, err: DecodeError) {
             match err {
                 DecodeError::Connection { code, message } => self.errors.push((code, message)),
-                DecodeError::Stream { code, message, .. } => self.errors.push((code, message)),
+                DecodeError::Stream {
+                    violation, message, ..
+                } => self.errors.push((violation.code(), message)),
             }
         }
     }

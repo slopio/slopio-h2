@@ -9,8 +9,8 @@ pub enum DecodeError {
     Stream {
         stream_id: StreamId,
         /// A malformed HEADERS still spent its stream id; a bad PRIORITY did not.
+        /// Its code is the reset's: `violation.code()`.
         violation: StreamViolation,
-        code: u32,
         message: &'static str,
     },
 }
@@ -74,23 +74,11 @@ impl StreamViolation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorScope {
     Stream,
+    #[expect(
+        dead_code,
+        reason = "what `FrameHandler::stream_error_scope` may escalate to; no handler does yet"
+    )]
     Connection,
-}
-
-impl DecodeError {
-    pub fn code(&self) -> u32 {
-        match self {
-            DecodeError::Connection { code, .. } | DecodeError::Stream { code, .. } => *code,
-        }
-    }
-
-    pub fn message(&self) -> &'static str {
-        match self {
-            DecodeError::Connection { message, .. } | DecodeError::Stream { message, .. } => {
-                *message
-            }
-        }
-    }
 }
 
 impl std::fmt::Display for DecodeError {

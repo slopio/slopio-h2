@@ -279,13 +279,10 @@ impl Table {
 
         let pos_idx = 0usize.wrapping_sub(self.inserted);
 
-        let prev = mem::replace(
-            &mut self.indices[probe],
-            Some(Pos {
-                index: pos_idx,
-                hash,
-            }),
-        );
+        let prev = self.indices[probe].replace(Pos {
+            index: pos_idx,
+            hash,
+        });
 
         if let Some(mut prev) = prev {
             let mut probe = probe + 1;
@@ -293,7 +290,7 @@ impl Table {
             probe_loop!(probe < self.indices.len(), {
                 let pos = &mut self.indices[probe];
 
-                prev = match mem::replace(pos, Some(prev)) {
+                prev = match pos.replace(prev) {
                     Some(p) => p,
                     None => break,
                 };
@@ -440,11 +437,11 @@ impl Table {
         let mut first_ideal = 0;
 
         for (i, pos) in self.indices.iter().enumerate() {
-            if let Some(pos) = *pos {
-                if 0 == probe_distance(self.mask, pos.hash, i) {
-                    first_ideal = i;
-                    break;
-                }
+            if let Some(pos) = *pos
+                && 0 == probe_distance(self.mask, pos.hash, i)
+            {
+                first_ideal = i;
+                break;
             }
         }
 

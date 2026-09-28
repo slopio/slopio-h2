@@ -119,16 +119,10 @@ impl<R: BufRingSpec> Transport for PlainMessages<R, true> {
     type Buf = BorrowedBuffer<R>;
     type Security = PlainText;
 
-    fn send<B: IoBuf>(
-        &mut self,
-        bufs: Vec<B>,
-        may_hold: bool,
-    ) -> impl Future<Output = (io::Result<()>, Vec<B>)> {
-        async move {
-            match may_hold && batch_bytes(&bufs) >= ZC_MIN_BATCH {
-                true => send_vectored_all_zc(self.recv.socket(), bufs).await,
-                false => send_vectored_all(self.recv.socket(), bufs).await,
-            }
+    async fn send<B: IoBuf>(&mut self, bufs: Vec<B>, may_hold: bool) -> (io::Result<()>, Vec<B>) {
+        match may_hold && batch_bytes(&bufs) >= ZC_MIN_BATCH {
+            true => send_vectored_all_zc(self.recv.socket(), bufs).await,
+            false => send_vectored_all(self.recv.socket(), bufs).await,
         }
     }
 }

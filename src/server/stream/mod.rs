@@ -131,10 +131,6 @@ impl StreamState {
         })
     }
 
-    pub fn created_at(&self) -> SystemTime {
-        self.created_at
-    }
-
     /// Floors at zero on a wall clock that stepped backwards, so a clock
     /// adjustment never fails a request.
     pub fn age(&self) -> Duration {

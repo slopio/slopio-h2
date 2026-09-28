@@ -8,12 +8,6 @@ pub struct Protocol {
 }
 
 impl Protocol {
-    pub const fn from_static(value: &'static str) -> Self {
-        Self {
-            value: BytesStr::from_static(value),
-        }
-    }
-
     pub fn as_str(&self) -> &str {
         self.value.as_str()
     }

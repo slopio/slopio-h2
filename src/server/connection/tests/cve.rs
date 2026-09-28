@@ -380,9 +380,7 @@ fn an_hpack_bomb_is_refused_by_the_decoded_size() {
 
     // Five references to index 62, the entry just added: one byte each, and
     // each costs 1 + 4000 + 32 against the list size.
-    for _ in 0..5 {
-        block.push(0xBE);
-    }
+    block.extend_from_slice(&[0xBE; 5]);
 
     let mut bytes = preface();
     bytes.extend_from_slice(&frame(

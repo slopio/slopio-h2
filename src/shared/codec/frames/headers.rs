@@ -218,15 +218,15 @@ impl HeaderBlock {
 
             match header {
                 Field { name, value } => {
-                    // Connection-specific fields must be a protocol error.
+                    // Connection-specific fields must be a protocol error;
+                    // `te` may stay only as `trailers`.
                     if name == header::CONNECTION
                         || name == header::TRANSFER_ENCODING
                         || name == header::UPGRADE
                         || name == "keep-alive"
                         || name == "proxy-connection"
+                        || (name == header::TE && value != "trailers")
                     {
-                        malformed = true;
-                    } else if name == header::TE && value != "trailers" {
                         malformed = true;
                     } else {
                         reg = true;

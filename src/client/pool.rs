@@ -607,7 +607,7 @@ impl Drop for Done<'_> {
 
 /// A client holding `connection` for `uri`'s origin, and opening no other:
 /// lets tests put a scripted connection behind the client's API.
-#[cfg(test)]
+#[cfg(all(test, feature = "grpc"))]
 pub(crate) fn holding<S: Security>(connection: Connection<S>, uri: &str) -> Client<S> {
     let client = Client::with_opener(Box::new(|_, _| {
         Box::pin(async { Err(io::Error::other("this client opens no connection")) })

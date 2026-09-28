@@ -9,15 +9,15 @@ pub struct Head {
     stream_id: StreamId,
 }
 
+/// The frames this end writes: never PRIORITY (RFC 9113 deprecates it), never
+/// PUSH_PROMISE (the client refuses push, the server never offers it).
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Kind {
     Data = 0,
     Headers = 1,
-    Priority = 2,
     Reset = 3,
     Settings = 4,
-    PushPromise = 5,
     Ping = 6,
     GoAway = 7,
     WindowUpdate = 8,
@@ -35,10 +35,6 @@ impl Head {
 
     pub fn stream_id(&self) -> StreamId {
         self.stream_id
-    }
-
-    pub fn kind(&self) -> Kind {
-        self.kind
     }
 
     pub fn flag(&self) -> u8 {

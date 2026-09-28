@@ -247,6 +247,7 @@ impl SharedConnection {
     /// the stream and the connection have credit for and the open segment has
     /// room for; `false` and nothing written otherwise, for the caller to go
     /// through [`write_data`](Self::write_data).
+    #[cfg(feature = "grpc")]
     pub fn try_write_data_in_place<S: SendSide>(
         &self,
         stream_id: StreamId,

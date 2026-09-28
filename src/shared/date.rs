@@ -1,5 +1,9 @@
 //! RFC 9110 §5.6.7: IMF-fixdate is the only format allowed in a new message,
 //! and is always 29 bytes wide.
+//!
+//! Nothing sends a Date now (96d185b): this is kept so that a server can
+//! again, hence nothing here being called.
+#![allow(dead_code)]
 
 use std::cell::RefCell;
 use std::time::UNIX_EPOCH;
@@ -47,10 +51,10 @@ fn imf_fixdate(secs: u64) -> [u8; 29] {
 
     let mut out = *b"Thu, 01 Jan 1970 00:00:00 GMT";
     out[0..3].copy_from_slice(weekday);
-    write_two(&mut out[5..7], day as u64);
+    write_two(&mut out[5..7], day);
     out[8..11].copy_from_slice(MONTHS[month as usize - 1]);
-    write_two(&mut out[12..14], year as u64 / 100);
-    write_two(&mut out[14..16], year as u64 % 100);
+    write_two(&mut out[12..14], year / 100);
+    write_two(&mut out[14..16], year % 100);
     write_two(&mut out[17..19], time / 3600);
     write_two(&mut out[20..22], time % 3600 / 60);
     write_two(&mut out[23..25], time % 60);

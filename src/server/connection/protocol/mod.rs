@@ -574,7 +574,7 @@ fn is_malformed_request(headers: &Headers) -> bool {
     p.status.is_some()
         || p.method.is_none()
         || p.scheme.is_none()
-        || !p.path.as_deref().is_some_and(|path| !path.is_empty())
+        || p.path.as_deref().is_none_or(str::is_empty)
 }
 
 impl<H: Handler> FrameHandler for Protocol<H> {
@@ -610,13 +610,14 @@ impl<H: Handler> FrameHandler for Protocol<H> {
         };
         self.shared.release_stream_credit(spent);
 
-        if received.is_ok() && !end_stream && spent > 0 {
-            if let Some(stream) = self.streams.streams.get(raw)
-                && let Some(increment) = stream.release_recv(spent)
-            {
-                self.shared
-                    .write_frame(|out| encode_window_update(out, stream_id, increment));
-            }
+        if received.is_ok()
+            && !end_stream
+            && spent > 0
+            && let Some(stream) = self.streams.streams.get(raw)
+            && let Some(increment) = stream.release_recv(spent)
+        {
+            self.shared
+                .write_frame(|out| encode_window_update(out, stream_id, increment));
         }
 
         // Either the peer's half closing or the task's token may retire the

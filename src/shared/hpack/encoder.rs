@@ -229,9 +229,7 @@ fn encode_str(val: &[u8], dst: &mut Vec<u8>) {
                 dst[dst_i] = dst[src_i];
             }
 
-            for i in 0..head_len {
-                dst[idx + i] = buf[i];
-            }
+            dst[idx..idx + head_len].copy_from_slice(&buf[..head_len]);
         }
     } else {
         dst.put_u8(0);
@@ -263,7 +261,7 @@ fn encode_int_one_byte(value: usize, prefix_bits: usize) -> bool {
     value < (1 << prefix_bits) - 1
 }
 
-fn position(buf: &Vec<u8>) -> usize {
+fn position(buf: &[u8]) -> usize {
     buf.len()
 }
 
