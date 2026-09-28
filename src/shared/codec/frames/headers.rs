@@ -231,11 +231,15 @@ impl HeaderBlock {
                     } else {
                         reg = true;
 
-                        headers_size += decoded_header_size(name.as_str().len(), value.len());
-                        if headers_size < max_header_list_size {
-                            self.field_size +=
-                                decoded_header_size(name.as_str().len(), value.len());
-                            self.fields.append(name, value);
+                        let size = decoded_header_size(name.as_str().len(), value.len());
+                        headers_size += size;
+                        // `append` panics past the 24 576 names a `HeaderMap`
+                        // holds, which a large enough `max_header_list_size`
+                        // lets a peer reach.
+                        if headers_size < max_header_list_size
+                            && self.fields.try_append(name, value).is_ok()
+                        {
+                            self.field_size += size;
                         } else if !self.is_over_size {
                             self.is_over_size = true;
                         }
@@ -317,4 +321,32 @@ pub fn content_length(fields: &HeaderMap) -> Result<Option<u64>, ()> {
     }
 
     Ok(declared)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::codec::frames::head::Kind;
+
+    /// A `HeaderMap` holds 24 576 names and panics past them. With a limit
+    /// this large the list is within it, so the map is what runs out.
+    #[test]
+    fn a_list_past_what_a_header_map_holds_is_over_size_not_a_panic() {
+        let mut block = Vec::new();
+        for i in 0..25_000u32 {
+            // Literal without indexing, new name: four letters, no value.
+            block.extend_from_slice(&[0x00, 4]);
+            block.extend((0..4).map(|k| b'a' + (i / 26u32.pow(k) % 26) as u8));
+            block.push(0);
+        }
+        let head = Head::new(Kind::Headers, END_HEADERS, StreamId::from(1));
+        let (mut headers, mut src) = Headers::load(head, BytesMut::from(&block[..])).unwrap();
+
+        let limit = 1 << 20;
+        assert!(25_000 * decoded_header_size(4, 0) < limit);
+        headers
+            .load_hpack(&mut src, limit, &mut hpack::Decoder::default())
+            .expect("an over-size list is not malformed");
+        assert!(headers.is_over_size());
+    }
 }
