@@ -35,23 +35,19 @@ async fn serve() {
     }
 }
 
+/// The body counted as it comes, never held whole, whatever the client sent:
+/// `stream.body(limit)` is the other way, for a route that wants it all.
 /// The head first, then the body: DATA on a stream whose peer has had no
 /// HEADERS is a stream the peer cannot make sense of.
 async fn hello(stream: Stream) {
-    let body = match stream.body_is_oneshot() {
-        true => stream.body(usize::MAX).await.map_or(0, |bytes| bytes.len()),
-        false => {
-            let mut total = 0;
-            while stream.readable().await {
-                let taken = stream.peek(|bytes| bytes.len());
-                // Taking the bytes is what credits the peer for them, so a
-                // handler that stops consuming stops the upload (§6.9.1).
-                stream.consume(taken);
-                total += taken;
-            }
-            total
-        }
-    };
+    let mut body = 0;
+    while stream.readable().await {
+        let taken = stream.peek(|bytes| bytes.len());
+        // Taking the bytes is what credits the peer for them, so a handler
+        // that stops consuming stops the upload (§6.9.1).
+        stream.consume(taken);
+        body += taken;
+    }
 
     let greeting = format!(
         "{} {} — {body} bytes of body\n",

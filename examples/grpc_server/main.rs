@@ -3,7 +3,7 @@
 //!     cargo run --example grpc_server
 
 use http::{HeaderMap, StatusCode};
-use popple_h2::grpc::{GrpcCall, Status, service};
+use popple_h2::grpc::{GrpcCall, GrpcRouter, Status, service};
 use popple_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 use runtime::{main_thread_with, thread_per_core_with};
 
@@ -72,23 +72,19 @@ fn main() {
     }
 }
 
+/// gRPC §9.1: a method no route has, `Health/Watch` among them, is
+/// UNIMPLEMENTED rather than a 404.
 async fn serve(port: u16) {
+    let grpc = GrpcRouter::new()
+        .route("/grpc.health.v1.Health/Check", check)
+        .route("/popple.echo.v1.Echo/Chat", chat);
+
     let settings = ServerSettings::new(([0, 0, 0, 0], port), ServerTransport::Plain);
     if let Err(e) = Server::new(settings)
-        .run::<MyBufRing, _>(service(route, plain_http))
+        .run::<MyBufRing, _>(service(grpc, plain_http))
         .await
     {
         eprintln!("server error: {e}");
-    }
-}
-
-/// §9.1: a method this server does not have is UNIMPLEMENTED rather than a 404.
-async fn route(call: &GrpcCall) -> Status {
-    match call.path() {
-        Some("/grpc.health.v1.Health/Check") => check(call).await,
-        Some("/popple.echo.v1.Echo/Chat") => chat(call).await,
-        Some("/grpc.health.v1.Health/Watch") => Status::unimplemented("Watch is not implemented"),
-        _ => Status::unimplemented("no such method"),
     }
 }
 

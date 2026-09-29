@@ -7,7 +7,7 @@
 //!     client -server_host localhost -server_port 8080 -test_case empty_unary
 
 use http::{HeaderMap, StatusCode};
-use popple_h2::grpc::{Code, GrpcCall, Status, service};
+use popple_h2::grpc::{Code, GrpcCall, GrpcRouter, Status, service};
 use popple_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 use runtime::{main_thread_with, thread_per_core_with};
 
@@ -43,36 +43,35 @@ fn main() {
     }
 }
 
+/// `UnimplementedCall` is left out on purpose: a method the router does not
+/// have is UNIMPLEMENTED, which is what the suite expects of it.
 async fn serve(port: u16) {
+    let grpc = GrpcRouter::new()
+        .route("/grpc.testing.TestService/EmptyCall", empty_call)
+        .route("/grpc.testing.TestService/UnaryCall", unary_call)
+        .route("/grpc.testing.TestService/CacheableUnaryCall", unary_call)
+        .route(
+            "/grpc.testing.TestService/StreamingInputCall",
+            streaming_input,
+        )
+        .route(
+            "/grpc.testing.TestService/StreamingOutputCall",
+            streaming_output,
+        )
+        .route("/grpc.testing.TestService/FullDuplexCall", full_duplex)
+        .route("/grpc.testing.TestService/HalfDuplexCall", full_duplex);
+
     let settings = ServerSettings::new(([0, 0, 0, 0], port), ServerTransport::Plain);
     if let Err(e) = Server::new(settings)
-        .run::<MyBufRing, _>(service(route, plain_http))
+        .run::<MyBufRing, _>(service(grpc, plain_http))
         .await
     {
         eprintln!("server error: {e}");
     }
 }
 
-async fn route(call: &GrpcCall) -> Status {
-    // Done once, here, before anything writes.
-    echo_metadata(call);
-
-    match call.path() {
-        Some("/grpc.testing.TestService/EmptyCall") => empty_call(call).await,
-        Some("/grpc.testing.TestService/UnaryCall")
-        | Some("/grpc.testing.TestService/CacheableUnaryCall") => unary_call(call).await,
-        Some("/grpc.testing.TestService/StreamingInputCall") => streaming_input(call).await,
-        Some("/grpc.testing.TestService/StreamingOutputCall") => streaming_output(call).await,
-        Some("/grpc.testing.TestService/FullDuplexCall")
-        | Some("/grpc.testing.TestService/HalfDuplexCall") => full_duplex(call).await,
-        Some("/grpc.testing.TestService/UnimplementedCall") => {
-            Status::unimplemented("UnimplementedCall")
-        }
-        _ => Status::unimplemented("no such method"),
-    }
-}
-
-/// Names ending `-bin` carry base64, which is passed through as it came.
+/// Each method's first act, before anything writes. Names ending `-bin`
+/// carry base64, which is passed through as it came.
 fn echo_metadata(call: &GrpcCall) {
     if let Some(value) = call.fields().get(ECHO_INITIAL) {
         let mut head = HeaderMap::new();
@@ -87,6 +86,7 @@ fn echo_metadata(call: &GrpcCall) {
 }
 
 async fn empty_call(call: &GrpcCall) -> Status {
+    echo_metadata(call);
     match call.message::<Empty>().await {
         Ok(Some(_)) => {
             call.write_message(&Empty {}).await;
@@ -98,6 +98,7 @@ async fn empty_call(call: &GrpcCall) -> Status {
 }
 
 async fn unary_call(call: &GrpcCall) -> Status {
+    echo_metadata(call);
     let request: SimpleRequest = match call.message().await {
         Ok(Some(request)) => request,
         Ok(None) => return Status::invalid_argument("no request message"),
@@ -123,6 +124,7 @@ async fn unary_call(call: &GrpcCall) -> Status {
 }
 
 async fn streaming_input(call: &GrpcCall) -> Status {
+    echo_metadata(call);
     let mut total = 0i32;
     loop {
         let request: StreamingInputCallRequest = match call.message().await {
@@ -147,6 +149,7 @@ async fn streaming_input(call: &GrpcCall) -> Status {
 }
 
 async fn streaming_output(call: &GrpcCall) -> Status {
+    echo_metadata(call);
     let request: StreamingOutputCallRequest = match call.message().await {
         Ok(Some(request)) => request,
         Ok(None) => return Status::invalid_argument("no request message"),
@@ -156,6 +159,7 @@ async fn streaming_output(call: &GrpcCall) -> Status {
 }
 
 async fn full_duplex(call: &GrpcCall) -> Status {
+    echo_metadata(call);
     loop {
         let request: StreamingOutputCallRequest = match call.message().await {
             Ok(Some(request)) => request,
