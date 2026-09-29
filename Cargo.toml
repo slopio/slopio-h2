@@ -57,7 +57,7 @@ matchit = "0.9.2"
 prost = { version = "0.14", default-features = false, features = [
     "std",
 ], optional = true }
-slopio-dns = { git = "ssh://git@github.com/saucisoupe/slopio-dns.git", package = "popple-dns" }
+slopio-dns = { git = "ssh://git@github.com/slopio/slopio-dns.git", package = "popple-dns" }
 slopio-tls = { git = "ssh://git@github.com/saucisoupe/slopio-tls.git", package = "popple-tls", optional = true }
 runtime = { git = "ssh://git@github.com/saucisoupe/runtime.git", version = "0.1.0" }
 runtime-streams = { git = "ssh://git@github.com/saucisoupe/runtime.git" }
