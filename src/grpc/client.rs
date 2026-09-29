@@ -157,6 +157,17 @@ impl Call {
         self.write(message, true).await
     }
 
+    /// A message already framed, its prefix included, and the last: for an
+    /// encoder that writes the wire format itself. Lent, so a buffer kept
+    /// from call to call is copied into the output rather than given up.
+    #[cfg(feature = "otlp")]
+    pub(crate) async fn write_framed_final(&self, framed: &[u8]) -> Result<(), Status> {
+        self.stream
+            .write(framed, true)
+            .await
+            .map_err(|e| sending_failed(&e))
+    }
+
     pub async fn finish(&self) -> Result<(), Status> {
         self.stream
             .write(&[], true)

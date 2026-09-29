@@ -23,12 +23,15 @@ use runtime::tracing::{Collector, SpanWrapper, thread_id};
 
 use crate::client::{PlainText, PlainTextClient};
 use crate::grpc::GrpcClient;
-use proto::{ExportTraceServiceRequest, ExportTraceServiceResponse, Resource, any_value};
 
 const EXPORT_PATH: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
 
 /// A batch still unanswered after this is dropped.
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What the encoding buffer keeps between batches. A burst may grow it past
+/// this; it is given back once the burst is sent.
+const BUFFER_KEPT: usize = 256 * 1024;
 
 /// What the backend files the spans under: OTLP's `service.*` and
 /// `host.name` resource attributes.
@@ -43,7 +46,10 @@ pub struct OtlpService {
 /// in the rings the runtime was started with.
 pub struct OtlpCollector<U> {
     client: GrpcClient<PlainText>,
-    resource: Resource,
+    /// Encoded once: the same for every batch this worker sends.
+    resource: Vec<u8>,
+    /// Each batch is encoded here, gRPC prefix and all.
+    buffer: Vec<u8>,
     _ring: PhantomData<fn() -> U>,
 }
 
@@ -60,6 +66,7 @@ impl<U: BufRingSpec + 'static> OtlpCollector<U> {
         Self {
             client,
             resource: resource(service),
+            buffer: Vec::new(),
             _ring: PhantomData,
         }
     }
@@ -67,42 +74,38 @@ impl<U: BufRingSpec + 'static> OtlpCollector<U> {
 
 impl<U: BufRingSpec + 'static> Collector for OtlpCollector<U> {
     async fn process(&mut self, batch: Vec<SpanWrapper>) {
-        let request = encode::export_request(&self.resource, &batch);
+        encode::export_request(&mut self.buffer, &self.resource, &batch);
         drop(batch);
         // A failed export loses its batch; the client reconnects for the next one.
-        let _ = timeout(
-            EXPORT_TIMEOUT,
-            self.client
-                .unary::<ExportTraceServiceRequest, ExportTraceServiceResponse>(
-                    EXPORT_PATH,
-                    &request,
-                ),
-        )
-        .await;
+        let _ = timeout(EXPORT_TIMEOUT, self.export()).await;
+        self.buffer.shrink_to(BUFFER_KEPT);
     }
 }
 
-fn resource(service: &OtlpService) -> Resource {
-    use any_value::Value::StringValue;
+impl<U: BufRingSpec + 'static> OtlpCollector<U> {
+    /// The response is waited for, the call cancelled otherwise, but not read:
+    /// a partial success is nothing this exporter could act on.
+    async fn export(&self) -> Result<(), ()> {
+        let call = self.client.call(EXPORT_PATH).await.map_err(drop)?;
+        call.write_framed_final(&self.buffer).await.map_err(drop)?;
+        match call.status().await.is_ok() {
+            true => Ok(()),
+            false => Err(()),
+        }
+    }
+}
 
-    let mut attributes = vec![encode::key_value(
-        "service.name",
-        StringValue(service.name.clone()),
-    )];
+fn resource(service: &OtlpService) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode::resource_attribute(&mut out, "service.name", &service.name);
     if let Some(version) = &service.version {
-        attributes.push(encode::key_value(
-            "service.version",
-            StringValue(version.clone()),
-        ));
+        encode::resource_attribute(&mut out, "service.version", version);
     }
     if let Some(host) = &service.host_name {
-        attributes.push(encode::key_value("host.name", StringValue(host.clone())));
+        encode::resource_attribute(&mut out, "host.name", host);
     }
     if let Some(worker) = thread_id() {
-        attributes.push(encode::key_value(
-            "service.instance.id",
-            StringValue(worker.to_string()),
-        ));
+        encode::resource_attribute(&mut out, "service.instance.id", &worker.to_string());
     }
-    Resource { attributes }
+    out
 }

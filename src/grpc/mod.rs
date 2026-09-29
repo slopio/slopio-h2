@@ -17,5 +17,7 @@ pub use frame::{
     MessageError, UncompressedGrpcFrame,
 };
 pub use input::{GrpcError, GrpcInput};
+#[cfg(feature = "otlp")]
+pub(crate) use prefix::PREFIX_LEN;
 pub use request::GrpcFormat;
 pub use status::{Code, Status};
