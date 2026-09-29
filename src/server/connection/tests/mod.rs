@@ -15,6 +15,7 @@ mod dst;
 mod grpc;
 mod limits;
 mod logic;
+mod routing;
 
 use std::time::Duration;
 

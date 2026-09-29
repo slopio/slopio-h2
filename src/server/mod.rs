@@ -19,32 +19,16 @@ use crate::shared::transport::{ALPN_H2, KtlsTransport};
 use crate::shared::transport::{PlainMessages, Transport};
 
 pub(crate) mod connection;
+mod handler;
 mod limits;
+pub mod router;
 mod shutdown;
 mod stream;
 
+pub use handler::{Handler, Incoming, StreamTask};
 pub use limits::Limits;
+pub use router::{Params, Router};
 pub use stream::Stream;
-
-/// Taken by value because the future it returns is spawned and must not
-/// borrow the handler.
-///
-/// A handler that panics fails its own stream, with a `500` or a reset, and
-/// nothing else. Not under `panic = "abort"`, where there is no unwinding to
-/// stop.
-pub trait Handler: Clone + 'static {
-    fn handle(self, stream: Stream) -> impl Future<Output = ()> + 'static;
-}
-
-impl<F, Fut> Handler for F
-where
-    F: FnOnce(Stream) -> Fut + Clone + 'static,
-    Fut: Future<Output = ()> + 'static,
-{
-    fn handle(self, stream: Stream) -> impl Future<Output = ()> + 'static {
-        self(stream)
-    }
-}
 
 pub struct Server {
     pub settings: ServerSettings,

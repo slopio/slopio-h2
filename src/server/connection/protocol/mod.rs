@@ -1,15 +1,13 @@
 use std::net::SocketAddr;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll};
 
 use crate::server::connection::{
     CONNECTION_INITIAL_WINDOW_SIZE, CONNECTION_RECV_WINDOW,
     shared_with_streams::{LiveStreams, StreamToken, retire_if_closed},
 };
+use crate::server::handler;
 use crate::server::stream::{Lifecycle, StreamState};
-use crate::server::{Handler, Limits, Stream};
+use crate::server::{Handler, Incoming, Limits, Stream};
 use crate::shared::codec::{
     frames::{
         FrameHandler, FrameKind, SettingsIter,
@@ -87,7 +85,6 @@ impl FrameWorth {
         }
     }
 }
-use runtime::spawn;
 
 pub struct Protocol<H: Handler> {
     peer_settings: Settings,
@@ -195,13 +192,14 @@ impl<H: Handler> Streams<H> {
             Rc::clone(shared),
             Rc::downgrade(&self.streams),
         );
-        // The handler runs on the task's first poll, not here, so the stream is
-        // in the map before the handler can touch (or drop) it.
-        let handler = self.handler.clone();
-        let handle = spawn(ContainPanic(async move {
-            handler.handle(Stream::new(token)).await
-        }));
-        self.streams.insert(raw, stream, handle);
+        // The handler only reads the head here; the stream reaches its task
+        // on the first poll, once it is in the map.
+        let Some(task) = handler::start(&self.handler, Incoming::new(Stream::new(token))) else {
+            // It panicked choosing, and the stream went with the unwind,
+            // answered and never in the map.
+            return Ok(());
+        };
+        self.streams.insert(raw, stream, task.into_handle());
         Ok(())
     }
 
@@ -307,28 +305,6 @@ impl<H: Handler> Streams<H> {
         stream
             .credit_send(increment)
             .map_err(|()| Rejected::Violation(StreamViolation::StreamWindowOverflow))
-    }
-}
-
-/// A panicking handler fails its stream, not the process: unwinding out of a
-/// task takes down the worker, and the runtime aborts on that. The handler is
-/// then dropped here, and its `StreamToken` answers for the stream as for any
-/// handler that returned early: a `500`, or `INTERNAL_ERROR` once the
-/// response has started.
-///
-/// Asserted unwind-safe because the panic is the application's, raised
-/// between our calls: nothing on the connection is left half-written, since
-/// no frame is encoded across a call into application code.
-struct ContainPanic<F>(F);
-
-impl<F: Future<Output = ()>> Future for ContainPanic<F> {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        // SAFETY: the field is pinned structurally: never moved out of, and
-        // `ContainPanic` has no `Drop` or `Unpin` of its own.
-        let handler = unsafe { self.map_unchecked_mut(|this| &mut this.0) };
-        catch_unwind(AssertUnwindSafe(|| handler.poll(cx))).unwrap_or(Poll::Ready(()))
     }
 }
 
