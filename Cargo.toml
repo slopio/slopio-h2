@@ -33,6 +33,11 @@ path = "examples/helloworld_server.rs"
 required-features = ["grpc"]
 
 [[example]]
+name = "telemetry_server"
+path = "examples/telemetry_server.rs"
+required-features = ["otlp"]
+
+[[example]]
 name = "grpc_load"
 path = "examples/grpc_load.rs"
 required-features = ["grpc"]
