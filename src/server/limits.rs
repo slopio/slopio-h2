@@ -48,6 +48,15 @@ pub struct Limits {
     /// runtime ends the process 30 s after the signal whatever is still
     /// running: past about 20 s, that is the deadline, not this.
     pub drain_timeout: Duration,
+    /// Bytes per second, averaged from the stream's opening, below which a
+    /// request body still coming is not slow but held, once it has had 5 s
+    /// to get started: its stream is reset
+    /// with ENHANCE_YOUR_CALM and counts against the connection. A floor
+    /// against a peer trickling bytes to hold a stream open, not a service
+    /// level; averaged from the start, so a peer cannot bank time by sending
+    /// fast and then stalling. Zero judges nothing, for a server whose peers
+    /// are trusted, a proxy's own.
+    pub body_min_rate: u32,
 }
 
 impl Default for Limits {
@@ -61,6 +70,7 @@ impl Default for Limits {
             tls_handshake_timeout: Duration::from_secs(10),
             // With `DRAIN_GRACE`, inside the runtime's 30 s after a signal.
             drain_timeout: Duration::from_secs(20),
+            body_min_rate: 256,
         }
     }
 }

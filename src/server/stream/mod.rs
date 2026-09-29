@@ -48,10 +48,6 @@ impl Input {
 /// never failed for the time it took to get started.
 const BODY_GRACE: Duration = Duration::from_secs(5);
 
-/// Bytes per second below which a request body is not slow but held: a floor
-/// against a peer trickling bytes to hold a stream open, not a service level.
-const MIN_BODY_RATE: u64 = 256;
-
 /// How long a response may have waited on the peer's credit, in total, before
 /// its rate is judged. Only time waiting for credit counts, so a slow handler
 /// never fails its own stream.
@@ -141,10 +137,11 @@ impl StreamState {
 
     /// A rate and not a deadline: a deadline cannot tell a large upload from
     /// a slow one. Averaged from the stream opening, so a peer cannot bank
-    /// credit by starting fast and then stalling.
+    /// credit by starting fast and then stalling. `min_rate` is
+    /// [`Limits`](crate::server::Limits)'s `body_min_rate`.
     ///
     /// Fails open on a clock that stepped backwards.
-    pub fn body_is_starving(&self) -> bool {
+    pub fn body_is_starving(&self, min_rate: u32) -> bool {
         // Once the peer owes nothing more, whatever time passes is the
         // handler's.
         let Some(Inbound::Open(body)) = self.lifecycle.get().inbound() else {
@@ -154,7 +151,7 @@ impl StreamState {
         if age < BODY_GRACE {
             return false;
         }
-        body.received() < MIN_BODY_RATE.saturating_mul(age.as_secs())
+        body.received() < u64::from(min_rate).saturating_mul(age.as_secs())
     }
 
     pub fn id(&self) -> crate::shared::codec::frames::stream_id::StreamId {

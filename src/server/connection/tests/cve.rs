@@ -623,7 +623,7 @@ fn a_dribbled_request_body_is_reset() {
 
     let second = Duration::from_secs(1);
     let mut inbound: Vec<Scripted> = vec![ReadEvent::Data(open).into()];
-    // One byte a second, well under `MIN_BODY_RATE`, for long enough to pass
+    // One byte a second, well under `body_min_rate`, for long enough to pass
     // `BODY_GRACE` and be judged.
     for i in 1..30u32 {
         inbound.push(ReadEvent::Data(frame(DATA, 0, 1, b"x")).after(second * i));
@@ -667,6 +667,70 @@ fn a_slow_but_honest_request_body_is_served() {
         written.iter().any(|f| f.kind == HEADERS),
         "and it gets its response: {written:?}"
     );
+}
+
+/// A request body sent `per_second` bytes each second for `seconds`, then
+/// ended, under `limits`: whether its stream was reset for starving. Each
+/// delivery is due a second after the one before it.
+fn reset_for_starving(per_second: usize, seconds: u32, limits: crate::server::Limits) -> bool {
+    let mut open = preface();
+    open.extend_from_slice(&frame(HEADERS, FLAG_END_HEADERS, 1, GET_BLOCK));
+
+    let second = Duration::from_secs(1);
+    let mut inbound: Vec<Scripted> = vec![ReadEvent::Data(open).into()];
+    let chunk = vec![b'x'; per_second];
+    for _ in 1..seconds {
+        inbound.push(ReadEvent::Data(frame(DATA, 0, 1, &chunk)).after(second));
+    }
+    inbound.push(ReadEvent::Data(frame(DATA, FLAG_END_STREAM, 1, b"")).after(second));
+
+    let written = super::run_connection_limited(inbound, limits, super::echo);
+    written.iter().any(|f| {
+        f.kind == RST_STREAM
+            && u32::from_be_bytes(f.payload[..4].try_into().unwrap()) == ENHANCE_YOUR_CALM
+    })
+}
+
+/// 4 KiB a second, which the default 256 B/s floor serves
+/// (`a_slow_but_honest_request_body_is_served`), is reset under a raised one.
+#[test]
+fn a_raised_body_rate_floor_resets_a_slower_body() {
+    assert!(reset_for_starving(
+        4096,
+        12,
+        crate::server::Limits {
+            body_min_rate: 8192,
+            ..Default::default()
+        }
+    ));
+}
+
+/// The same 4 KiB a second, under the default floor, through this helper:
+/// what the test above changes is the floor alone.
+#[test]
+fn the_default_body_rate_floor_serves_4_kib_a_second() {
+    assert!(!reset_for_starving(4096, 12, Default::default()));
+}
+
+/// A byte a second, which the default resets
+/// (`a_dribbled_request_body_is_reset`), is served with no floor at all.
+#[test]
+fn no_body_rate_floor_serves_a_dribbled_body() {
+    assert!(!reset_for_starving(
+        1,
+        20,
+        crate::server::Limits {
+            body_min_rate: 0,
+            ..Default::default()
+        }
+    ));
+}
+
+/// The same byte a second, under the default floor, through this helper:
+/// what the test above changes is the floor alone.
+#[test]
+fn the_default_body_rate_floor_resets_a_dribbled_body() {
+    assert!(reset_for_starving(1, 20, Default::default()));
 }
 
 /// SETTINGS advertising `initial_window_size`, so a response of any size

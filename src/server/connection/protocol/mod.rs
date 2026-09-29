@@ -218,7 +218,7 @@ impl<H: Handler> Streams<H> {
     fn body_is_starving(&self, id: STREAM_ID) -> bool {
         self.streams
             .get(id)
-            .is_some_and(|stream| stream.body_is_starving())
+            .is_some_and(|stream| stream.body_is_starving(self.limits.body_min_rate))
     }
 
     fn recv_data(
@@ -531,8 +531,9 @@ impl<H: Handler> Protocol<H> {
         // Collected first: resetting inside `try_for_each` would re-enter the
         // borrow it is contracted not to.
         let mut starving: Vec<StreamId> = Vec::new();
+        let min_rate = self.streams.limits.body_min_rate;
         let _ = self.streams.streams.try_for_each(|stream| {
-            if stream.body_is_starving() || stream.output_is_starving() {
+            if stream.body_is_starving(min_rate) || stream.output_is_starving() {
                 starving.push(stream.id());
             }
             Ok::<(), ()>(())
