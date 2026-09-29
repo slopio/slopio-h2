@@ -109,7 +109,7 @@ fn requested_size(path: Option<&str>) -> Option<usize> {
 async fn bench_route(stream: Stream) {
     let received = if stream.body_is_oneshot() {
         // No credit goes back while it fills.
-        stream.body().await.map_or(0, |body| body.len())
+        stream.body(usize::MAX).await.map_or(0, |body| body.len())
     } else {
         // Taking bytes is what hands the peer its credit back, so a handler
         // that stops taking is a handler that stops the upload.

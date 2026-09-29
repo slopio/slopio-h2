@@ -166,7 +166,7 @@ fn span_name(method: Option<&Method>) -> &'static str {
 
 async fn read_body(stream: &Stream) -> usize {
     if stream.body_is_oneshot() {
-        return stream.body().await.map_or(0, |bytes| bytes.len());
+        return stream.body(usize::MAX).await.map_or(0, |bytes| bytes.len());
     }
     let mut total = 0;
     while stream.readable().await {

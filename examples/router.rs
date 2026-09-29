@@ -305,7 +305,10 @@ async fn text(stream: Stream, status: StatusCode, body: &str) {
 
 async fn read_body(stream: &Stream) -> Vec<u8> {
     if stream.body_is_oneshot() {
-        return stream.body().await.map_or_else(Vec::new, Vec::from);
+        return stream
+            .body(usize::MAX)
+            .await
+            .map_or_else(|_| Vec::new(), Vec::from);
     }
     let mut body = Vec::new();
     while stream.readable().await {

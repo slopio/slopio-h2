@@ -28,7 +28,7 @@ mod stream;
 pub use handler::{Handler, Incoming, StreamTask};
 pub use limits::Limits;
 pub use router::{Params, Router};
-pub use stream::Stream;
+pub use stream::{BodyTooLarge, Stream};
 
 pub struct Server {
     pub settings: ServerSettings,

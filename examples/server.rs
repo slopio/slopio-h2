@@ -39,7 +39,7 @@ async fn serve() {
 /// HEADERS is a stream the peer cannot make sense of.
 async fn hello(stream: Stream) {
     let body = match stream.body_is_oneshot() {
-        true => stream.body().await.map_or(0, |bytes| bytes.len()),
+        true => stream.body(usize::MAX).await.map_or(0, |bytes| bytes.len()),
         false => {
             let mut total = 0;
             while stream.readable().await {

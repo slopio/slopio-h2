@@ -9,6 +9,7 @@
 //! Tests that end with streams still open report leaks at exit: `block_on`
 //! returns without freeing the tasks it killed.
 
+mod body;
 mod cve;
 mod dst;
 #[cfg(feature = "grpc")]
@@ -36,7 +37,7 @@ const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 async fn echo(stream: crate::server::Stream) {
     let received = if stream.body_is_oneshot() {
-        stream.body().await.map_or(0, |body| body.len())
+        stream.body(usize::MAX).await.map_or(0, |body| body.len())
     } else {
         let mut total = 0;
         while stream.readable().await {

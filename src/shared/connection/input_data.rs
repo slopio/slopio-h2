@@ -1,10 +1,14 @@
-/// `Capped` is delivered whole and once; the other two are drained as they
-/// fill.
+/// `Capped` is seen only once whole; the other two are drained as they fill.
 pub enum InputData {
     /// `len` is what was declared, which is also the capacity. Reserved, not
     /// zeroed: a peer that declares a length on each stream and sends nothing
-    /// must not make us commit that memory at HEADERS.
-    Capped { len: usize, data: Vec<u8> },
+    /// must not make us commit that memory at HEADERS. `read` is how much of
+    /// it a reader has taken since it was whole.
+    Capped {
+        len: usize,
+        data: Vec<u8>,
+        read: usize,
+    },
     /// `len` is kept for the §8.1.1 check, never allocated.
     BufferedCapped { len: usize, data: Vec<u8> },
     /// Bounded by the receive window, since none of it is credited back
@@ -41,6 +45,7 @@ impl InputData {
         Self::Capped {
             len,
             data: Vec::with_capacity(len),
+            read: 0,
         }
     }
 
@@ -96,20 +101,20 @@ impl InputData {
         !matches!(self, Self::Capped { .. })
     }
 
-    /// Always empty for `Capped`: it is delivered whole, which is what lets it
-    /// issue no WINDOW_UPDATE while it fills.
+    /// Empty for `Capped` until it is whole, then what is left unread of it.
     pub fn available(&self) -> &[u8] {
         match self {
+            Self::Capped { len, data, read } if data.len() == *len => &data[*read..],
             Self::Capped { .. } => &[],
             Self::BufferedCapped { data, .. } | Self::Uncapped { data } => data,
         }
     }
 
-    /// A no-op on `Capped`, whose `push` relies on `at` being where its buffer
-    /// ends; removing the front would break that.
+    /// Only moves `read` on `Capped`: its `push` relies on `at` being where
+    /// its buffer ends, and removing the front would break that.
     pub fn consume(&mut self, n: usize) {
         match self {
-            Self::Capped { .. } => {}
+            Self::Capped { read, .. } => *read += n,
             Self::BufferedCapped { data, .. } | Self::Uncapped { data } => {
                 data.drain(..n);
             }
@@ -129,7 +134,10 @@ impl InputData {
         match self {
             // Full by now (checked against `len` at END_STREAM), so length
             // is capacity and this moves the allocation rather than copying.
-            Self::Capped { data, .. } => Some(data.into_boxed_slice()),
+            Self::Capped { mut data, read, .. } => {
+                data.drain(..read);
+                Some(data.into_boxed_slice())
+            }
             _ => None,
         }
     }

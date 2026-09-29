@@ -355,6 +355,11 @@ impl StreamState {
             .is_none_or(|input| !input.wakes_per_frame())
     }
 
+    /// The `content-length` the body is held to, if it declared one.
+    pub fn declared_len(&self) -> Option<u64> {
+        self.input.borrow().http().and_then(InputData::expected)
+    }
+
     #[cfg(feature = "grpc")]
     pub fn is_grpc(&self) -> bool {
         self.grpc.is_some()
@@ -365,10 +370,10 @@ impl StreamState {
         self.grpc
     }
 
-    /// Each frame's bytes are credited back as they land, so an unfinished
-    /// body holds no window, only its stream's slot, until the starvation
-    /// sweep takes that too.
-    pub fn body(&self) -> impl Future<Output = Option<Box<[u8]>>> {
+    /// A oneshot body, whole: each frame's bytes are credited back as they
+    /// land, so an unfinished body holds no window, only its stream's slot,
+    /// until the starvation sweep takes that too. `None` for any other.
+    pub fn take_oneshot(&self) -> impl Future<Output = Option<Box<[u8]>>> {
         std::future::poll_fn(move |cx| {
             if !self.input_ended() {
                 self.register_waker(cx.waker());
@@ -413,10 +418,12 @@ impl StreamState {
             return 0;
         };
         let n = n.min(input.available().len());
+        // A oneshot body was credited as it landed: reading it owes nothing.
+        let credited = if input.wakes_per_frame() { n } else { 0 };
         input.consume(n);
         // Cannot underflow: `unreleased` counts the same bytes.
-        self.unreleased.set(self.unreleased.get() - n as u32);
-        n as u32
+        self.unreleased.set(self.unreleased.get() - credited as u32);
+        credited as u32
     }
 
     /// `Some` is already credited here, so the caller must write the frame
@@ -526,6 +533,18 @@ impl StreamState {
     }
 }
 
+/// A body past the limit a route gave [`Stream::body`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BodyTooLarge;
+
+impl std::fmt::Display for BodyTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the request body is larger than the route accepts")
+    }
+}
+
+impl std::error::Error for BodyTooLarge {}
+
 /// Dropping it is what ends the server's half of the exchange (§5.1).
 ///
 /// Not `Clone` and not `Send`: one stream, one task, one thread.
@@ -565,14 +584,49 @@ impl Stream {
         self.token.shared().peer()
     }
 
+    /// Whether the body was declared small enough, 16 KiB at most, to be
+    /// gathered whole before anything sees it. Nothing a route must act on:
+    /// [`Stream::body`] and [`Stream::readable`] both read either kind.
     pub fn body_is_oneshot(&self) -> bool {
         self.state().body_is_oneshot()
     }
 
-    pub fn body(&self) -> impl Future<Output = Option<Box<[u8]>>> {
-        self.state().body()
+    /// The whole body, however the client sent it, or `BodyTooLarge` past
+    /// `limit` bytes, what a route typically answers with a `413`. A body
+    /// with a `content-length` over `limit` is refused before any of it is
+    /// read. Empty when the request has none.
+    ///
+    /// A small declared body comes as it was gathered, without a copy; any
+    /// other is gathered here, its credit given back as it is, so the client
+    /// is never left waiting on a window.
+    pub async fn body(&self, limit: usize) -> Result<Box<[u8]>, BodyTooLarge> {
+        let declared = self.state().declared_len();
+        if declared.is_some_and(|len| len > limit as u64) {
+            return Err(BodyTooLarge);
+        }
+        if self.body_is_oneshot() {
+            let body = self.state().take_oneshot().await;
+            return Ok(body.unwrap_or_default());
+        }
+        // Bounded by `limit`, which a declared length is under.
+        let mut body = Vec::with_capacity(declared.map_or(0, |len| len as usize));
+        while self.readable().await {
+            let taken = self.peek(|bytes| {
+                (body.len() + bytes.len() <= limit).then(|| {
+                    body.extend_from_slice(bytes);
+                    bytes.len()
+                })
+            });
+            match taken {
+                Some(taken) => self.consume(taken),
+                None => return Err(BodyTooLarge),
+            }
+        }
+        Ok(body.into_boxed_slice())
     }
 
+    /// The body as it comes, whichever way the client sent it: a small
+    /// declared one is seen once whole, as a single piece.
     pub fn readable(&self) -> impl Future<Output = bool> {
         self.state().readable()
     }
