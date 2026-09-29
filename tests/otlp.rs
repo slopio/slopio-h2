@@ -9,13 +9,13 @@ use std::thread;
 use std::time::Duration;
 
 use http::{HeaderMap, StatusCode};
-use popple_h2::grpc::{GrpcCall, Status, service};
-use popple_h2::otlp::proto::{ExportTraceServiceRequest, ExportTraceServiceResponse};
-use popple_h2::otlp::{OtlpCollector, OtlpService};
-use popple_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 use runtime::runtime::time::Sleep;
 use runtime::tracing::{Level, new_trace};
 use runtime::{main_thread_traced, main_thread_with, spawn};
+use slopio_h2::grpc::{GrpcCall, Status, service};
+use slopio_h2::otlp::proto::{ExportTraceServiceRequest, ExportTraceServiceResponse};
+use slopio_h2::otlp::{OtlpCollector, OtlpService};
+use slopio_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 
 runtime::define_buf_ring!(ServerRing, bgid = 0, buffer_size = 16384, ring_size = 256);
 runtime::define_buf_ring!(ClientRing, bgid = 1, buffer_size = 16384, ring_size = 64);

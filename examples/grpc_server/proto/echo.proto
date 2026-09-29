@@ -3,7 +3,7 @@
 // sends the next.
 syntax = "proto3";
 
-package popple.echo.v1;
+package slopio.echo.v1;
 
 message EchoRequest {
   string text = 1;

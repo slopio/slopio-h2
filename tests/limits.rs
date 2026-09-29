@@ -4,8 +4,8 @@
 use std::io;
 use std::net::TcpListener;
 
-use popple_h2::server::{Limits, Server, ServerSettings, ServerTransport, Stream};
 use runtime::main_thread_with;
+use slopio_h2::server::{Limits, Server, ServerSettings, ServerTransport, Stream};
 
 runtime::define_buf_ring!(ServerRing, bgid = 0, buffer_size = 16384, ring_size = 16);
 

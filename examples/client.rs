@@ -4,17 +4,17 @@
 //!     cargo run --release --example client                # in another
 //!     URL=http://127.0.0.1:8080/upload BODY=hello cargo run --release --example client
 //!
-//! A host that is a name is resolved by popple-dns, against `DNS` (ip:port)
+//! A host that is a name is resolved by slopio-dns, against `DNS` (ip:port)
 //! or else the first `nameserver` of /etc/resolv.conf.
 
 use std::net::{IpAddr, SocketAddr};
 
-use popple_h2::client::{DnsClient, PlainTextClient};
 use runtime::main_thread_with;
+use slopio_h2::client::{DnsClient, PlainTextClient};
 
 runtime::define_buf_ring!(ClientRing, bgid = 1, buffer_size = 16384, ring_size = 64);
 
-/// popple-dns reads no system configuration, so this does.
+/// slopio-dns reads no system configuration, so this does.
 fn dns_server() -> SocketAddr {
     if let Some(addr) = std::env::var("DNS").ok().and_then(|v| v.parse().ok()) {
         return addr;

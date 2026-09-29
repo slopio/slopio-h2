@@ -1,5 +1,5 @@
 [package]
-name = "popple-h2"
+name = "slopio-h2"
 version = "0.1.0"
 edition = "2024"
 
@@ -10,7 +10,7 @@ grpc = ["dep:prost"]
 otlp = ["grpc", "prost/derive", "runtime/tracing"]
 
 # Off by default: rustls and aws-lc-rs are the largest thing this would compile.
-tls = ["dep:popple-tls"]
+tls = ["dep:slopio-tls"]
 
 [[example]]
 name = "grpc_server"
@@ -57,8 +57,8 @@ matchit = "0.9.2"
 prost = { version = "0.14", default-features = false, features = [
     "std",
 ], optional = true }
-popple-dns = { git = "ssh://git@github.com/saucisoupe/popple-dns.git" }
-popple-tls = { git = "ssh://git@github.com/saucisoupe/popple-tls.git", optional = true }
+slopio-dns = { git = "ssh://git@github.com/saucisoupe/slopio-dns.git", package = "popple-dns" }
+slopio-tls = { git = "ssh://git@github.com/saucisoupe/slopio-tls.git", package = "popple-tls", optional = true }
 runtime = { git = "ssh://git@github.com/saucisoupe/runtime.git", version = "0.1.0" }
 runtime-streams = { git = "ssh://git@github.com/saucisoupe/runtime.git" }
 rustc-hash = "2.1.3"

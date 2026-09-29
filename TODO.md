@@ -44,7 +44,7 @@ runs dry.
   `grpc_load` cannot cap its concurrency at the server's
   `max_concurrent_streams` any more. Calls past it now count as failures.
 - DNS: A records first, AAAA only when there are none. No Happy Eyeballs, and
-  no `/etc/resolv.conf`, since popple-dns reads no system configuration.
+  no `/etc/resolv.conf`, since slopio-dns reads no system configuration.
 - `ATTACH_MIN` (4 KiB) is provisional. Measure it with large uploads, which
   `grpc_load` does not do.
 - `send_zc` is off on the client (`PlainMessages<U, false>`). With slices

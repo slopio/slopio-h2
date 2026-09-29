@@ -14,16 +14,16 @@ use std::thread;
 use std::time::Duration;
 
 use http::{HeaderMap, StatusCode};
-use popple_h2::client;
-use popple_h2::server::{Server, ServerSettings, ServerTransport, Stream};
-use popple_tls::{
-    Config, ServerSettings as TlsServerSettings, client_config_dangerous_no_verification,
-    server_config,
-};
 use rcgen::{CertificateParams, KeyPair};
 use runtime::main_thread_with;
 use runtime::runtime::time::Sleep;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use slopio_h2::client;
+use slopio_h2::server::{Server, ServerSettings, ServerTransport, Stream};
+use slopio_tls::{
+    Config, ServerSettings as TlsServerSettings, client_config_dangerous_no_verification,
+    server_config,
+};
 
 runtime::define_buf_ring!(ServerRing, bgid = 0, buffer_size = 16384, ring_size = 256);
 runtime::define_buf_ring!(ClientRing, bgid = 1, buffer_size = 16384, ring_size = 64);
@@ -75,7 +75,7 @@ async fn answer(stream: Stream) {
 
 #[test]
 fn a_request_and_its_response_cross_a_tls_connection() {
-    if !popple_tls::ktls_available() {
+    if !slopio_tls::ktls_available() {
         eprintln!("skipped: this kernel has no kTLS (`modprobe tls`)");
         return;
     }

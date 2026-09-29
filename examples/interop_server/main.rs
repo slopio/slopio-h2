@@ -7,9 +7,9 @@
 //!     client -server_host localhost -server_port 8080 -test_case empty_unary
 
 use http::{HeaderMap, StatusCode};
-use popple_h2::grpc::{Code, GrpcCall, GrpcRouter, Status, service};
-use popple_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 use runtime::{main_thread_with, thread_per_core_with};
+use slopio_h2::grpc::{Code, GrpcCall, GrpcRouter, Status, service};
+use slopio_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 
 mod testing;
 use testing::{

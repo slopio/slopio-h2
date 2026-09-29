@@ -315,7 +315,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 [[package]]
 name = "popple-dns"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/popple-dns.git#ca4c89f75865d541d9f94abb4fa9be532322af12"
+source = "git+ssh://git@github.com/saucisoupe/slopio-dns.git#ca4c89f75865d541d9f94abb4fa9be532322af12"
 dependencies = [
  "rand",
  "runtime",
@@ -324,31 +324,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "popple-h2"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "fnv",
- "http",
- "libc",
- "matchit",
- "popple-dns",
- "popple-tls",
- "prost",
- "rcgen",
- "runtime",
- "runtime-core",
- "runtime-streams",
- "rustc-hash",
- "rustls",
- "webpki-roots",
- "zerocopy",
-]
-
-[[package]]
 name = "popple-tls"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/popple-tls.git#d042b87af0e97cbc4436216fe8e809be612e5b31"
+source = "git+ssh://git@github.com/saucisoupe/slopio-tls.git#d042b87af0e97cbc4436216fe8e809be612e5b31"
 dependencies = [
  "libc",
  "runtime",
@@ -597,6 +575,28 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "slopio-h2"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "fnv",
+ "http",
+ "libc",
+ "matchit",
+ "popple-dns",
+ "popple-tls",
+ "prost",
+ "rcgen",
+ "runtime",
+ "runtime-core",
+ "runtime-streams",
+ "rustc-hash",
+ "rustls",
+ "webpki-roots",
+ "zerocopy",
+]
 
 [[package]]
 name = "smallvec"

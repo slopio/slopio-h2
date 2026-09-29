@@ -4,9 +4,9 @@
 //!     taskset -c 1 cargo run --release --example grpc_load
 
 use http::{HeaderMap, StatusCode};
-use popple_h2::grpc::{GrpcCall, GrpcRouter, Status, service};
-use popple_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 use runtime::{main_thread_with, thread_per_core_with};
+use slopio_h2::grpc::{GrpcCall, GrpcRouter, Status, service};
+use slopio_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 
 runtime::define_buf_ring!(ServerRing, bgid = 0, buffer_size = 16384, ring_size = 2048);
 

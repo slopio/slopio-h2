@@ -40,9 +40,9 @@ use connection::Driver;
 pub use pool::{
     Client, ClientError, MAX_CONNECTIONS_PER_ORIGIN, Origin, PlainTextClient, TlsClient,
 };
-/// Re-exported: what [`Client::with_dns`] takes.
-pub use popple_dns::DnsClient;
 pub use shared::Unavailable;
+/// Re-exported: what [`Client::with_dns`] takes.
+pub use slopio_dns::DnsClient;
 pub use stream::{Body, Stream};
 
 /// Our `SETTINGS_INITIAL_WINDOW_SIZE`. Credit goes back only for bytes the
@@ -195,10 +195,10 @@ pub(crate) async fn connect<U: BufRingSpec + 'static>(
 #[cfg(feature = "tls")]
 pub(crate) async fn connect_tls<U: BufRingSpec + 'static>(
     addr: SocketAddr,
-    server_name: popple_tls::ServerName<'static>,
-    config: popple_tls::ClientConfig,
+    server_name: slopio_tls::ServerName<'static>,
+    config: slopio_tls::ClientConfig,
 ) -> io::Result<Connection<Tls>> {
-    if !popple_tls::ktls_available() {
+    if !slopio_tls::ktls_available() {
         return Err(io::Error::other(
             "this kernel has no kTLS: `modprobe tls`, or build without the tls feature",
         ));
@@ -206,7 +206,7 @@ pub(crate) async fn connect_tls<U: BufRingSpec + 'static>(
 
     let established = timeout(CONNECT_TIMEOUT, async move {
         let socket = connect_tcp(addr).await?;
-        let ktls = popple_tls::handshake_client(socket, server_name, config, CONNECT_TIMEOUT)
+        let ktls = slopio_tls::handshake_client(socket, server_name, config, CONNECT_TIMEOUT)
             .await
             .map_err(|e| io::Error::other(TlsHandshake(e)))?;
 
@@ -232,7 +232,7 @@ pub(crate) async fn connect_tls<U: BufRingSpec + 'static>(
 /// The handshake's own error, kept whole and said when shown.
 #[cfg(feature = "tls")]
 #[derive(Debug)]
-struct TlsHandshake(popple_tls::HandshakeError);
+struct TlsHandshake(slopio_tls::HandshakeError);
 
 #[cfg(feature = "tls")]
 impl std::fmt::Display for TlsHandshake {

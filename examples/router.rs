@@ -15,12 +15,12 @@
 //!         -d '{"service": ""}' localhost:8080 grpc.health.v1.Health/Check
 //!     grpcurl -plaintext -import-path examples/grpc_server/proto -proto echo.proto \
 //!         -d '{"text": "a", "index": 1} {"text": "b", "index": 2}' \
-//!         localhost:8080 popple.echo.v1.Echo/Chat
+//!         localhost:8080 slopio.echo.v1.Echo/Chat
 
 use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
-use popple_h2::grpc::{GrpcCall, GrpcRouter, Status, service};
-use popple_h2::server::{Params, Router, Server, ServerSettings, ServerTransport, Stream};
 use runtime::main_thread_with;
+use slopio_h2::grpc::{GrpcCall, GrpcRouter, Status, service};
+use slopio_h2::server::{Params, Router, Server, ServerSettings, ServerTransport, Stream};
 
 runtime::define_buf_ring!(
     RouterRing,
@@ -49,7 +49,7 @@ async fn serve() {
         .route(Method::POST, "/echo", echo);
     let grpc = GrpcRouter::new()
         .route("/grpc.health.v1.Health/Check", check)
-        .route("/popple.echo.v1.Echo/Chat", chat);
+        .route("/slopio.echo.v1.Echo/Chat", chat);
 
     let settings = ServerSettings::new(([0, 0, 0, 0], 8080), ServerTransport::Plain);
     if let Err(e) = Server::new(settings)

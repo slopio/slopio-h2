@@ -4,8 +4,8 @@
 //!     curl --http2-prior-knowledge http://localhost:8080/ -v
 
 use http::{HeaderMap, StatusCode};
-use popple_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 use runtime::main_thread_with;
+use slopio_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 
 // Not a smaller ring: `ring_size` is how many sockets the kernel can serve
 // between two submits, reserve or no reserve. `bgid` must be below 4.

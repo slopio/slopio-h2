@@ -3,15 +3,15 @@
 //!     cargo run --release --features tls --example tls_client
 //!     cargo run --release --features tls --example tls_client https://cloudflare.com/
 //!
-//! The host is resolved by popple-dns, against `DNS` (ip:port) or else the
+//! The host is resolved by slopio-dns, against `DNS` (ip:port) or else the
 //! first `nameserver` of /etc/resolv.conf. `INSECURE=1` skips checking the
 //! certificate, for a local server: `https://127.0.0.1:8443/`.
 
 use std::net::{IpAddr, SocketAddr};
 
-use popple_h2::client::{DnsClient, TlsClient};
-use popple_tls::{ClientSettings, client_config, client_config_dangerous_no_verification};
 use runtime::main_thread_with;
+use slopio_h2::client::{DnsClient, TlsClient};
+use slopio_tls::{ClientSettings, client_config, client_config_dangerous_no_verification};
 
 runtime::define_buf_ring!(ClientRing, bgid = 1, buffer_size = 16384, ring_size = 64);
 
@@ -19,7 +19,7 @@ runtime::define_buf_ring!(ClientRing, bgid = 1, buffer_size = 16384, ring_size =
 /// is refused rather than spoken HTTP/2 at.
 const H2: &[&[u8]] = &[b"h2"];
 
-/// popple-dns reads no system configuration, so this does.
+/// slopio-dns reads no system configuration, so this does.
 fn dns_server() -> SocketAddr {
     if let Some(addr) = std::env::var("DNS").ok().and_then(|v| v.parse().ok()) {
         return addr;

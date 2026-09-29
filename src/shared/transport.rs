@@ -134,12 +134,12 @@ pub const ALPN_H2: &[u8] = b"h2";
 
 #[cfg(feature = "tls")]
 pub struct KtlsTransport<R: BufRingSpec, S> {
-    stream: popple_tls::KtlsMessages<R, S>,
+    stream: slopio_tls::KtlsMessages<R, S>,
 }
 
 #[cfg(feature = "tls")]
 impl<R: BufRingSpec, S> KtlsTransport<R, S> {
-    pub fn new(stream: popple_tls::KtlsMessages<R, S>) -> Self {
+    pub fn new(stream: slopio_tls::KtlsMessages<R, S>) -> Self {
         Self { stream }
     }
 
@@ -154,7 +154,7 @@ impl<R: BufRingSpec, S> Unpin for KtlsTransport<R, S> {}
 
 #[cfg(feature = "tls")]
 impl<R: BufRingSpec, S> Stream for KtlsTransport<R, S> {
-    type Item = Result<popple_tls::Frame<R>, RecvError>;
+    type Item = Result<slopio_tls::Frame<R>, RecvError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.get_mut().stream)
@@ -165,7 +165,7 @@ impl<R: BufRingSpec, S> Stream for KtlsTransport<R, S> {
 
 #[cfg(feature = "tls")]
 impl<R: BufRingSpec, S> Transport for KtlsTransport<R, S> {
-    type Buf = popple_tls::Frame<R>;
+    type Buf = slopio_tls::Frame<R>;
     type Security = Tls;
 
     /// `may_hold` is ignored: kTLS zero-copy only takes the runtime's

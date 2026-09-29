@@ -57,7 +57,7 @@ pub enum ServerTransport {
     Plain,
     PlainZeroCopy,
     #[cfg(feature = "tls")]
-    Tls(popple_tls::Config),
+    Tls(slopio_tls::Config),
 }
 
 /// How long the listener waits after running out of descriptors or memory.
@@ -109,7 +109,7 @@ impl Server {
             // rather than refuse every connection or serve them in the clear.
             #[cfg(feature = "tls")]
             ServerTransport::Tls(config) => {
-                if !popple_tls::ktls_available() {
+                if !slopio_tls::ktls_available() {
                     return Err(std::io::Error::other(
                         "this kernel has no kTLS: `modprobe tls`, or build without the tls feature",
                     ));
@@ -183,7 +183,7 @@ where
 #[cfg(feature = "tls")]
 async fn serve_tls<U: BufRingSpec + 'static, H: Handler, S: Future<Output = ()>>(
     mut acceptor: MultiAccept,
-    config: popple_tls::Config,
+    config: slopio_tls::Config,
     limits: Limits,
     handler: H,
     shutdown: &Rc<Shutdown>,
@@ -197,7 +197,7 @@ async fn serve_tls<U: BufRingSpec + 'static, H: Handler, S: Future<Output = ()>>
         let registration = shutdown.join();
         spawn(async move {
             let deadline = limits.tls_handshake_timeout;
-            let ktls = match popple_tls::handshake(socket, config, deadline).await {
+            let ktls = match slopio_tls::handshake(socket, config, deadline).await {
                 Ok(ktls) => ktls,
                 Err(_) => return,
             };

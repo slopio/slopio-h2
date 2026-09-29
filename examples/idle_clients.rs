@@ -5,8 +5,8 @@
 
 use std::net::SocketAddr;
 
-use popple_h2::client::PlainTextClient;
 use runtime::main_thread_with;
+use slopio_h2::client::PlainTextClient;
 
 runtime::define_buf_ring!(IdleRing, bgid = 1, buffer_size = 16384, ring_size = 64);
 

@@ -7,10 +7,10 @@ use std::thread;
 use std::time::Duration;
 
 use http::{HeaderMap, StatusCode};
-use popple_h2::client;
-use popple_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 use runtime::main_thread_with;
 use runtime::runtime::time::Sleep;
+use slopio_h2::client;
+use slopio_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 
 runtime::define_buf_ring!(ServerRing, bgid = 0, buffer_size = 16384, ring_size = 256);
 runtime::define_buf_ring!(ClientRing, bgid = 1, buffer_size = 16384, ring_size = 64);

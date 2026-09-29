@@ -9,9 +9,9 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use popple_h2::client::PlainTextClient;
-use popple_h2::grpc::{Code, GrpcClient};
 use runtime::{main_thread_with, thread_per_core_with};
+use slopio_h2::client::PlainTextClient;
+use slopio_h2::grpc::{Code, GrpcClient};
 
 runtime::define_buf_ring!(LoadRing, bgid = 0, buffer_size = 16384, ring_size = 1024);
 

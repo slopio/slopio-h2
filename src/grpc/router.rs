@@ -4,7 +4,7 @@
 //! ```ignore
 //! let grpc = GrpcRouter::new()
 //!     .route("/grpc.health.v1.Health/Check", check)
-//!     .route("/popple.echo.v1.Echo/Chat", chat);
+//!     .route("/slopio.echo.v1.Echo/Chat", chat);
 //! ```
 //!
 //! A gRPC path is the method's full name, matched whole: no patterns, no

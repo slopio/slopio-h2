@@ -18,9 +18,9 @@ use std::sync::Arc;
 use std::task::{Poll, Waker};
 
 use http::uri::{Scheme, Uri};
-use popple_dns::protocol::Name;
-use popple_dns::{DnsClient, IpVersion, ResolveError};
 use runtime::net::BufRingSpec;
+use slopio_dns::protocol::Name;
+use slopio_dns::{DnsClient, IpVersion, ResolveError};
 
 use crate::client::{Connection, PlainText, Security, Stream, Tls, Unavailable, connect};
 
@@ -161,12 +161,12 @@ impl Client<Tls> {
     /// Over TLS, receiving into `U`'s buffers. Each server's certificate is
     /// checked against its origin's host, by `config`'s verifier. §3.3: a
     /// server that does not agree to `h2` via ALPN is refused.
-    pub fn tls<U: BufRingSpec + 'static>(config: popple_tls::ClientConfig) -> Self {
+    pub fn tls<U: BufRingSpec + 'static>(config: slopio_tls::ClientConfig) -> Self {
         Self::with_opener(Box::new(move |origin, addr| {
             let config = config.clone();
             let host = origin.bare_host().to_owned();
             Box::pin(async move {
-                let name = popple_tls::ServerName::try_from(host)
+                let name = slopio_tls::ServerName::try_from(host)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
                 crate::client::connect_tls::<U>(addr, name, config).await
             })

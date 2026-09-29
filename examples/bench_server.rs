@@ -4,9 +4,9 @@
 //!     RING=64x128+512 PER_CORE=1 taskset -c 0,1 cargo run --release --example bench_server
 
 use http::{HeaderMap, StatusCode};
-use popple_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 use runtime::net::BufRingSpec;
 use runtime::{main_thread_with, thread_per_core_with};
+use slopio_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 
 // Only the ring actually selected is ever installed: each of these is its own
 // type with its own thread-local.
@@ -55,7 +55,7 @@ fn main() {
     let ring = std::env::var("RING").unwrap_or_else(|_| "64x128+512".into());
     let per_core = std::env::var_os("PER_CORE").is_some();
 
-    println!("popple-h2 on :{port}, ring {ring}, per_core={per_core}");
+    println!("slopio-h2 on :{port}, ring {ring}, per_core={per_core}");
 
     match ring.as_str() {
         "64x512" => start::<Ring64x512>(port, per_core),

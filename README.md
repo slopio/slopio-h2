@@ -34,7 +34,7 @@ strict suite included.
   given up on if it does not answer.
 - **Backpressure**: window credit goes back only for bytes the application
   has read. No deadline is imposed on a request; that is the caller's choice.
-- Names are resolved with `popple-dns`, which reads no system configuration.
+- Names are resolved with `slopio-dns`, which reads no system configuration.
 
 ## gRPC
 

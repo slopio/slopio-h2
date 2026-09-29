@@ -23,10 +23,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use http::{HeaderMap, Method, StatusCode, header};
-use popple_h2::otlp::{OtlpCollector, OtlpService};
-use popple_h2::server::{Params, Router, Server, ServerSettings, ServerTransport, Stream};
 use runtime::runtime::time::Sleep;
 use runtime::tracing::{self, KeyValue, Level, Span, SpanKind, Status};
+use slopio_h2::otlp::{OtlpCollector, OtlpService};
+use slopio_h2::server::{Params, Router, Server, ServerSettings, ServerTransport, Stream};
 
 runtime::define_buf_ring!(
     ServerRing,
