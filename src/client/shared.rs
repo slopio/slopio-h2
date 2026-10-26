@@ -190,6 +190,13 @@ impl ClientShared {
         }
     }
 
+    /// From outside the loop: fails what is still running, and wakes the loop
+    /// to see it has nothing left and end the connection.
+    pub(crate) fn cut(&self, reason: &'static str) {
+        self.shut_down(reason);
+        self.core.wake_flusher();
+    }
+
     /// A failed `Stream` still yields the body that arrived before the end,
     /// and then the error.
     pub(crate) fn shut_down(&self, reason: &'static str) {

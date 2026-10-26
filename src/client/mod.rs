@@ -70,6 +70,16 @@ pub const ACTIVE_PING_TICKS: u32 = 4;
 /// GOAWAY ENHANCE_YOUR_CALM.
 pub const IDLE_PING_TICKS: u32 = 12;
 
+/// Ticks with no stream open before the connection is closed (§6.8), about
+/// ninety seconds. Past `IDLE_PING_TICKS`, so an idle peer is still probed
+/// once in the meantime.
+pub const IDLE_CLOSE_TICKS: u32 = 18;
+
+/// How long the GOAWAY that ends a connection may take to go out. Past it the
+/// socket is closed anyway: a peer that stops reading must not keep a
+/// connection it was told is over.
+pub const FAREWELL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Ticks a keepalive PING may go unanswered before the connection is given up
 /// on. Only one probe is outstanding at a time, so this is the full budget.
 pub const PING_TIMEOUT_TICKS: u32 = 4;

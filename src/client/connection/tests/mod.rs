@@ -2,7 +2,9 @@ use std::io;
 
 use std::time::Duration;
 
-use runtime_core::deterministic_testing::{FakeRing, ReadEvent, Scripted, simulated_socket};
+use runtime_core::deterministic_testing::{
+    FakeRing, ReadEvent, Scripted, WriteEvent, simulated_socket,
+};
 use runtime_core::runtime::RuntimeInner;
 use runtime_core::runtime::time::timeout;
 
@@ -1784,6 +1786,111 @@ fn an_idle_connection_is_not_probed_on_the_active_budget() {
             .iter()
             .any(|f| f.kind == PING && f.flags & FLAG_ACK == 0),
         "nothing was in flight, so nothing was asked"
+    );
+}
+
+/// A peer that pings every ten seconds for `pings` of them, so keepalive
+/// never probes or gives up, and only idleness can end the connection. Each
+/// delay runs from the read before it.
+fn a_chatty_peer(pings: u32) -> Vec<Scripted> {
+    let every = Duration::from_secs(10);
+    let mut script = vec![ReadEvent::Data(server_opening()).after(Duration::from_millis(1))];
+    for _ in 0..pings {
+        script.push(ReadEvent::Data(frame(PING, 0, 0, &[0; 8])).after(every));
+    }
+    script.push(ReadEvent::Eof.after(every));
+    script
+}
+
+#[test]
+fn an_idle_connection_is_closed() {
+    let idle = DEADLINE_TICK * crate::client::IDLE_CLOSE_TICKS;
+
+    let ((before, after, end), written) =
+        with_client(a_chatty_peer(40), move |client| async move {
+            wait(idle - DEADLINE_TICK).await;
+            let before = client.is_closed();
+            wait(DEADLINE_TICK * 3).await;
+            let after = client.is_closed();
+            (before, after, client.closed().await.is_ok())
+        });
+
+    assert!(!before, "kept until it had been idle long enough");
+    assert!(after, "then it takes no more requests");
+    assert!(end, "and ends cleanly, before the peer goes");
+    assert!(
+        frames(&written).iter().any(|f| f.kind == GOAWAY),
+        "§6.8: a GOAWAY went out"
+    );
+}
+
+#[test]
+fn a_request_restarts_the_idle_count() {
+    let idle = DEADLINE_TICK * crate::client::IDLE_CLOSE_TICKS;
+
+    let ((kept, closed), _) = with_client(a_chatty_peer(40), move |client| async move {
+        wait(idle - DEADLINE_TICK * 2).await;
+        let request = http::Request::get("http://example.test/").body(()).unwrap();
+        let stream = client.send_request(&request, true).expect("a stream");
+        // Open far past the idle budget: in use is not idle.
+        wait(idle + DEADLINE_TICK).await;
+        drop(stream);
+        wait(idle - DEADLINE_TICK * 2).await;
+        let kept = !client.is_closed();
+        wait(DEADLINE_TICK * 4).await;
+        (kept, client.is_closed())
+    });
+
+    assert!(
+        kept,
+        "idle counted from the stream's end, not from the start"
+    );
+    assert!(closed, "and closed once idle long enough after it");
+}
+
+/// The GOAWAY is scripted once the handshake is done, so it is the write
+/// that stalls, and nothing before it.
+#[test]
+fn a_peer_that_stops_reading_does_not_hold_the_goodbye() {
+    let farewell = crate::client::FAREWELL_TIMEOUT;
+    let (fake, handle) = FakeRing::builder().virtual_time().build();
+    let socket = simulated_socket();
+    let fd = socket.fd();
+    handle.on_multishot_read(
+        fd,
+        vec![
+            ReadEvent::Data(server_opening()).after(Duration::from_millis(1)),
+            ReadEvent::Eof.after(farewell * 100),
+        ],
+    );
+    let script = handle.clone();
+
+    let (outcome, took) = RuntimeInner::simulated(fake).block_on::<TestRing, _>(
+        async move {
+            runtime_core::runtime::spawn(async move {
+                let conn = Driver::handshake(PlainMessages::<TestRing, false>::new(socket))
+                    .await
+                    .expect("the handshake completed");
+                let client = conn.spawn();
+                script.on_write(fd, WriteEvent::All.after(farewell * 60));
+
+                let start = runtime_core::runtime::now();
+                client.close();
+                let outcome = client.closed().await.map_err(|e| e.to_string());
+                let took = runtime_core::runtime::now().duration_since(start).unwrap();
+                (outcome, took)
+            })
+            .await
+        },
+        None,
+        |run| run(),
+    );
+
+    let failure = outcome.expect_err("the GOAWAY never went");
+    assert!(failure.contains("GOAWAY"), "{failure}");
+    assert!(
+        took < farewell * 2,
+        "given up at the timeout, not the peer's pace: {took:?}"
     );
 }
 

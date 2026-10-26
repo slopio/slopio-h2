@@ -27,8 +27,6 @@ runs dry.
 
 ## Client
 
-- The origin map never shrinks: an entry per origin ever asked for, open
-  attempts that failed included. A proxy or a crawler grows without bound.
 - The in-place gRPC send only uses the room left in the open segment. A
   message that would fit a fresh one falls back to framing it apart, copying
   it and cutting it at the segment boundary.
@@ -39,7 +37,6 @@ runs dry.
   about 1 MB of 16 KiB segments per connection, which carry 9 bytes each.
 - Nothing waits at the limit: past `max_connections` a request is refused with
   `AtLimit` rather than queued for a stream to free up.
-- Extra connections opened for a burst are never closed while idle.
 - The peer's settings are no longer visible through `Client`, so
   `grpc_load` cannot cap its concurrency at the server's
   `max_concurrent_streams` any more. Calls past it now count as failures.

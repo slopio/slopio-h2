@@ -105,6 +105,11 @@ impl<S: Security> Client<S> {
             ClientError::Connect(_) => {
                 Status::new(Code::Unavailable, "no connection could be opened")
             }
+            // The client's own resources, which gRPC reports as this.
+            ClientError::AtCapacity => Status::new(
+                Code::ResourceExhausted,
+                "every connection this client may hold is in use",
+            ),
         })?;
 
         call.write_message_final(request).await?;

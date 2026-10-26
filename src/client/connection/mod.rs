@@ -2,12 +2,15 @@ use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::Poll;
+use std::time::SystemTime;
 
 use runtime::runtime::time::timeout;
 use runtime_streams::StreamExt;
 
 use crate::client::shared::ClientShared;
-use crate::client::{CONNECTION_RECV_WINDOW, Connection, STREAM_RECV_WINDOW};
+use crate::client::{
+    CONNECTION_RECV_WINDOW, Connection, FAREWELL_TIMEOUT, IDLE_CLOSE_TICKS, STREAM_RECV_WINDOW,
+};
 use crate::shared::codec::frames::{
     CLIENT_PREFACE, DECODE_MAX_HEADER_LIST_SIZE, FrameDecoder,
     encode::{encode_ping, encode_settings, encode_window_update},
@@ -72,6 +75,8 @@ pub(crate) struct Driver<T: Transport> {
     transport: T,
     decoder: FrameDecoder,
     protocol: Protocol,
+    /// Since when no stream has been open, as the loop last saw it.
+    idle_since: Option<SystemTime>,
 }
 
 impl<T: Transport> Driver<T> {
@@ -83,6 +88,7 @@ impl<T: Transport> Driver<T> {
             // A server sends no preface, so the decoder starts past that check.
             decoder: FrameDecoder::client(),
             protocol: Protocol::new(Rc::new(shared)),
+            idle_since: None,
         };
 
         conn.protocol.write_frame(|out| {
@@ -162,6 +168,13 @@ impl<T: Transport> Driver<T> {
                 break Ended::Failed(reason);
             }
 
+            // Nothing in flight is cut: with no stream open, `finished` says so
+            // on the next turn.
+            if self.idle_too_long(runtime::runtime::now()) {
+                self.protocol.shared.stop_opening();
+                continue;
+            }
+
             // Dropping the wait is safe: `MultiRecv` queues its completions in
             // a buffer it owns, so the read stays armed and nothing is lost.
             let Ok(event) = timeout(DEADLINE_TICK, self.next_event()).await else {
@@ -219,6 +232,17 @@ impl<T: Transport> Driver<T> {
         }
     }
 
+    /// Opening a stream writes its HEADERS, which wakes the loop, so no
+    /// request comes and goes between two turns unseen.
+    fn idle_too_long(&mut self, now: SystemTime) -> bool {
+        if self.protocol.shared.streams.len() > 0 {
+            self.idle_since = None;
+            return false;
+        }
+        let since = *self.idle_since.get_or_insert(now);
+        now.duration_since(since).unwrap_or_default() >= DEADLINE_TICK * IDLE_CLOSE_TICKS
+    }
+
     /// §6.8. `fail` is idempotent, so the GOAWAY is written only if none has
     /// gone out, and a reason the peer already gave is kept.
     async fn farewell(&mut self) -> Ended {
@@ -227,13 +251,16 @@ impl<T: Transport> Driver<T> {
             .failure
             .unwrap_or("the client closed the connection");
         self.protocol.fail(NO_ERROR, reason);
-        match self.flush().await {
-            Ok(()) => {
+        // A send dropped at the timeout hands its segments to the driver,
+        // which keeps them until the kernel is done with them.
+        match timeout(FAREWELL_TIMEOUT, self.flush()).await {
+            Ok(Ok(())) => {
                 // Only after the GOAWAY has gone.
                 let _ = self.transport.shutdown().await;
                 Ended::Done(reason)
             }
-            Err(_) => Ended::Failed("the connection failed while sending"),
+            Ok(Err(_)) => Ended::Failed("the connection failed while sending"),
+            Err(()) => Ended::Failed("the peer did not take the GOAWAY"),
         }
     }
 
