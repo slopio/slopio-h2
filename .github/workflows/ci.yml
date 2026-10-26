@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # git's own ssh, so the URL rewrites below apply
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # runtime and slopio-tls are private, one read-only deploy key each, and
+      # GitHub stops at the first key it accepts: each repository gets its own
+      # ssh host alias. slopio-dns is public.
+      - name: Deploy keys
+        env:
+          RUNTIME_DEPLOY_KEY: ${{ secrets.RUNTIME_DEPLOY_KEY }}
+          TLS_DEPLOY_KEY: ${{ secrets.TLS_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$RUNTIME_DEPLOY_KEY" > ~/.ssh/runtime
+          printf '%s\n' "$TLS_DEPLOY_KEY" > ~/.ssh/tls
+          chmod 600 ~/.ssh/runtime ~/.ssh/tls
+          cat >> ~/.ssh/config <<'EOF'
+          Host github-runtime
+            HostName github.com
+            User git
+            IdentityFile ~/.ssh/runtime
+            IdentitiesOnly yes
+          Host github-tls
+            HostName github.com
+            User git
+            IdentityFile ~/.ssh/tls
+            IdentitiesOnly yes
+          EOF
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          git config --global url."ssh://github-runtime/saucisoupe/runtime.git".insteadOf ssh://git@github.com/saucisoupe/runtime.git
+          git config --global url."ssh://github-tls/saucisoupe/slopio-tls.git".insteadOf ssh://git@github.com/saucisoupe/slopio-tls.git
+          git config --global url."https://github.com/slopio/slopio-dns.git".insteadOf ssh://git@github.com/slopio/slopio-dns.git
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: |
+          cargo clippy --locked --all-targets --no-default-features -- -D warnings
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+      # The tls tests need kTLS; zero-copy sends and registered buffers pin
+      # pages against RLIMIT_MEMLOCK.
+      - name: Test
+        run: |
+          sudo modprobe tls
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          cargo test --locked --all-features --no-fail-fast
