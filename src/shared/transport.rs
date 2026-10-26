@@ -79,10 +79,18 @@ pub struct PlainMessages<R: BufRingSpec, const ZC: bool = false> {
     recv: MultiRecv<R>,
 }
 
+/// Chunks a connection may have received and not yet decoded before its recv
+/// pauses. Each holds a buffer of the ring every connection on the worker
+/// shares, however few bytes it carries, and a loop stalled in a send decodes
+/// nothing: at the runtime's default of 32, a few such connections empty the
+/// ring for everyone until `FLUSH_TIMEOUT` cuts them. Paused, the peer's
+/// bytes wait in the socket, for TCP to push back with.
+const RECV_QUEUE_LIMIT: usize = 4;
+
 impl<R: BufRingSpec, const ZC: bool> PlainMessages<R, ZC> {
     pub fn new(socket: SocketWrapper) -> Self {
         Self {
-            recv: MultiRecv::new(socket),
+            recv: MultiRecv::with_queue_limit(socket, RECV_QUEUE_LIMIT),
         }
     }
 }
