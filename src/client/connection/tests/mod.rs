@@ -16,6 +16,8 @@ use crate::shared::connection::input_data::InputData;
 use crate::shared::connection::settings::Settings;
 use crate::shared::transport::PlainMessages;
 
+mod dst;
+mod dst_peer;
 #[cfg(feature = "grpc")]
 mod grpc;
 
