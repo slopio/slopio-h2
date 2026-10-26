@@ -75,10 +75,13 @@ pub const IDLE_PING_TICKS: u32 = 12;
 /// once in the meantime.
 pub const IDLE_CLOSE_TICKS: u32 = 18;
 
-/// How long the GOAWAY that ends a connection may take to go out. Past it the
-/// socket is closed anyway: a peer that stops reading must not keep a
-/// connection it was told is over.
-pub const FAREWELL_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long one gather-write may stall before the connection is given up on.
+/// It bounds the whole write, so a peer taking a byte at a time gets no fresh
+/// deadline per byte. Without it a server that stops reading holds the loop
+/// in its send for ever: the keepalive is only asked between turns. The
+/// GOAWAY that ends a connection is one such write, so a peer that stops
+/// reading does not keep a connection it was told is over either.
+pub const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Ticks a keepalive PING may go unanswered before the connection is given up
 /// on. Only one probe is outstanding at a time, so this is the full budget.

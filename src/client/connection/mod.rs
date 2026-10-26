@@ -9,7 +9,7 @@ use runtime_streams::StreamExt;
 
 use crate::client::shared::ClientShared;
 use crate::client::{
-    CONNECTION_RECV_WINDOW, Connection, FAREWELL_TIMEOUT, IDLE_CLOSE_TICKS, STREAM_RECV_WINDOW,
+    CONNECTION_RECV_WINDOW, Connection, FLUSH_TIMEOUT, IDLE_CLOSE_TICKS, STREAM_RECV_WINDOW,
 };
 use crate::shared::codec::frames::{
     CLIENT_PREFACE, DECODE_MAX_HEADER_LIST_SIZE, FrameDecoder,
@@ -251,16 +251,17 @@ impl<T: Transport> Driver<T> {
             .failure
             .unwrap_or("the client closed the connection");
         self.protocol.fail(NO_ERROR, reason);
-        // A send dropped at the timeout hands its segments to the driver,
-        // which keeps them until the kernel is done with them.
-        match timeout(FAREWELL_TIMEOUT, self.flush()).await {
-            Ok(Ok(())) => {
+        // Bounded by the flush's own deadline.
+        match self.flush().await {
+            Ok(()) => {
                 // Only after the GOAWAY has gone.
                 let _ = self.transport.shutdown().await;
                 Ended::Done(reason)
             }
-            Ok(Err(_)) => Ended::Failed("the connection failed while sending"),
-            Err(()) => Ended::Failed("the peer did not take the GOAWAY"),
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                Ended::Failed("the peer did not take the GOAWAY")
+            }
+            Err(_) => Ended::Failed("the connection failed while sending"),
         }
     }
 
@@ -313,9 +314,18 @@ impl<T: Transport> Driver<T> {
             return Ok(());
         }
         let bufs = self.protocol.shared.core.take_output();
-        let (result, bufs) = self.transport.send(bufs, false).await;
-        self.protocol.shared.core.restore_output(bufs);
-        result
+        // Bound before the match: a scrutinee's temporaries would hold the
+        // borrow of `self.transport` into the arms.
+        let sent = timeout(FLUSH_TIMEOUT, self.transport.send(bufs, false)).await;
+        match sent {
+            Ok((result, bufs)) => {
+                self.protocol.shared.core.restore_output(bufs);
+                result
+            }
+            // The segments must not come back: a dropped send hands them to
+            // the driver, which keeps them until the kernel is done with them.
+            Err(()) => Err(io::ErrorKind::TimedOut.into()),
+        }
     }
 }
 

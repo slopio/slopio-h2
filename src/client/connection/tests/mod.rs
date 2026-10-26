@@ -1852,7 +1852,7 @@ fn a_request_restarts_the_idle_count() {
 /// that stalls, and nothing before it.
 #[test]
 fn a_peer_that_stops_reading_does_not_hold_the_goodbye() {
-    let farewell = crate::client::FAREWELL_TIMEOUT;
+    let farewell = crate::client::FLUSH_TIMEOUT;
     let (fake, handle) = FakeRing::builder().virtual_time().build();
     let socket = simulated_socket();
     let fd = socket.fd();
