@@ -9,6 +9,7 @@ use crate::server::shutdown::Registration;
 use crate::server::{Handler, Limits};
 use crate::shared::{
     codec::frames::FrameDecoder,
+    connection::DryRing,
     transport::{RecvError, Transport},
 };
 use runtime::runtime::time::timeout;
@@ -169,6 +170,7 @@ impl<T: Transport, H: Handler> Connection<T, H> {
         // restarts whenever handler output wakes the loop, so a dead peer
         // would otherwise be held for as long as a handler kept writing.
         let mut last_heard = runtime::runtime::now();
+        let mut dry = DryRing::default();
         loop {
             match self.due(last_heard) {
                 Due::Nothing => {}
@@ -192,7 +194,10 @@ impl<T: Transport, H: Handler> Connection<T, H> {
             };
             let chunk = match waited {
                 Err(()) => continue,
-                Ok(Event::Inbound(chunk)) => chunk,
+                Ok(Event::Inbound(chunk)) => {
+                    dry.refilled();
+                    chunk
+                }
                 // Not the peer's doing, so it must not reset the peer's
                 // silence or run the sweep.
                 Ok(Event::Flush) => {
@@ -214,12 +219,11 @@ impl<T: Transport, H: Handler> Connection<T, H> {
                     continue;
                 }
                 // An empty ring is other connections holding buffers, not
-                // this peer's doing, so it never ends the connection. Yield,
-                // not sleep: a sleeper loses every refill to the yielders.
+                // this peer's doing, so it never ends the connection.
                 // `last_heard` is untouched, so a ring that never refills
                 // still ends in the silence deadline's GOAWAY.
                 Ok(Event::Retry) => {
-                    runtime::yield_now().await;
+                    dry.wait().await;
                     continue;
                 }
                 Ok(Event::Failed) => return,

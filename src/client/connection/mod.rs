@@ -17,7 +17,7 @@ use crate::shared::codec::frames::{
     stream_id::StreamId,
 };
 use crate::shared::codec::types::{NO_ERROR, Setting};
-use crate::shared::connection::{CONNECTION_INITIAL_WINDOW_SIZE, DEADLINE_TICK};
+use crate::shared::connection::{CONNECTION_INITIAL_WINDOW_SIZE, DEADLINE_TICK, DryRing};
 use crate::shared::transport::{RecvError, Security, Transport};
 
 mod keepalive;
@@ -115,15 +115,16 @@ impl<T: Transport> Driver<T> {
 
         conn.flush().await?;
 
+        let mut dry = DryRing::default();
         while conn.protocol.handshake != Handshake::Complete {
             match conn.recv().await {
                 None => return Err(handshake_failed(&conn, "peer closed during the handshake")),
                 Some(Err(RecvError::Fatal(e))) => return Err(e),
                 Some(Err(RecvError::Later)) => {
-                    runtime::yield_now().await;
+                    dry.wait().await;
                     continue;
                 }
-                Some(Ok(())) => {}
+                Some(Ok(())) => dry.refilled(),
             }
             conn.flush().await?;
             if conn.protocol.is_closing() || conn.protocol.shared.is_closing() {
@@ -154,6 +155,7 @@ impl<T: Transport> Driver<T> {
     async fn run(mut self) -> io::Result<()> {
         // Silence starts after the handshake, which was the peer talking.
         self.protocol.keepalive.heard(runtime::runtime::now());
+        let mut dry = DryRing::default();
         let ended = loop {
             if finished(&self.protocol.shared) {
                 break self.farewell().await;
@@ -182,6 +184,7 @@ impl<T: Transport> Driver<T> {
             };
             match event {
                 Event::Inbound(chunk) => {
+                    dry.refilled();
                     self.protocol.keepalive.heard(runtime::runtime::now());
                     self.decoder.decode_with(chunk.as_ref(), &mut self.protocol);
                 }
@@ -191,10 +194,10 @@ impl<T: Transport> Driver<T> {
                     }
                     continue;
                 }
-                // Buffers come back only when other connections on this worker
-                // are polled, which yielding lets happen.
+                // Buffers come back when other connections on this worker
+                // are polled, or once what holds them is done waiting.
                 Event::Retry => {
-                    runtime::yield_now().await;
+                    dry.wait().await;
                     continue;
                 }
                 Event::Closed => break Ended::Done("the peer closed the connection"),
