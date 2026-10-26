@@ -18,7 +18,8 @@ jobs:
       # runtime, slopio-tls and slopio-dns are private, one read-only deploy
       # key each, and GitHub stops at the first key it accepts: each repository
       # gets its own ssh host alias.
-      - name: Deploy keys
+      - &deploy-keys
+        name: Deploy keys
         env:
           RUNTIME_DEPLOY_KEY: ${{ secrets.RUNTIME_DEPLOY_KEY }}
           TLS_DEPLOY_KEY: ${{ secrets.TLS_DEPLOY_KEY }}
@@ -68,3 +69,26 @@ jobs:
           sudo modprobe tls
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           cargo test --locked --all-features --no-fail-fast
+
+  # The README's promise: h2spec passes clean, strict suite included.
+  h2spec:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - *deploy-keys
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the server
+        run: cargo build --locked --example server
+      - name: Install h2spec
+        run: |
+          curl -sSfL -o h2spec.tgz https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz
+          echo "157ee0de702e01ad40e752dbf074b366027e550c8e7504f9450da2809e279318  h2spec.tgz" | sha256sum -c
+          tar xzf h2spec.tgz h2spec
+      - name: h2spec
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          ./target/debug/examples/server &
+          timeout 10 sh -c 'until nc -z 127.0.0.1 8080; do sleep 0.1; done'
+          ./h2spec -h 127.0.0.1 -p 8080 --timeout 5
+          ./h2spec -h 127.0.0.1 -p 8080 --timeout 5 --strict
