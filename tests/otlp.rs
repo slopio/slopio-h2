@@ -22,8 +22,11 @@ runtime::define_buf_ring!(ClientRing, bgid = 1, buffer_size = 16384, ring_size =
 
 const EXPORT: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
 
-/// Each export's `(trace id length, name)` per span, to the test thread.
-static EXPORTS: OnceLock<Mutex<mpsc::Sender<Vec<(usize, String)>>>> = OnceLock::new();
+/// One export: `(trace id length, name)` per span.
+type Export = Vec<(usize, String)>;
+
+/// Each export, to the test thread.
+static EXPORTS: OnceLock<Mutex<mpsc::Sender<Export>>> = OnceLock::new();
 static RECEIVED: AtomicBool = AtomicBool::new(false);
 
 async fn route(call: &GrpcCall) -> Status {
