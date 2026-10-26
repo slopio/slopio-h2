@@ -389,7 +389,7 @@ impl Wire {
                     }
                 }
                 SETTINGS => {
-                    for pair in payload.chunks_exact(6) {
+                    for pair in payload.as_chunks::<6>().0 {
                         let value = u32::from_be_bytes([pair[2], pair[3], pair[4], pair[5]]);
                         match u16::from_be_bytes([pair[0], pair[1]]) {
                             INITIAL_WINDOW_SIZE => self.send.resize(i64::from(value)),
