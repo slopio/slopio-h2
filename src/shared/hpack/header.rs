@@ -62,7 +62,7 @@ impl Header<Option<HeaderName>> {
 impl Header {
     /// A refused field is not dropped: the decoder still owes the dynamic
     /// table an entry for it.
-    pub fn new(name: &[u8], value: &Bytes) -> Result<Header, DecoderError> {
+    pub fn new(name: &Bytes, value: &Bytes) -> Result<Header, DecoderError> {
         if name.is_empty() {
             return Err(DecoderError::InvalidField);
         }
@@ -84,7 +84,7 @@ impl Header {
             }
         } else {
             // HTTP/2 requires lower case header names
-            let name = HeaderName::from_lowercase(name)?;
+            let name = HeaderName::from_shared_lowercase(name.clone())?;
             Ok(Header::Field {
                 name,
                 value: field_value(value)?,
@@ -244,8 +244,8 @@ impl<'a> Name<'a> {
 }
 
 /// §8.2.1: `HeaderValue` refuses NUL, CR, LF and other controls; whitespace
-/// at either end is ours to check.
-fn field_value(value: &[u8]) -> Result<HeaderValue, DecoderError> {
+/// at either end is ours to check. A view on the decoded bytes, not a copy.
+fn field_value(value: &Bytes) -> Result<HeaderValue, DecoderError> {
     if value
         .first()
         .into_iter()
@@ -254,7 +254,7 @@ fn field_value(value: &[u8]) -> Result<HeaderValue, DecoderError> {
     {
         return Err(DecoderError::InvalidField);
     }
-    Ok(HeaderValue::from_bytes(value)?)
+    Ok(HeaderValue::from_shared(value.clone())?)
 }
 
 /// No control character, space or DEL fits these grammars. Refusing them keeps

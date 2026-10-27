@@ -3,7 +3,7 @@ use crate::shared::hpack::Error;
 use super::{Header, header::BytesStr, huffman};
 use crate::shared::codec::ext::Protocol;
 
-use http::header;
+use http::header::{self, HeaderName, HeaderValue};
 use http::method::{self, Method};
 use http::status::{self, StatusCode};
 use runtime::bytes::{Bytes, BytesMut};
@@ -136,11 +136,15 @@ impl Entry {
     /// of a chunk shared with whatever was staged or decoded beside it, and a
     /// table entry lives as long as the connection: as a slice, a 43-byte
     /// `:authority` held a padded frame's whole 16 KiB chunk, a table's worth
-    /// of them about 1.5 MB. Ordinary fields need nothing: `http` copies
-    /// their names and values as it checks them.
+    /// of them about 1.5 MB. Ordinary fields are slices too; a standard name
+    /// is a constant and needs no copy.
     fn detached(&self) -> Entry {
         let owned = |value: &BytesStr| BytesStr::from(value.as_str());
         match self {
+            Entry::Field(Header::Field { name, value }) => Entry::Field(Header::Field {
+                name: HeaderName::from_lowercase(name.as_ref()).expect("was a lowercase name"),
+                value: HeaderValue::from_bytes(value.as_bytes()).expect("was a header value"),
+            }),
             Entry::Field(Header::Authority(value)) => Entry::Field(Header::Authority(owned(value))),
             Entry::Field(Header::Scheme(value)) => Entry::Field(Header::Scheme(owned(value))),
             Entry::Field(Header::Path(value)) => Entry::Field(Header::Path(owned(value))),
@@ -963,6 +967,35 @@ mod test {
         let mut buf = Vec::new();
         huffman::encode(src, &mut buf);
         buf
+    }
+
+    /// A field is a view on the block it came in, not a copy; what the table
+    /// keeps for later blocks owns its bytes.
+    #[test]
+    fn a_field_shares_the_block_and_the_table_copies_it() {
+        let mut de = Decoder::new(4096);
+        let mut buf = BytesMut::new();
+        // Literal with indexing, new name, neither Huffman-coded.
+        buf.extend_from_slice(&[0b0100_0000, 5]);
+        buf.extend_from_slice(b"x-foo");
+        buf.extend_from_slice(&[3]);
+        buf.extend_from_slice(b"bar");
+        let block = buf.as_ptr_range();
+
+        let mut fields = Vec::new();
+        de.decode(&mut Cursor::new(&mut buf), |h| fields.push(h))
+            .unwrap();
+        let [Header::Field { name, value }] = &fields[..] else {
+            panic!("{fields:?}");
+        };
+        assert!(block.contains(&value.as_bytes().as_ptr()), "a view");
+        assert!(block.contains(&name.as_str().as_ptr()), "a view");
+
+        let Ok(Entry::Field(Header::Field { value: kept, .. })) = de.table.get(62) else {
+            panic!("indexed");
+        };
+        assert_eq!(kept, value);
+        assert!(!block.contains(&kept.as_bytes().as_ptr()), "a copy");
     }
 
     #[test]
