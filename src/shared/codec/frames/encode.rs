@@ -3,7 +3,7 @@ use crate::shared::codec::{
         head::{Head, Kind},
         stream_id::StreamId,
     },
-    types::Setting,
+    types::{HEADER_LEN, Setting},
 };
 
 const FLAG_END_STREAM: u8 = 0x1;
@@ -27,11 +27,15 @@ pub fn encode_headers_header(
     block_len: usize,
     end_stream: bool,
 ) {
+    whole_headers(stream_id, end_stream).encode(block_len, out);
+}
+
+fn whole_headers(stream_id: StreamId, end_stream: bool) -> Head {
     let mut flags = FLAG_END_HEADERS;
     if end_stream {
         flags |= FLAG_END_STREAM;
     }
-    Head::new(Kind::Headers, flags, stream_id).encode(block_len, out);
+    Head::new(Kind::Headers, flags, stream_id)
 }
 
 /// §6.10: END_HEADERS deliberately unset; END_STREAM still belongs here.
@@ -139,5 +143,55 @@ pub fn encode_header_block(
     while let Some(fragment) = rest.next() {
         encode_continuation_header(out, stream_id, fragment.len(), rest.peek().is_none());
         out.extend_from_slice(fragment);
+    }
+}
+
+/// A header block `encode` writes straight into `out`, its frame header
+/// filled in once the length is known. One that does not fit `limit` is cut
+/// into CONTINUATIONs, which moves it: rare, and the block is copied out.
+pub fn encode_header_block_in_place(
+    out: &mut Vec<u8>,
+    stream_id: StreamId,
+    limit: usize,
+    end_stream: bool,
+    encode: impl FnOnce(&mut Vec<u8>),
+) {
+    let start = out.len();
+    out.extend_from_slice(&[0; HEADER_LEN]);
+    encode(out);
+    let len = out.len() - start - HEADER_LEN;
+    if len <= limit {
+        let head = whole_headers(stream_id, end_stream).to_bytes(len);
+        out[start..start + HEADER_LEN].copy_from_slice(&head);
+    } else {
+        let block = out.split_off(start + HEADER_LEN);
+        out.truncate(start);
+        encode_header_block(out, stream_id, &block, limit, end_stream);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn both_ways(block: &[u8], limit: usize, end_stream: bool) -> (Vec<u8>, Vec<u8>) {
+        let id = StreamId::from(1);
+        let mut copied = b"before".to_vec();
+        encode_header_block(&mut copied, id, block, limit, end_stream);
+        let mut in_place = b"before".to_vec();
+        encode_header_block_in_place(&mut in_place, id, limit, end_stream, |out| {
+            out.extend_from_slice(block)
+        });
+        (copied, in_place)
+    }
+
+    #[test]
+    fn a_block_in_place_frames_as_one_copied_in() {
+        for (block, limit) in [(&[][..], 16), (&[1; 16][..], 16), (&[2; 40][..], 16)] {
+            for end_stream in [false, true] {
+                let (copied, in_place) = both_ways(block, limit, end_stream);
+                assert_eq!(in_place, copied, "{} bytes, limit {limit}", block.len());
+            }
+        }
     }
 }

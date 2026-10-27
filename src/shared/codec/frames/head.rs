@@ -40,12 +40,13 @@ impl Head {
     }
 
     pub fn encode(&self, payload_len: usize, dst: &mut Vec<u8>) {
-        let start = dst.len();
-        let [_, len @ ..] = (payload_len as u32).to_be_bytes();
-        dst.extend_from_slice(&len);
-        dst.push(self.kind as u8);
-        dst.push(self.flag);
-        dst.extend_from_slice(&u32::from(self.stream_id).to_be_bytes());
-        debug_assert_eq!(dst.len() - start, HEADER_LEN);
+        dst.extend_from_slice(&self.to_bytes(payload_len));
+    }
+
+    /// For a header written after its payload, once the length is known.
+    pub fn to_bytes(self, payload_len: usize) -> [u8; HEADER_LEN] {
+        let [_, l0, l1, l2] = (payload_len as u32).to_be_bytes();
+        let [s0, s1, s2, s3] = u32::from(self.stream_id).to_be_bytes();
+        [l0, l1, l2, self.kind as u8, self.flag, s0, s1, s2, s3]
     }
 }

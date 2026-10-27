@@ -7,7 +7,7 @@ use http::{HeaderMap, HeaderName};
 use runtime::bytes::Bytes;
 
 use crate::shared::codec::frames::{
-    encode::{encode_data_header, encode_header_block, encode_window_update},
+    encode::{encode_data_header, encode_header_block_in_place, encode_window_update},
     stream_id::StreamId,
 };
 use crate::shared::connection::STREAM_ID;
@@ -214,16 +214,18 @@ impl SharedConnection {
         headers: impl Iterator<Item = Header<Option<HeaderName>>>,
         end_stream: bool,
     ) {
-        let mut block = Vec::new();
-        // SAFETY: the reference dies with the expression. `encode` runs the
-        // caller's header iterator, which clones out of a map it owns, and
-        // writes into a local that aliases nothing — neither can re-enter.
-        unsafe { (*self.encoder.get()).encode(headers, &mut block) };
-
         // Never zero: `chunks` panics on zero and the value came off the wire.
         let limit = (self.max_frame_size.get() as usize).max(1);
 
-        self.write_frame(|out| encode_header_block(out, stream_id, &block, limit, end_stream));
+        self.write_frame(|out| {
+            encode_header_block_in_place(out, stream_id, limit, end_stream, |out| {
+                // SAFETY: the reference dies with the expression. `encode`
+                // runs the caller's header iterator, which clones out of a
+                // map it owns, and writes into a segment rather than the
+                // connection — neither can re-enter.
+                unsafe { (*self.encoder.get()).encode(headers, out) }
+            })
+        });
     }
 
     /// §8.1: no pseudo-header. The caller must have checked the stream can
