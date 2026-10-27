@@ -1,7 +1,6 @@
 use super::table::{Index, Table};
 use super::{Header, huffman};
 
-use bytes::BufMut;
 use http::header::{HeaderName, HeaderValue};
 
 #[derive(Debug)]
@@ -118,7 +117,7 @@ impl Encoder {
 
                 assert!(!header.is_sensitive());
 
-                dst.put_u8(0b0100_0000);
+                dst.push(0b0100_0000);
 
                 encode_str(header.name().as_slice(), dst);
                 encode_str(header.value_slice(), dst);
@@ -190,9 +189,9 @@ fn encode_not_indexed(name: usize, value: &[u8], sensitive: bool, dst: &mut Vec<
 
 fn encode_not_indexed2(name: &[u8], value: &[u8], sensitive: bool, dst: &mut Vec<u8>) {
     if sensitive {
-        dst.put_u8(0b10000);
+        dst.push(0b10000);
     } else {
-        dst.put_u8(0);
+        dst.push(0);
     }
 
     encode_str(name, dst);
@@ -203,7 +202,7 @@ fn encode_str(val: &[u8], dst: &mut Vec<u8>) {
     if !val.is_empty() {
         let idx = position(dst);
 
-        dst.put_u8(0);
+        dst.push(0);
 
         huffman::encode(val, dst);
 
@@ -212,33 +211,22 @@ fn encode_str(val: &[u8], dst: &mut Vec<u8>) {
         if encode_int_one_byte(huff_len, 7) {
             dst[idx] = 0x80 | huff_len as u8;
         } else {
-            const PLACEHOLDER_LEN: usize = 8;
-            let mut buf = [0u8; PLACEHOLDER_LEN];
-
-            let head_len = {
-                let mut head_dst = &mut buf[..];
-                encode_int(huff_len, 7, 0x80, &mut head_dst);
-                PLACEHOLDER_LEN - head_dst.remaining_mut()
-            };
-
-            dst.put_slice(&buf[1..head_len]);
-
-            for i in 0..huff_len {
-                let src_i = idx + 1 + (huff_len - (i + 1));
-                let dst_i = idx + head_len + (huff_len - (i + 1));
-                dst[dst_i] = dst[src_i];
-            }
-
-            dst[idx..idx + head_len].copy_from_slice(&buf[..head_len]);
+            // The length goes after the string, then moves in front of it,
+            // over the placeholder.
+            let end = position(dst);
+            encode_int(huff_len, 7, 0x80, dst);
+            let head_len = position(dst) - end;
+            dst[idx..].rotate_right(head_len);
+            dst.remove(idx + head_len);
         }
     } else {
-        dst.put_u8(0);
+        dst.push(0);
     }
 }
 
-fn encode_int<B: BufMut>(mut value: usize, prefix_bits: usize, first_byte: u8, dst: &mut B) {
+fn encode_int(mut value: usize, prefix_bits: usize, first_byte: u8, dst: &mut Vec<u8>) {
     if encode_int_one_byte(value, prefix_bits) {
-        dst.put_u8(first_byte | value as u8);
+        dst.push(first_byte | value as u8);
         return;
     }
 
@@ -246,15 +234,15 @@ fn encode_int<B: BufMut>(mut value: usize, prefix_bits: usize, first_byte: u8, d
 
     value -= low;
 
-    dst.put_u8(first_byte | low as u8);
+    dst.push(first_byte | low as u8);
 
     while value >= 128 {
-        dst.put_u8(0b1000_0000 | value as u8);
+        dst.push(0b1000_0000 | value as u8);
 
         value >>= 7;
     }
 
-    dst.put_u8(value as u8);
+    dst.push(value as u8);
 }
 
 fn encode_int_one_byte(value: usize, prefix_bits: usize) -> bool {
@@ -268,8 +256,8 @@ fn position(buf: &[u8]) -> usize {
 #[cfg(test)]
 mod test {
     use super::*;
-    use bytes::BytesMut;
     use http::*;
+    use runtime::bytes::BytesMut;
 
     #[test]
     fn test_encode_method_get() {
@@ -295,7 +283,7 @@ mod test {
         assert_eq!(res[0], 0b01000000 | 2); // Incremental indexing w/ name pulled from table
         assert_eq!(res[1], 0x80 | 5); // header value w/ huffman coding
 
-        assert_eq!("PATCH", huff_decode(&res[2..7]));
+        assert_eq!(huff_decode(&res[2..7]), "PATCH");
         assert_eq!(encoder.table.len(), 1);
 
         let res = encode(&mut encoder, vec![method("PATCH")]);
@@ -312,12 +300,12 @@ mod test {
         assert_eq!(res[0], 0b01000000 | 27); // Indexed name
         assert_eq!(res[1], 0x80 | 2); // header value w/ huffman coding
 
-        assert_eq!("foo", huff_decode(&res[2..4]));
+        assert_eq!(huff_decode(&res[2..4]), "foo");
 
         let res = encode(&mut encoder, vec![header("content-language", "bar")]);
         assert_eq!(res[0], 0b01000000 | 27); // Indexed name
         assert_eq!(res[1], 0x80 | 3); // header value w/ huffman coding
-        assert_eq!("bar", huff_decode(&res[2..5]));
+        assert_eq!(huff_decode(&res[2..5]), "bar");
     }
 
     #[test]
@@ -326,9 +314,9 @@ mod test {
         let res = encode(&mut encoder, vec![header("foo", "hello")]);
 
         assert_eq!(&[0b01000000, 0x80 | 2], &res[0..2]);
-        assert_eq!("foo", huff_decode(&res[2..4]));
+        assert_eq!(huff_decode(&res[2..4]), "foo");
         assert_eq!(0x80 | 4, res[4]);
-        assert_eq!("hello", huff_decode(&res[5..]));
+        assert_eq!(huff_decode(&res[5..]), "hello");
         assert_eq!(9, res.len());
 
         assert_eq!(1, encoder.table.len());
@@ -348,9 +336,9 @@ mod test {
             let res = encode(&mut encoder, vec![header(&key, &key)]);
 
             assert_eq!(&[0b01000000, 0x80 | 12], &res[0..2]);
-            assert_eq!(key, huff_decode(&res[2..14]));
+            assert_eq!(huff_decode(&res[2..14]), key.as_str());
             assert_eq!(0x80 | 12, res[14]);
-            assert_eq!(key, huff_decode(&res[15..]));
+            assert_eq!(huff_decode(&res[15..]), key.as_str());
             assert_eq!(27, res.len());
 
             let res = encode(&mut encoder, vec![header(&key, &key)]);
@@ -371,9 +359,9 @@ mod test {
         let res = encode(&mut encoder, vec![header(key, key)]);
 
         assert_eq!(&[0b01000000, 0x80 | 12], &res[0..2]);
-        assert_eq!(key, huff_decode(&res[2..14]));
+        assert_eq!(huff_decode(&res[2..14]), key);
         assert_eq!(0x80 | 12, res[14]);
-        assert_eq!(key, huff_decode(&res[15..]));
+        assert_eq!(huff_decode(&res[15..]), key);
         assert_eq!(27, res.len());
 
         assert_eq!(64, encoder.table.len());
@@ -398,6 +386,29 @@ mod test {
         assert_eq!(0, encoder.table.size());
     }
 
+    /// From 127 bytes a string's length takes several bytes, written after
+    /// it and moved in front.
+    #[test]
+    fn a_long_value_decodes_back() {
+        let value = "0123456789".repeat(30);
+        let mut encoder = Encoder::default();
+        let res = encode(&mut encoder, vec![header("x-long", &value)]);
+        assert!(res.len() > 128 + 8, "a length of several bytes");
+
+        let mut buf = BytesMut::from(&res[..]);
+        let mut decoded = Vec::new();
+        crate::shared::hpack::Decoder::default()
+            .decode(&mut std::io::Cursor::new(&mut buf), |h| decoded.push(h))
+            .unwrap();
+        match &decoded[..] {
+            [Header::Field { name, value: got }] => {
+                assert_eq!(name, "x-long");
+                assert_eq!(got.as_bytes(), value.as_bytes());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn test_sensitive_headers_are_never_indexed() {
         use http::header::HeaderValue;
@@ -415,9 +426,9 @@ mod test {
         let res = encode(&mut encoder, vec![header]);
 
         assert_eq!(&[0b10000, 0x80 | 8], &res[..2]);
-        assert_eq!("my-password", huff_decode(&res[2..10]));
+        assert_eq!(huff_decode(&res[2..10]), "my-password");
         assert_eq!(0x80 | 4, res[10]);
-        assert_eq!("12345", huff_decode(&res[11..]));
+        assert_eq!(huff_decode(&res[11..]), "12345");
 
         // A sensitive header with a name in the static table.
         let name = "authorization".parse().unwrap();
@@ -434,7 +445,7 @@ mod test {
 
         assert_eq!(&[0b11111, 8], &res[..2]);
         assert_eq!(0x80 | 4, res[2]);
-        assert_eq!("12345", huff_decode(&res[3..]));
+        assert_eq!(huff_decode(&res[3..]), "12345");
 
         // The name of a previously indexed header, without the sensitive flag.
         let _ = encode(
@@ -454,7 +465,7 @@ mod test {
 
         assert_eq!(&[0b11111, 47], &res[..2]);
         assert_eq!(0x80 | 4, res[2]);
-        assert_eq!("12345", huff_decode(&res[3..]));
+        assert_eq!(huff_decode(&res[3..]), "12345");
     }
 
     #[test]
@@ -463,7 +474,7 @@ mod test {
         let res = encode(&mut encoder, vec![header("content-length", "1234")]);
 
         assert_eq!(&[15, 13, 0x80 | 3], &res[0..3]);
-        assert_eq!("1234", huff_decode(&res[3..]));
+        assert_eq!(huff_decode(&res[3..]), "1234");
         assert_eq!(6, res.len());
     }
 
@@ -476,7 +487,7 @@ mod test {
 
         let res = encode(&mut encoder, vec![header(name, "two")]);
         assert_eq!(&[0x40 | 62, 0x80 | 3], &res[0..2]);
-        assert_eq!("two", huff_decode(&res[2..]));
+        assert_eq!(huff_decode(&res[2..]), "two");
         assert_eq!(5, res.len());
 
         let res = encode(&mut encoder, vec![header(name, "one")]);
@@ -517,14 +528,14 @@ mod test {
 
         let res = encode(&mut encoder, vec![header("foo", "bar")]);
         assert_eq!(&[0, 0x80 | 2], &res[..2]);
-        assert_eq!("foo", huff_decode(&res[2..4]));
+        assert_eq!(huff_decode(&res[2..4]), "foo");
         assert_eq!(0x80 | 3, res[4]);
-        assert_eq!("bar", huff_decode(&res[5..8]));
+        assert_eq!(huff_decode(&res[5..8]), "bar");
         assert_eq!(0, encoder.table.len());
 
         let res = encode(&mut encoder, vec![header("transfer-encoding", "chunked")]);
         assert_eq!(&[15, 42, 0x80 | 6], &res[..3]);
-        assert_eq!("chunked", huff_decode(&res[3..]));
+        assert_eq!(huff_decode(&res[3..]), "chunked");
     }
 
     #[test]
@@ -616,13 +627,13 @@ mod test {
         );
 
         assert_eq!(&[0x40, 0x80 | 4], &res[0..2]);
-        assert_eq!("hello", huff_decode(&res[2..6]));
+        assert_eq!(huff_decode(&res[2..6]), "hello");
         assert_eq!(0x80 | 4, res[6]);
-        assert_eq!("world", huff_decode(&res[7..11]));
+        assert_eq!(huff_decode(&res[7..11]), "world");
 
         // Next is not indexed
         assert_eq!(&[15, 47, 0x80 | 3], &res[11..14]);
-        assert_eq!("zomg", huff_decode(&res[14..]));
+        assert_eq!(huff_decode(&res[14..]), "zomg");
     }
 
     #[test]

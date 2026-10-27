@@ -1,5 +1,3 @@
-use bytes::BufMut;
-
 use crate::shared::codec::{
     frames::{
         head::{Head, Kind},
@@ -12,8 +10,8 @@ const FLAG_END_STREAM: u8 = 0x1;
 const FLAG_END_HEADERS: u8 = 0x4;
 const FLAG_ACK: u8 = 0x1;
 
-pub fn encode_data_header<T: BufMut>(
-    out: &mut T,
+pub fn encode_data_header(
+    out: &mut Vec<u8>,
     stream_id: StreamId,
     payload_len: usize,
     end_stream: bool,
@@ -23,8 +21,8 @@ pub fn encode_data_header<T: BufMut>(
 }
 
 /// END_HEADERS always set: single-frame only (no CONTINUATION).
-pub fn encode_headers_header<T: BufMut>(
-    out: &mut T,
+pub fn encode_headers_header(
+    out: &mut Vec<u8>,
     stream_id: StreamId,
     block_len: usize,
     end_stream: bool,
@@ -37,8 +35,8 @@ pub fn encode_headers_header<T: BufMut>(
 }
 
 /// §6.10: END_HEADERS deliberately unset; END_STREAM still belongs here.
-pub fn encode_headers_fragment_header<T: BufMut>(
-    out: &mut T,
+pub fn encode_headers_fragment_header(
+    out: &mut Vec<u8>,
     stream_id: StreamId,
     fragment_len: usize,
     end_stream: bool,
@@ -48,8 +46,8 @@ pub fn encode_headers_fragment_header<T: BufMut>(
 }
 
 /// §6.10: must follow their HEADERS with nothing interleaved.
-pub fn encode_continuation_header<T: BufMut>(
-    out: &mut T,
+pub fn encode_continuation_header(
+    out: &mut Vec<u8>,
     stream_id: StreamId,
     fragment_len: usize,
     end_headers: bool,

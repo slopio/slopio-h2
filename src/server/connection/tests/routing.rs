@@ -62,7 +62,7 @@ fn answer(
     let mut decoder = Decoder::new(4096);
     let mut heads = Vec::new();
     for f in written.iter().filter(|f| f.kind == HEADERS) {
-        let mut buf = bytes::BytesMut::from(&f.payload[..]);
+        let mut buf = runtime::bytes::BytesMut::from(&f.payload[..]);
         let mut fields = std::collections::HashMap::new();
         decoder
             .decode(&mut std::io::Cursor::new(&mut buf), |header| {

@@ -2,6 +2,7 @@ use std::io;
 
 use std::time::Duration;
 
+use runtime::Bytes;
 use runtime_core::deterministic_testing::{
     FakeRing, ReadEvent, Scripted, WriteEvent, simulated_socket,
 };
@@ -617,7 +618,10 @@ fn an_owned_body_goes_out_whole() {
                 .body(())
                 .unwrap();
             let stream = client.send_request(&request, false).expect("a stream");
-            stream.write_owned(body, true).await.expect("written");
+            stream
+                .write_owned(Bytes::copy_from_slice(&body), true)
+                .await
+                .expect("written");
             let head = stream.response().await.expect("a response");
             head.status().as_u16()
         },
@@ -1541,7 +1545,7 @@ fn decode_block_with(
     payload: &[u8],
 ) -> std::collections::HashMap<String, String> {
     use crate::shared::hpack::Header;
-    use bytes::BytesMut;
+    use runtime::bytes::BytesMut;
 
     let mut buf = BytesMut::from(payload);
     let mut cursor = std::io::Cursor::new(&mut buf);

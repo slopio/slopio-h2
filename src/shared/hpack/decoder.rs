@@ -3,10 +3,10 @@ use crate::shared::hpack::Error;
 use super::{Header, header::BytesStr, huffman};
 use crate::shared::codec::ext::Protocol;
 
-use bytes::{Buf, Bytes, BytesMut};
 use http::header;
 use http::method::{self, Method};
 use http::status::{self, StatusCode};
+use runtime::bytes::{Bytes, BytesMut};
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -36,10 +36,12 @@ struct Scratch {
 }
 
 thread_local! {
-    static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch {
-        buffer: BytesMut::new(),
-        input: BytesMut::new(),
-    });
+    static SCRATCH: RefCell<Scratch> = const {
+        RefCell::new(Scratch {
+            buffer: BytesMut::new(),
+            input: BytesMut::new(),
+        })
+    };
 }
 
 /// Taken out of the thread-local rather than borrowed, so no `RefCell` guard
@@ -317,14 +319,14 @@ impl Decoder {
 
         let len = decode_int(buf, 7)?;
 
-        if len > buf.remaining() {
+        if len > rest(buf).len() {
             return Err(DecoderError::NeedMore(NeedMore::StringUnderflow));
         }
 
         let offset = (buf.position() - old_pos) as usize;
         if huff {
             let ret = {
-                let raw = &buf.chunk()[..len];
+                let raw = &rest(buf)[..len];
                 huffman::decode(raw, arena).map(|buf| StringMarker {
                     offset,
                     len,
@@ -332,10 +334,10 @@ impl Decoder {
                 })
             };
 
-            buf.advance(len);
+            skip(buf, len);
             ret
         } else {
-            buf.advance(len);
+            skip(buf, len);
             Ok(StringMarker {
                 offset,
                 len,
@@ -387,7 +389,7 @@ impl Representation {
     }
 }
 
-fn decode_int<B: Buf>(buf: &mut B, prefix_size: u8) -> Result<usize, DecoderError> {
+fn decode_int<T: AsRef<[u8]>>(buf: &mut Cursor<T>, prefix_size: u8) -> Result<usize, DecoderError> {
     // Bounds the value (~2^28 at 5 octets) so it can never overflow a u32.
     const MAX_BYTES: usize = 5;
     const VARINT_MASK: u8 = 0b0111_1111;
@@ -397,9 +399,9 @@ fn decode_int<B: Buf>(buf: &mut B, prefix_size: u8) -> Result<usize, DecoderErro
         return Err(DecoderError::InvalidIntegerPrefix);
     }
 
-    if !buf.has_remaining() {
+    let Some(first) = next_u8(buf) else {
         return Err(DecoderError::NeedMore(NeedMore::IntegerUnderflow));
-    }
+    };
 
     let mask = if prefix_size == 8 {
         0xFF
@@ -407,7 +409,7 @@ fn decode_int<B: Buf>(buf: &mut B, prefix_size: u8) -> Result<usize, DecoderErro
         (1u8 << prefix_size).wrapping_sub(1)
     };
 
-    let mut ret = (buf.get_u8() & mask) as usize;
+    let mut ret = (first & mask) as usize;
 
     if ret < mask as usize {
         return Ok(ret);
@@ -417,9 +419,7 @@ fn decode_int<B: Buf>(buf: &mut B, prefix_size: u8) -> Result<usize, DecoderErro
 
     let mut shift = 0;
 
-    while buf.has_remaining() {
-        let b = buf.get_u8();
-
+    while let Some(b) = next_u8(buf) {
         bytes += 1;
         ret += ((b & VARINT_MASK) as usize) << shift;
         shift += 7;
@@ -437,12 +437,24 @@ fn decode_int<B: Buf>(buf: &mut B, prefix_size: u8) -> Result<usize, DecoderErro
     Err(DecoderError::NeedMore(NeedMore::IntegerUnderflow))
 }
 
-fn peek_u8<B: Buf>(buf: &B) -> Option<u8> {
-    if buf.has_remaining() {
-        Some(buf.chunk()[0])
-    } else {
-        None
-    }
+fn peek_u8<T: AsRef<[u8]>>(buf: &Cursor<T>) -> Option<u8> {
+    rest(buf).first().copied()
+}
+
+fn next_u8<T: AsRef<[u8]>>(buf: &mut Cursor<T>) -> Option<u8> {
+    let b = peek_u8(buf)?;
+    skip(buf, 1);
+    Some(b)
+}
+
+/// What is left of the block past the cursor.
+fn rest<T: AsRef<[u8]>>(buf: &Cursor<T>) -> &[u8] {
+    let block = buf.get_ref().as_ref();
+    &block[(buf.position() as usize).min(block.len())..]
+}
+
+fn skip<T>(buf: &mut Cursor<T>, n: usize) {
+    buf.set_position(buf.position() + n as u64);
 }
 
 fn take(buf: &mut Cursor<&mut BytesMut>, n: usize) -> Bytes {
@@ -455,10 +467,10 @@ fn take(buf: &mut Cursor<&mut BytesMut>, n: usize) -> Bytes {
 
 impl StringMarker {
     fn consume(self, buf: &mut Cursor<&mut BytesMut>) -> Bytes {
-        buf.advance(self.offset);
+        skip(buf, self.offset);
         match self.string {
             Some(string) => {
-                buf.advance(self.len);
+                skip(buf, self.len);
                 string
             }
             None => take(buf, self.len),
@@ -894,7 +906,7 @@ mod test {
         let b = 0xff;
         let mut buf = Cursor::new(vec![b]);
         assert_eq!(peek_u8(&buf), Some(b));
-        assert_eq!(buf.get_u8(), b);
+        assert_eq!(next_u8(&mut buf), Some(b));
         assert_eq!(peek_u8(&buf), None);
     }
 
@@ -921,10 +933,10 @@ mod test {
         let mut de = Decoder::new(0);
 
         let mut buf = BytesMut::new();
-        buf.extend([0b01000000, 0x80 | 2]);
-        buf.extend(huff_encode(b"foo"));
-        buf.extend([0x80 | 3]);
-        buf.extend(huff_encode(b"bar"));
+        buf.extend_from_slice(&[0b01000000, 0x80 | 2]);
+        buf.extend_from_slice(&huff_encode(b"foo"));
+        buf.extend_from_slice(&[0x80 | 3]);
+        buf.extend_from_slice(&huff_encode(b"bar"));
 
         let mut res = vec![];
         de.decode(&mut Cursor::new(&mut buf), |h| {
@@ -947,8 +959,8 @@ mod test {
         }
     }
 
-    fn huff_encode(src: &[u8]) -> BytesMut {
-        let mut buf = BytesMut::new();
+    fn huff_encode(src: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
         huffman::encode(src, &mut buf);
         buf
     }
@@ -958,9 +970,9 @@ mod test {
         let mut de = Decoder::new(0);
         let value = huff_encode(b"bar");
         let mut buf = BytesMut::new();
-        buf.extend([0b01000000, 3]);
+        buf.extend_from_slice(&[0b01000000, 3]);
         buf.extend(b"foo");
-        buf.extend([0x80 | 3]);
+        buf.extend_from_slice(&[0x80 | 3]);
         buf.extend(&value[0..1]);
 
         let mut res = vec![];

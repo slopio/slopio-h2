@@ -5,8 +5,8 @@ use std::rc::Rc;
 use std::task::{Poll, Waker};
 use std::time::{Duration, SystemTime};
 
-use bytes::Bytes;
 use http::HeaderMap;
+use runtime::bytes::Bytes;
 use runtime::runtime::time::timeout;
 
 use crate::client::STREAM_RECV_WINDOW;
@@ -451,8 +451,8 @@ impl Stream {
     /// As [`Stream::write`], for a buffer handed over rather than lent: from
     /// [`ATTACH_MIN`](crate::client::ATTACH_MIN) bytes up it is sent as it
     /// is, never copied into the connection's output.
-    /// `Vec<u8>`, `Box<[u8]>`, `Bytes` and `&'static [u8]` all become one
-    /// without a copy.
+    /// `Bytes`, `BytesMut` and `&'static [u8]` all become one without a copy;
+    /// a `Vec<u8>` is copied in with `Bytes::copy_from_slice`.
     pub async fn write_owned(&self, data: impl Into<Bytes>, end_stream: bool) -> io::Result<()> {
         let data = data.into();
         self.within(self.write_owned_body(data, end_stream)).await

@@ -3,7 +3,7 @@
 
 use std::task::Waker;
 
-use bytes::Bytes;
+use runtime::bytes::Bytes;
 use runtime::net::IoBuf;
 
 use crate::shared::codec::types::HEADER_LEN;
@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn attached_bytes_count_against_the_high_water_mark_until_sent() {
         let mut output = Output::new();
-        output.attach(Bytes::from(vec![0; 1000]));
+        output.attach(Bytes::copy_from_slice(&vec![0; 1000]));
         assert_eq!(output.attach_room(), OUTPUT_HIGH_WATER - 1000);
 
         let chain = output.take();
@@ -259,7 +259,7 @@ mod tests {
     fn a_sent_chain_pools_its_segments_and_drops_its_slices() {
         let mut output = Output::new();
         output.write(|out| out.extend_from_slice(b"header"));
-        output.attach(Bytes::from(vec![0; 1000]));
+        output.attach(Bytes::copy_from_slice(&vec![0; 1000]));
         output.write(|out| out.extend_from_slice(b"next"));
 
         let chain = output.take();

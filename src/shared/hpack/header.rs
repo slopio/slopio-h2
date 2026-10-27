@@ -2,9 +2,9 @@ use crate::shared::codec::ext::Protocol;
 
 use super::DecoderError;
 
-use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
 use http::{Method, StatusCode};
+use runtime::bytes::Bytes;
 use std::fmt;
 
 #[derive(Debug, Clone, Eq, PartialEq)]

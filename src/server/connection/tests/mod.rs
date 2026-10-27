@@ -95,7 +95,7 @@ pub(super) struct Frame {
 /// name stay distinct.
 fn decode_block(payload: &[u8]) -> std::collections::HashMap<String, String> {
     use crate::shared::hpack::{Decoder, Header};
-    use bytes::BytesMut;
+    use runtime::bytes::BytesMut;
 
     let mut buf = BytesMut::from(payload);
     let mut cursor = std::io::Cursor::new(&mut buf);

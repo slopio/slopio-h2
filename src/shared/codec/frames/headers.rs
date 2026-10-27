@@ -6,7 +6,7 @@ use crate::shared::hpack::{self, BytesStr, Error};
 use http::header;
 use http::{HeaderMap, Method, StatusCode};
 
-use bytes::{Buf, BytesMut};
+use runtime::bytes::BytesMut;
 
 use std::io::Cursor;
 
@@ -328,12 +328,13 @@ mod tests {
     use super::*;
     use crate::shared::codec::frames::head::Kind;
 
-    /// A `HeaderMap` holds 24 576 names and panics past them. With a limit
-    /// this large the list is within it, so the map is what runs out.
+    /// A `HeaderMap` holds `MAX_SIZE` values. With a limit this large the
+    /// list is within it, so the map is what runs out.
     #[test]
     fn a_list_past_what_a_header_map_holds_is_over_size_not_a_panic() {
+        let fields = http::header::MAX_SIZE as u32 + 1;
         let mut block = Vec::new();
-        for i in 0..25_000u32 {
+        for i in 0..fields {
             // Literal without indexing, new name: four letters, no value.
             block.extend_from_slice(&[0x00, 4]);
             block.extend((0..4).map(|k| b'a' + (i / 26u32.pow(k) % 26) as u8));
@@ -342,8 +343,8 @@ mod tests {
         let head = Head::new(Kind::Headers, END_HEADERS, StreamId::from(1));
         let (mut headers, mut src) = Headers::load(head, BytesMut::from(&block[..])).unwrap();
 
-        let limit = 1 << 20;
-        assert!(25_000 * decoded_header_size(4, 0) < limit);
+        let limit = 1 << 21;
+        assert!(fields as usize * decoded_header_size(4, 0) < limit);
         headers
             .load_hpack(&mut src, limit, &mut hpack::Decoder::default())
             .expect("an over-size list is not malformed");

@@ -1,5 +1,3 @@
-use bytes::BufMut;
-
 use crate::shared::codec::{frames::stream_id::StreamId, types::HEADER_LEN};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -41,12 +39,13 @@ impl Head {
         self.flag
     }
 
-    pub fn encode<T: BufMut>(&self, payload_len: usize, dst: &mut T) {
-        debug_assert!(HEADER_LEN <= dst.remaining_mut());
-
-        dst.put_uint(payload_len as u64, 3);
-        dst.put_u8(self.kind as u8);
-        dst.put_u8(self.flag);
-        dst.put_u32(self.stream_id.into());
+    pub fn encode(&self, payload_len: usize, dst: &mut Vec<u8>) {
+        let start = dst.len();
+        let [_, len @ ..] = (payload_len as u32).to_be_bytes();
+        dst.extend_from_slice(&len);
+        dst.push(self.kind as u8);
+        dst.push(self.flag);
+        dst.extend_from_slice(&u32::from(self.stream_id).to_be_bytes());
+        debug_assert_eq!(dst.len() - start, HEADER_LEN);
     }
 }

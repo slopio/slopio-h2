@@ -3,7 +3,7 @@ mod table;
 use self::table::{DECODE_TABLE, ENCODE_TABLE};
 use crate::shared::hpack::DecoderError;
 
-use bytes::{BufMut, BytesMut};
+use runtime::bytes::BytesMut;
 
 struct Decoder {
     state: u8,
@@ -50,7 +50,7 @@ fn decode_into(src: &[u8], buf: &mut BytesMut) -> Result<(), DecoderError> {
     Ok(())
 }
 
-pub fn encode(src: &[u8], dst: &mut impl BufMut) {
+pub fn encode(src: &[u8], dst: &mut Vec<u8>) {
     let mut bits: u64 = 0;
     let mut bits_left = 40;
 
@@ -61,7 +61,7 @@ pub fn encode(src: &[u8], dst: &mut impl BufMut) {
         bits_left -= nbits;
 
         while bits_left <= 32 {
-            dst.put_u8((bits >> 32) as u8);
+            dst.push((bits >> 32) as u8);
 
             bits <<= 8;
             bits_left += 8;
@@ -71,7 +71,7 @@ pub fn encode(src: &[u8], dst: &mut impl BufMut) {
     if bits_left != 40 {
         // This writes the EOS token
         bits |= (1 << bits_left) - 1;
-        dst.put_u8((bits >> 32) as u8);
+        dst.push((bits >> 32) as u8);
     }
 }
 
@@ -119,27 +119,27 @@ mod test {
 
     #[test]
     fn decode_single_byte() {
-        assert_eq!("o", decode(&[0b00111111]).unwrap());
-        assert_eq!("0", decode(&[7]).unwrap());
-        assert_eq!("A", decode(&[(0x21 << 2) + 3]).unwrap());
+        assert_eq!(decode(&[0b00111111]).unwrap(), "o");
+        assert_eq!(decode(&[7]).unwrap(), "0");
+        assert_eq!(decode(&[(0x21 << 2) + 3]).unwrap(), "A");
     }
 
     #[test]
     fn single_char_multi_byte() {
-        assert_eq!("#", decode(&[255, 160 + 15]).unwrap());
-        assert_eq!("$", decode(&[255, 200 + 7]).unwrap());
-        assert_eq!("\x0a", decode(&[255, 255, 255, 240 + 3]).unwrap());
+        assert_eq!(decode(&[255, 160 + 15]).unwrap(), "#");
+        assert_eq!(decode(&[255, 200 + 7]).unwrap(), "$");
+        assert_eq!(decode(&[255, 255, 255, 240 + 3]).unwrap(), "\x0a");
     }
 
     #[test]
     fn multi_char() {
-        assert_eq!("!0", decode(&[254, 1]).unwrap());
-        assert_eq!(" !", decode(&[0b01010011, 0b11111000]).unwrap());
+        assert_eq!(decode(&[254, 1]).unwrap(), "!0");
+        assert_eq!(decode(&[0b01010011, 0b11111000]).unwrap(), " !");
     }
 
     #[test]
     fn encode_single_byte() {
-        let mut dst = BytesMut::with_capacity(1);
+        let mut dst = Vec::with_capacity(1);
 
         encode(b"o", &mut dst);
         assert_eq!(&dst[..], &[0b00111111]);
@@ -180,7 +180,7 @@ mod test {
         ];
 
         for s in DATA {
-            let mut dst = BytesMut::with_capacity(s.len());
+            let mut dst = Vec::with_capacity(s.len());
 
             encode(s.as_bytes(), &mut dst);
 
@@ -195,7 +195,7 @@ mod test {
         const DATA: &[&[u8]] = &[b"\0", b"\0\0\0", b"\0\x01\x02\x03\x04\x05", b"\xFF\xF8"];
 
         for s in DATA {
-            let mut dst = BytesMut::with_capacity(s.len());
+            let mut dst = Vec::with_capacity(s.len());
 
             encode(s, &mut dst);
 

@@ -11,7 +11,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "async_timers"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#d8b636f0082bac93b97b6d5d0038abc93f69946b"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#8f24304d27ec324cb9a02c4cf1fd25a099a7de05"
 
 [[package]]
 name = "aws-lc-rs"
@@ -123,7 +123,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -167,16 +167,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "http"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "918d3568bebf352712bc2ef3d46a8bcf1a75b373be6539de198e9105cbbf9ce0"
-dependencies = [
- "bytes",
- "itoa",
-]
-
-[[package]]
 name = "io-uring"
 version = "0.7.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -190,7 +180,7 @@ dependencies = [
 [[package]]
 name = "io_uring_rb"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#d8b636f0082bac93b97b6d5d0038abc93f69946b"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#8f24304d27ec324cb9a02c4cf1fd25a099a7de05"
 dependencies = [
  "io-uring",
  "rustix",
@@ -204,12 +194,6 @@ checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
 dependencies = [
  "either",
 ]
-
-[[package]]
-name = "itoa"
-version = "1.0.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jobserver"
@@ -326,7 +310,7 @@ dependencies = [
 [[package]]
 name = "popple-tls"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/slopio-tls.git#c2841211939d3cc1aea09f3645ebd5975a18525e"
+source = "git+ssh://git@github.com/saucisoupe/slopio-tls.git#2753ed21e1370b365dd175549ad2f3ca55fe6cbc"
 dependencies = [
  "libc",
  "runtime",
@@ -458,7 +442,7 @@ dependencies = [
 [[package]]
 name = "runtime"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#d8b636f0082bac93b97b6d5d0038abc93f69946b"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#8f24304d27ec324cb9a02c4cf1fd25a099a7de05"
 dependencies = [
  "libc",
  "mimalloc",
@@ -468,7 +452,7 @@ dependencies = [
 [[package]]
 name = "runtime-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#d8b636f0082bac93b97b6d5d0038abc93f69946b"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#8f24304d27ec324cb9a02c4cf1fd25a099a7de05"
 dependencies = [
  "async_timers",
  "bitfield-struct",
@@ -485,9 +469,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-http"
+version = "0.1.0"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#8f24304d27ec324cb9a02c4cf1fd25a099a7de05"
+dependencies = [
+ "runtime-core",
+]
+
+[[package]]
 name = "runtime-streams"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#d8b636f0082bac93b97b6d5d0038abc93f69946b"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#8f24304d27ec324cb9a02c4cf1fd25a099a7de05"
 
 [[package]]
 name = "rustc-hash"
@@ -497,15 +489,15 @@ checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "rustix"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags",
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -580,9 +572,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 name = "slopio-h2"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "fnv",
- "http",
  "libc",
  "matchit",
  "popple-dns",
@@ -591,6 +581,7 @@ dependencies = [
  "rcgen",
  "runtime",
  "runtime-core",
+ "runtime-http",
  "runtime-streams",
  "rustc-hash",
  "rustls",

@@ -1,4 +1,4 @@
-use bytes::BytesMut;
+use runtime::bytes::BytesMut;
 use zerocopy::{FromBytes, Immutable, KnownLayout, network_endian::U32};
 
 use crate::shared::{

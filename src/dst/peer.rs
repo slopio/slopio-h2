@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-use bytes::BytesMut;
+use runtime::bytes::BytesMut;
 use runtime_core::deterministic_testing::{ActorCx, ReadReply, WriteReply};
 
 use super::{

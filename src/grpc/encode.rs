@@ -1,3 +1,5 @@
+use runtime::bytes::{Bytes, BytesMut};
+
 use super::prefix::PREFIX_LEN;
 use crate::shared::codec::frames::stream_id::StreamId;
 use crate::shared::connection::{SendSide, SharedConnection};
@@ -5,11 +7,20 @@ use crate::shared::connection::{SendSide, SharedConnection};
 /// The flag is always 0. Compressing a response would mean agreeing an
 /// encoding with the peer first, through `grpc-accept-encoding`, and this end
 /// announces none.
-pub fn frame_message<M: prost::Message>(message: &M) -> Vec<u8> {
+pub fn frame_message<M: prost::Message>(message: &M) -> Bytes {
     let len = message.encoded_len();
-    let mut out = Vec::with_capacity(PREFIX_LEN + len);
-    put_message(&mut out, message, len);
-    out
+    let mut out = BytesMut::with_capacity(PREFIX_LEN + len);
+    out.put_u8(0);
+    out.put_u32(len as u32);
+    let mut spare = &mut out.spare_capacity_mut()[..len];
+    message.encode(&mut spare).expect("room for `encoded_len`");
+    assert!(
+        spare.is_empty(),
+        "a message wrote less than its `encoded_len`"
+    );
+    // SAFETY: the message wrote all `len` bytes after the prefix.
+    unsafe { out.set_len(PREFIX_LEN + len) };
+    out.freeze()
 }
 
 /// A message on its way, client's or server's: encoded straight into the
@@ -32,7 +43,7 @@ pub(crate) async fn write_message<S: SendSide, M: prost::Message>(
     );
     if !in_place {
         connection
-            .write_data_owned(stream_id, stream, frame_message(message).into(), end_stream)
+            .write_data_owned(stream_id, stream, frame_message(message), end_stream)
             .await;
     }
 }
@@ -63,7 +74,6 @@ mod tests {
 
         // Field 1, varint, 1.
         assert_eq!(framed, [0, 0, 0, 0, 2, 0x08, 0x01]);
-        assert_eq!(framed.capacity(), framed.len(), "reserved exactly");
     }
 
     #[test]

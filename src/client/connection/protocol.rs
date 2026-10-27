@@ -113,7 +113,7 @@ impl Protocol {
         }
 
         let end_stream = headers.is_end_stream();
-        let Some(response) = into_response(headers) else {
+        let Some(response) = into_response(*headers) else {
             return self.fail_stream(id, StreamViolation::MalformedResponse);
         };
         if let Err(violation) = state.recv_response(response, end_stream) {
@@ -337,7 +337,7 @@ impl FrameHandler for Protocol {
 }
 
 /// §8.1.2.4: a response head is `:status` and nothing else pseudo.
-fn into_response(headers: Box<Headers>) -> Option<http::Response<()>> {
+fn into_response(headers: Headers) -> Option<http::Response<()>> {
     let pseudo = headers.pseudo();
     let status = pseudo.status?;
     if pseudo.method.is_some()
@@ -352,7 +352,7 @@ fn into_response(headers: Box<Headers>) -> Option<http::Response<()>> {
     let mut response = http::Response::new(());
     *response.status_mut() = status;
     *response.version_mut() = http::Version::HTTP_2;
-    *response.headers_mut() = (*headers).into_fields();
+    *response.headers_mut() = headers.into_fields();
     Some(response)
 }
 

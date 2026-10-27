@@ -3,8 +3,8 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::task::{Poll, Waker};
 
-use bytes::Bytes;
 use http::{HeaderMap, HeaderName};
+use runtime::bytes::Bytes;
 
 use crate::shared::codec::frames::{
     encode::{encode_data_header, encode_header_block, encode_window_update},
@@ -637,7 +637,7 @@ mod tests {
     #[test]
     fn an_owned_buffer_is_sent_from_its_own_memory() {
         let connection = connection(1 << 20);
-        let payload = Bytes::from(vec![7; 40_000]);
+        let payload = Bytes::copy_from_slice(&vec![7; 40_000]);
         assert!(poll(&connection, &payload).is_ready());
 
         let chain = connection.take_output();
@@ -665,7 +665,7 @@ mod tests {
     #[test]
     fn a_small_owned_buffer_is_copied_in() {
         let connection = connection(1 << 20);
-        let payload = Bytes::from(vec![7; ATTACH_MIN - 1]);
+        let payload = Bytes::copy_from_slice(&vec![7; ATTACH_MIN - 1]);
         assert!(poll(&connection, &payload).is_ready());
 
         let chain = connection.take_output();
@@ -684,7 +684,7 @@ mod tests {
     #[test]
     fn a_large_owned_buffer_goes_no_further_than_the_high_water_mark() {
         let connection = connection(1 << 24);
-        let payload = Bytes::from(vec![7; OUTPUT_HIGH_WATER * 2]);
+        let payload = Bytes::copy_from_slice(&vec![7; OUTPUT_HIGH_WATER * 2]);
         let mut writing =
             pin!(connection.write_data_owned(StreamId::from(1), &Unmetered, payload, true));
         let mut cx = Context::from_waker(Waker::noop());
@@ -718,7 +718,7 @@ mod tests {
         let mut writing = pin!(connection.write_data_owned(
             StreamId::from(1),
             &stream,
-            Bytes::from(vec![7; 40_000]),
+            Bytes::copy_from_slice(&vec![7; 40_000]),
             true
         ));
         let mut cx = Context::from_waker(Waker::noop());
