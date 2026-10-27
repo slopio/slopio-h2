@@ -157,3 +157,25 @@ fn body_refuses_an_undeclared_body_past_the_limit() {
     let written = run(None, &[&[0; 6], &[0; 6], &[0; 6]], whole(10));
     assert_eq!(status(&written), "413");
 }
+
+/// A static body handed over goes out whole, in frames of at most the
+/// default size, the last ending the stream.
+#[test]
+fn a_static_body_handed_over_is_sent_whole() {
+    static ASSET: [u8; 40_000] = [7; 40_000];
+    let written = run(None, &[], |stream: Stream| async move {
+        stream.write_headers(StatusCode::OK, &HeaderMap::new());
+        stream
+            .write_owned_final(runtime::Bytes::from_static(&ASSET))
+            .await;
+    });
+    assert_eq!(status(&written), "200");
+    assert_eq!(body(&written), ASSET);
+
+    let data: Vec<_> = written.iter().filter(|f| f.kind == DATA).collect();
+    assert!(data.iter().all(|f| f.payload.len() <= 16_384));
+    assert_eq!(
+        data.last().unwrap().flags & FLAG_END_STREAM,
+        FLAG_END_STREAM
+    );
+}

@@ -3,6 +3,7 @@ use std::task::{Poll, Waker};
 use std::time::{Duration, SystemTime};
 
 use http::StatusCode;
+use runtime::bytes::Bytes;
 
 #[cfg(feature = "grpc")]
 use crate::grpc::{GrpcError, GrpcFormat, GrpcFrame, GrpcInput};
@@ -701,6 +702,17 @@ impl Stream {
             .await;
     }
 
+    /// As [`write_data`](Self::write_data), for a buffer handed over rather
+    /// than lent: from [`ATTACH_MIN`](crate::server::ATTACH_MIN) bytes up it
+    /// is sent as it is, never copied into the connection's output. A static
+    /// body is `Bytes::from_static`.
+    pub async fn write_owned(&self, data: impl Into<Bytes>) {
+        self.token
+            .shared()
+            .write_data_owned(self.id(), self.state(), data.into(), false)
+            .await;
+    }
+
     /// No `_final`: a gRPC response always ends with its trailers, never with
     /// END_STREAM on DATA. See [`crate::grpc::write_message`].
     #[cfg(feature = "grpc")]
@@ -716,6 +728,15 @@ impl Stream {
             .await;
         // After the await: a write dropped half way never wrote the frame
         // that carries the flag.
+        self.state().end_output();
+    }
+
+    pub async fn write_owned_final(self, data: impl Into<Bytes>) {
+        self.token
+            .shared()
+            .write_data_owned(self.id(), self.state(), data.into(), true)
+            .await;
+        // As `write_data_final`.
         self.state().end_output();
     }
 

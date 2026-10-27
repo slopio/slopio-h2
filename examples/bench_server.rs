@@ -124,7 +124,11 @@ async fn bench_route(stream: Stream) {
 
     stream.write_headers(StatusCode::OK, &HeaderMap::new());
     match requested_size(stream.path()) {
-        Some(n) => stream.write_data_final(&FILLER[..n]).await,
+        Some(n) => {
+            stream
+                .write_owned_final(runtime::Bytes::from_static(&FILLER[..n]))
+                .await
+        }
         None => {
             let body = format!("read {received} bytes\n");
             stream.write_data_final(body.as_bytes()).await;

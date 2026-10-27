@@ -30,6 +30,8 @@ pub use limits::Limits;
 pub use router::{Params, Router};
 pub use stream::{BodyTooLarge, Stream};
 
+pub use crate::shared::connection::output::ATTACH_MIN;
+
 pub struct Server {
     pub settings: ServerSettings,
 }
