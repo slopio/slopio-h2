@@ -58,11 +58,11 @@ pub trait Transport: Stream<Item = Result<Self::Buf, RecvError>> + Unpin {
         may_hold: bool,
     ) -> impl Future<Output = (io::Result<()>, Vec<B>)>;
 
-    /// Best-effort: runs when the connection is already over, so callers
-    /// ignore failures.
-    fn shutdown(&mut self) -> impl Future<Output = io::Result<()>> {
-        std::future::ready(Ok(()))
-    }
+    /// Ends our side of the stream: FIN, after close_notify over TLS.
+    /// Receiving goes on, for the caller to read out what the peer still
+    /// sends before the socket closes. Best-effort: runs when the connection
+    /// is already over, so callers ignore failures.
+    fn shutdown(&mut self) -> impl Future<Output = io::Result<()>>;
 }
 
 /// Provisional — to be calibrated against h2load.
@@ -121,6 +121,10 @@ impl<R: BufRingSpec> Transport for PlainMessages<R, false> {
     ) -> impl Future<Output = (io::Result<()>, Vec<B>)> {
         send_vectored_all(self.recv.socket(), bufs)
     }
+
+    fn shutdown(&mut self) -> impl Future<Output = io::Result<()>> {
+        std::future::ready(self.recv.socket().shutdown_write())
+    }
 }
 
 impl<R: BufRingSpec> Transport for PlainMessages<R, true> {
@@ -132,6 +136,10 @@ impl<R: BufRingSpec> Transport for PlainMessages<R, true> {
             true => send_vectored_all_zc(self.recv.socket(), bufs).await,
             false => send_vectored_all(self.recv.socket(), bufs).await,
         }
+    }
+
+    fn shutdown(&mut self) -> impl Future<Output = io::Result<()>> {
+        std::future::ready(self.recv.socket().shutdown_write())
     }
 }
 

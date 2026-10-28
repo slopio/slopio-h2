@@ -57,6 +57,13 @@ const _: () = assert!(
 /// largest transfers.
 pub const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a connection that ends first reads out what its peer still sends,
+/// after its FIN. Closed with input unread, a Linux socket resets the
+/// connection instead of ending it, and the peer may meet the reset before
+/// our last frames. A peer that has read our FIN ends within a round trip;
+/// one that keeps sending this long gets the reset.
+pub const LINGER: Duration = Duration::from_secs(1);
+
 /// Every deadline below is a multiple of this, and only as precise as it.
 pub use crate::shared::connection::DEADLINE_TICK;
 
@@ -139,6 +146,8 @@ pub struct Connection<T: Transport, H: Handler> {
     /// `None` outside a `Server`: nothing can stop the connection but itself.
     shutdown: Option<Registration>,
     shutdown_seen: bool,
+    /// The peer's end has been read: closing then leaves nothing unread.
+    peer_ended: bool,
 }
 
 impl<T: Transport, H: Handler> Connection<T, H> {
@@ -154,6 +163,7 @@ impl<T: Transport, H: Handler> Connection<T, H> {
             idle_timeout: limits.idle_timeout,
             shutdown: None,
             shutdown_seen: false,
+            peer_ended: false,
         }
     }
 
@@ -212,6 +222,7 @@ impl<T: Transport, H: Handler> Connection<T, H> {
                     continue;
                 }
                 Ok(Event::Closed) => {
+                    self.peer_ended = true;
                     self.protocol.peer_closed();
                     if self.protocol.is_done() {
                         break;
@@ -258,6 +269,25 @@ impl<T: Transport, H: Handler> Connection<T, H> {
         // An invalid preface queued nothing, so it closes in silence (§3.4).
         let _ = self.flush().await;
         let _ = self.transport.shutdown().await;
+        // Ending first, we read out what the peer still sends up to its end,
+        // so that the socket closes with nothing unread and is not reset.
+        if !self.peer_ended {
+            let _ = timeout(LINGER, self.read_to_end()).await;
+        }
+    }
+
+    /// Drops what arrives, until the peer's end or a dead socket.
+    async fn read_to_end(&mut self) {
+        let mut dry = DryRing::default();
+        loop {
+            let next = std::future::poll_fn(|cx| Pin::new(&mut self.transport).poll_next(cx));
+            match next.await {
+                Some(Ok(_)) => {}
+                // An empty ring is other connections holding buffers.
+                Some(Err(RecvError::Later)) => dry.wait().await,
+                Some(Err(RecvError::Fatal(_))) | None => return,
+            }
+        }
     }
 
     /// One flush is not enough: a task may have parked on a full buffer, and
