@@ -3,10 +3,11 @@
 
 use std::io;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use http::uri::Scheme;
 use runtime::io_driver::operations::sockets::multi_recv::{CompletionError, Continuation};
+use runtime::io_driver::operations::sockets::recv::{ClassicRecv, socket_recv};
 use runtime::io_driver::operations::sockets::send_vectored::send_vectored_all;
 use runtime::io_driver::operations::sockets::send_vectored_zc::send_vectored_all_zc;
 use runtime::net::{BorrowedBuffer, BufRingSpec, IoBuf, MultiRecv, SocketWrapper};
@@ -77,7 +78,37 @@ fn batch_bytes<B: IoBuf>(batch: &[B]) -> usize {
 /// instant.
 pub struct PlainMessages<R: BufRingSpec, const ZC: bool = false> {
     recv: MultiRecv<R>,
+    /// A recv into a buffer of our own, while the ring has none to lend.
+    own: Option<ClassicRecv<Vec<u8>>>,
+    /// The last one filled its buffer: more is likely waiting in the socket,
+    /// to be read the same way rather than through a multishot re-armed into
+    /// a ring that may still be empty.
+    own_again: bool,
 }
+
+/// What a plain connection reads: a buffer of the ring every connection on
+/// the worker shares or, while that ring is empty, one of its own.
+pub enum Chunk<R: BufRingSpec> {
+    Ring(BorrowedBuffer<R>),
+    Own(Vec<u8>),
+}
+
+impl<R: BufRingSpec> AsRef<[u8]> for Chunk<R> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Chunk::Ring(buf) => buf.as_ref(),
+            Chunk::Own(buf) => buf,
+        }
+    }
+}
+
+/// How much a recv of a connection's own takes: a ring buffer's worth, since
+/// a connection that keeps them coming back full reads this way for as long
+/// as its peer sends. One at a time per connection, freed once decoded, so
+/// it adds at most this per connection to what the ring bounds; the
+/// allocator hands the same block back, warm, where the ring rotates
+/// through cold ones.
+const OWN_RECV: usize = 64 * 1024;
 
 /// Chunks a connection may have received and not yet decoded before its recv
 /// pauses. Each holds a buffer of the ring every connection on the worker
@@ -91,27 +122,70 @@ impl<R: BufRingSpec, const ZC: bool> PlainMessages<R, ZC> {
     pub fn new(socket: SocketWrapper) -> Self {
         Self {
             recv: MultiRecv::with_queue_limit(socket, RECV_QUEUE_LIMIT),
+            own: None,
+            own_again: false,
         }
+    }
+
+    fn read_own(&mut self) {
+        let buf = Vec::with_capacity(OWN_RECV);
+        self.own = Some(socket_recv(self.recv.socket(), buf));
     }
 }
 
 impl<R: BufRingSpec, const ZC: bool> Unpin for PlainMessages<R, ZC> {}
 
 impl<R: BufRingSpec, const ZC: bool> Stream for PlainMessages<R, ZC> {
-    type Item = Result<BorrowedBuffer<R>, RecvError>;
+    type Item = Result<Chunk<R>, RecvError>;
 
+    /// An empty ring does not stop the connection: waiting for a buffer to
+    /// come back, it lost each one to the recvs still armed on other
+    /// connections, for seconds at a time, until the body sweep reset its
+    /// streams. It reads into a buffer of its own instead, and goes on so
+    /// while those come back full, which also keeps a peer holding the
+    /// ring's buffers from slowing anyone else. One that comes back short
+    /// drained the socket: the multishot is re-armed for what comes next.
+    /// It is over until then, so nothing else reads the socket meanwhile,
+    /// and the bytes keep their order.
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // What `MultiRecv` hands up is not all fatal — hence `RecvError`.
-        Pin::new(&mut self.get_mut().recv)
-            .poll_next(cx)
-            .map(|item| item.map(|r| r.map_err(RecvError::from)))
+        let this = self.get_mut();
+        loop {
+            if let Some(recv) = this.own.as_mut() {
+                let (result, buf) = ready!(Pin::new(recv).poll(cx));
+                this.own = None;
+                return Poll::Ready(match result {
+                    Ok(0) => None,
+                    Ok(n) => {
+                        this.own_again = n == OWN_RECV;
+                        Some(Ok(Chunk::Own(buf)))
+                    }
+                    Err(e) => Some(Err(RecvError::Fatal(e))),
+                });
+            }
+            if this.own_again {
+                this.read_own();
+                continue;
+            }
+            match Pin::new(&mut this.recv).poll_next(cx) {
+                Poll::Ready(Some(Err(e)))
+                    if matches!(e.continuation(), Continuation::ContinueLater) =>
+                {
+                    this.read_own();
+                }
+                // What `MultiRecv` hands up is not all fatal — hence `RecvError`.
+                polled => {
+                    return polled
+                        .map(|item| item.map(|r| r.map(Chunk::Ring).map_err(RecvError::from)));
+                }
+            }
+        }
     }
 }
 
 /// Two impls rather than a branch on `ZC`: a branch would size the copy
 /// send's future for the zero-copy one.
 impl<R: BufRingSpec> Transport for PlainMessages<R, false> {
-    type Buf = BorrowedBuffer<R>;
+    type Buf = Chunk<R>;
     type Security = PlainText;
 
     fn send<B: IoBuf>(
@@ -128,7 +202,7 @@ impl<R: BufRingSpec> Transport for PlainMessages<R, false> {
 }
 
 impl<R: BufRingSpec> Transport for PlainMessages<R, true> {
-    type Buf = BorrowedBuffer<R>;
+    type Buf = Chunk<R>;
     type Security = PlainText;
 
     async fn send<B: IoBuf>(&mut self, bufs: Vec<B>, may_hold: bool) -> (io::Result<()>, Vec<B>) {
