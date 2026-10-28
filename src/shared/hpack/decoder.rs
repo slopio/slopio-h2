@@ -8,6 +8,7 @@ use http::method::{self, Method};
 use http::status::{self, StatusCode};
 use runtime::bytes::{Bytes, BytesMut};
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::Cursor;
@@ -65,6 +66,9 @@ impl Drop for Lent {
 /// live `Bytes` point at. A larger block takes a chunk of its own size, capped
 /// by the frame decoder at `max_header_block_size`.
 const STAGE_CAPACITY: usize = 4096;
+
+/// §A: entries 1 to 61; the dynamic table starts at 62.
+const STATIC_LEN: usize = 61;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum DecoderError {
@@ -233,18 +237,29 @@ impl Decoder {
         // A refused field does not stop the decode: what follows it still
         // has to reach the table.
         let mut invalid = false;
-        let mut emit = |entry: Entry| match entry {
-            Entry::Field(header) => f(header),
-            Entry::Invalid { .. } => invalid = true,
-        };
+        macro_rules! emit {
+            ($entry:expr) => {
+                match $entry {
+                    Entry::Field(header) => f(header),
+                    Entry::Invalid { .. } => invalid = true,
+                }
+            };
+        }
 
         while let Some(ty) = peek_u8(src) {
             // Always at the start of a representation here.
             match Representation::load(ty)? {
                 Indexed => {
                     can_resize = false;
-                    let entry = self.decode_indexed(src)?;
-                    emit(entry);
+                    // Made straight into the callback's argument rather than
+                    // moved there through an `Entry`.
+                    match decode_int(src, 7)? {
+                        index @ 1..=STATIC_LEN => f(get_static(index)),
+                        index => match self.table.dynamic(index)? {
+                            Entry::Field(header) => f(header.clone()),
+                            Entry::Invalid { .. } => invalid = true,
+                        },
+                    }
                 }
                 LiteralWithIndexing => {
                     can_resize = false;
@@ -252,12 +267,12 @@ impl Decoder {
 
                     self.table.insert(entry.detached());
 
-                    emit(entry);
+                    emit!(entry);
                 }
                 LiteralWithoutIndexing => {
                     can_resize = false;
                     let entry = self.decode_literal(src, false, &mut huff.0)?;
-                    emit(entry);
+                    emit!(entry);
                 }
                 LiteralNeverIndexed => {
                     can_resize = false;
@@ -265,7 +280,7 @@ impl Decoder {
 
                     // TODO: Track that this should never be indexed
 
-                    emit(entry);
+                    emit!(entry);
                 }
                 SizeUpdate => {
                     if !can_resize {
@@ -293,11 +308,6 @@ impl Decoder {
         Ok(())
     }
 
-    fn decode_indexed(&self, buf: &mut Cursor<&mut BytesMut>) -> Result<Entry, DecoderError> {
-        let index = decode_int(buf, 7)?;
-        self.table.get(index)
-    }
-
     fn decode_literal(
         &mut self,
         buf: &mut Cursor<&mut BytesMut>,
@@ -317,6 +327,7 @@ impl Decoder {
             let value = value_marker.consume(buf);
             Ok(Entry::new(name, value))
         } else {
+            // Borrowed, not cloned: only its name is wanted.
             let e = self.table.get(table_idx)?;
             let value = self.decode_string(buf, huff)?;
 
@@ -325,7 +336,7 @@ impl Decoder {
     }
 
     fn try_decode_string(
-        &mut self,
+        &self,
         buf: &mut Cursor<&mut BytesMut>,
         arena: &mut BytesMut,
     ) -> Result<StringMarker, DecoderError> {
@@ -367,7 +378,7 @@ impl Decoder {
     }
 
     fn decode_string(
-        &mut self,
+        &self,
         buf: &mut Cursor<&mut BytesMut>,
         huff: &mut BytesMut,
     ) -> Result<Bytes, DecoderError> {
@@ -513,19 +524,20 @@ impl Table {
     }
 
     /// §2.3.3: 1-indexed, static entries then dynamic, one address space.
-    fn get(&self, index: usize) -> Result<Entry, DecoderError> {
-        if index == 0 {
-            return Err(DecoderError::InvalidTableIndex);
+    fn get(&self, index: usize) -> Result<Cow<'_, Entry>, DecoderError> {
+        match index {
+            0 => Err(DecoderError::InvalidTableIndex),
+            1..=STATIC_LEN => Ok(Cow::Owned(Entry::Field(get_static(index)))),
+            _ => self.dynamic(index).map(Cow::Borrowed),
         }
+    }
 
-        if index <= 61 {
-            return Ok(Entry::Field(get_static(index)));
-        }
-
-        match self.entries.get(index - 62) {
-            Some(e) => Ok(e.clone()),
-            None => Err(DecoderError::InvalidTableIndex),
-        }
+    /// A dynamic entry, by its index in the one address space: 62 and up.
+    fn dynamic(&self, index: usize) -> Result<&Entry, DecoderError> {
+        index
+            .checked_sub(STATIC_LEN + 1)
+            .and_then(|i| self.entries.get(i))
+            .ok_or(DecoderError::InvalidTableIndex)
     }
 
     fn insert(&mut self, entry: Entry) {
@@ -927,7 +939,7 @@ mod test {
 
     #[test]
     fn test_decode_string_empty() {
-        let mut de = Decoder::new(0);
+        let de = Decoder::new(0);
         let mut buf = BytesMut::new();
         let mut huff = BytesMut::new();
         let err = de
@@ -1002,7 +1014,7 @@ mod test {
         assert!(block.contains(&value.as_bytes().as_ptr()), "a view");
         assert!(block.contains(&name.as_str().as_ptr()), "a view");
 
-        let Ok(Entry::Field(Header::Field { value: kept, .. })) = de.table.get(62) else {
+        let Ok(Entry::Field(Header::Field { value: kept, .. })) = de.table.dynamic(62) else {
             panic!("indexed");
         };
         assert_eq!(kept, value);
@@ -1142,7 +1154,7 @@ mod test {
             let [Header::Authority(given)] = &fields[..] else {
                 panic!("{fields:?}");
             };
-            let Ok(Entry::Field(Header::Authority(kept))) = de.table.get(62) else {
+            let Ok(Entry::Field(Header::Authority(kept))) = de.table.dynamic(62) else {
                 panic!("the entry is in the table");
             };
             assert_eq!(kept.as_str(), "example.com");
