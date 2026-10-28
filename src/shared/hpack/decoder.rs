@@ -925,6 +925,9 @@ mod arena {
 }
 
 #[cfg(test)]
+mod rfc7541;
+
+#[cfg(test)]
 mod test {
     use super::*;
 
