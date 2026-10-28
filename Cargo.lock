@@ -301,7 +301,7 @@ dependencies = [
 [[package]]
 name = "popple-tls"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/slopio-tls.git#2753ed21e1370b365dd175549ad2f3ca55fe6cbc"
+source = "git+ssh://git@github.com/saucisoupe/slopio-tls.git#dd05cafa1b61214a87df378e72b6147f30a651d8"
 dependencies = [
  "libc",
  "runtime",
