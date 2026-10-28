@@ -4,6 +4,8 @@ mod decoder;
 mod encoder;
 pub(crate) mod header;
 pub(crate) mod huffman;
+#[cfg(test)]
+mod round_trip;
 mod table;
 
 use crate::shared::hpack;

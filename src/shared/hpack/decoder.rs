@@ -296,6 +296,22 @@ impl Decoder {
         Ok(invalid)
     }
 
+    /// The table's bookkeeping: its size is what its entries add up to, and
+    /// neither passes the limit last set, nor that limit what we advertise.
+    #[cfg(test)]
+    pub fn assert_consistent(&self) {
+        let sum: usize = self.table.entries.iter().map(Entry::len).sum();
+        assert_eq!(self.table.size, sum, "table size against its entries");
+        assert!(
+            self.table.size <= self.table.max_size,
+            "table over its limit"
+        );
+        assert!(
+            self.table.max_size <= self.last_max_update,
+            "limit over what we advertise"
+        );
+    }
+
     fn process_size_update(&mut self, buf: &mut Cursor<&mut BytesMut>) -> Result<(), DecoderError> {
         let new_size = decode_int(buf, 5)?;
 
