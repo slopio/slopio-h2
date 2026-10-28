@@ -47,6 +47,10 @@ name = "router"
 path = "examples/router.rs"
 required-features = ["grpc"]
 
+# `cargo fuzz` builds with `--cfg fuzzing`, for `src/fuzz.rs`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
 [dependencies]
 fnv = "1"
 # The `http` crate's API on the runtime's `Bytes`.

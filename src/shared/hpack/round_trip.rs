@@ -76,6 +76,35 @@ fn run(seed: u64) {
     }
 }
 
+/// Seeds for `fuzz/`'s `hpack_decode`: one connection's blocks per seed, as
+/// that target reads them. `cargo test --lib write_hpack_fuzz_seeds --
+/// --ignored` writes them under `fuzz/corpus/`.
+#[test]
+#[ignore = "writes fuzz seeds"]
+fn write_hpack_fuzz_seeds() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/hpack_decode");
+    std::fs::create_dir_all(&dir).unwrap();
+    for seed in 0..64 {
+        let mut rng = Rng(seed);
+        let mut encoder = Encoder::default();
+        // 2: the target's 4096-byte table.
+        let mut out = vec![2];
+        for block in blocks(&mut rng).into_iter().take(12) {
+            for &size in &block.resizes {
+                encoder.update_max_size(size);
+            }
+            let mut wire = Vec::new();
+            encoder.encode(block.headers, &mut wire);
+            if wire.len() > u16::MAX as usize {
+                break;
+            }
+            out.extend_from_slice(&(wire.len() as u16).to_be_bytes());
+            out.extend_from_slice(&wire);
+        }
+        std::fs::write(dir.join(format!("round-trip-{seed}")), out).unwrap();
+    }
+}
+
 /// The list as it decodes: a field without a name has the one before it.
 fn named(headers: &[Header<Option<HeaderName>>]) -> Vec<Header> {
     let mut previous = None;

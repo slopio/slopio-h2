@@ -298,7 +298,7 @@ impl Decoder {
 
     /// The table's bookkeeping: its size is what its entries add up to, and
     /// neither passes the limit last set, nor that limit what we advertise.
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub fn assert_consistent(&self) {
         let sum: usize = self.table.entries.iter().map(Entry::len).sum();
         assert_eq!(self.table.size, sum, "table size against its entries");

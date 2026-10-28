@@ -162,3 +162,114 @@ fn a_sensitive_field_is_never_indexed() {
     );
     assert_eq!(wire[0] & 0xf0, 0x10, "never indexed: {wire:02x?}");
 }
+
+/// Seeds for `fuzz/`: each RFC connection as `hpack_decode` reads it, and
+/// for `frames`, the request blocks (C.3, C.4) in HEADERS frames among the
+/// other frame types, the way a client sends them. `cargo test --lib
+/// write_rfc_fuzz_seeds -- --ignored` writes them under `fuzz/corpus/`.
+#[test]
+#[ignore = "writes fuzz seeds"]
+fn write_rfc_fuzz_seeds() {
+    let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus");
+    let hpack = corpus.join("hpack_decode");
+    let frames = corpus.join("frames");
+    std::fs::create_dir_all(&hpack).unwrap();
+    std::fs::create_dir_all(&frames).unwrap();
+
+    for (size, examples) in connections() {
+        // The target's size byte: 1 is 256 bytes, 2 is 4096.
+        let mut out = vec![if size == 256 { 1 } else { 2 }];
+        for example in &examples {
+            out.extend_from_slice(&(example.wire.len() as u16).to_be_bytes());
+            out.extend_from_slice(example.wire);
+        }
+        std::fs::write(hpack.join(format!("rfc7541-{}", examples[0].section)), out).unwrap();
+    }
+
+    fn frame(out: &mut Vec<u8>, kind: u8, flags: u8, stream: u32, payload: &[u8]) {
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
+        out.extend_from_slice(&[kind, flags]);
+        out.extend_from_slice(&stream.to_be_bytes());
+        out.extend_from_slice(payload);
+    }
+    const DATA: u8 = 0;
+    const HEADERS: u8 = 1;
+    const PRIORITY: u8 = 2;
+    const RST_STREAM: u8 = 3;
+    const SETTINGS: u8 = 4;
+    const PING: u8 = 6;
+    const GOAWAY: u8 = 7;
+    const WINDOW_UPDATE: u8 = 8;
+    const CONTINUATION: u8 = 9;
+    const END_STREAM: u8 = 0x1;
+    const END_HEADERS: u8 = 0x4;
+    const PADDED: u8 = 0x8;
+    const WITH_PRIORITY: u8 = 0x20;
+
+    for group in ["C.3", "C.4"] {
+        let blocks: Vec<_> = EXAMPLES
+            .iter()
+            .filter(|e| e.section.starts_with(group))
+            .collect();
+        let mut wire = Vec::new();
+        // SETTINGS_HEADER_TABLE_SIZE 4096, SETTINGS_INITIAL_WINDOW_SIZE 65535.
+        frame(
+            &mut wire,
+            SETTINGS,
+            0,
+            0,
+            &[0, 1, 0, 0, 0x10, 0, 0, 4, 0, 0, 0xff, 0xff],
+        );
+        frame(&mut wire, SETTINGS, 0x1, 0, &[]);
+        frame(&mut wire, WINDOW_UPDATE, 0, 0, &1_000_000u32.to_be_bytes());
+        // A whole GET.
+        frame(
+            &mut wire,
+            HEADERS,
+            END_HEADERS | END_STREAM,
+            1,
+            blocks[0].wire,
+        );
+        // A POST cut into CONTINUATION, with a padded, prioritised HEADERS and a body.
+        let (head, tail) = blocks[1].wire.split_at(blocks[1].wire.len() / 2);
+        let mut padded = vec![3];
+        padded.extend_from_slice(&[0, 0, 0, 1, 15]);
+        padded.extend_from_slice(head);
+        padded.extend_from_slice(&[0; 3]);
+        frame(&mut wire, HEADERS, PADDED | WITH_PRIORITY, 3, &padded);
+        frame(&mut wire, CONTINUATION, END_HEADERS, 3, tail);
+        frame(&mut wire, DATA, 0, 3, b"hello");
+        frame(&mut wire, DATA, PADDED | END_STREAM, 3, &[2, b'!', 0, 0]);
+        frame(&mut wire, HEADERS, END_HEADERS, 5, blocks[2].wire);
+        frame(&mut wire, PRIORITY, 0, 5, &[0, 0, 0, 3, 7]);
+        frame(&mut wire, RST_STREAM, 0, 5, &8u32.to_be_bytes());
+        frame(&mut wire, PING, 0, 0, b"12345678");
+        frame(&mut wire, 0xfa, 0, 0, b"an unknown type");
+        frame(
+            &mut wire,
+            GOAWAY,
+            0,
+            0,
+            &[0, 0, 0, 5, 0, 0, 0, 0, b'b', b'y', b'e'],
+        );
+
+        // The server side, the preface sent by the target; whole, then cut
+        // into reads of 1, 7, 9, 10 and 64 bytes.
+        let reads = |size: usize| {
+            let mut out = vec![0];
+            for chunk in wire.chunks(size) {
+                out.push(chunk.len() as u8);
+                out.extend_from_slice(chunk);
+            }
+            out
+        };
+        std::fs::write(frames.join(format!("rfc7541-{group}-whole")), reads(255)).unwrap();
+        for size in [1, 7, 9, 10, 64] {
+            std::fs::write(
+                frames.join(format!("rfc7541-{group}-reads-{size}")),
+                reads(size),
+            )
+            .unwrap();
+        }
+    }
+}

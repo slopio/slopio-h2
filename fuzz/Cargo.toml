@@ -1,0 +1,36 @@
+# Coverage-guided fuzzing of the decoders, with cargo-fuzz (nightly):
+#
+#     cargo test --lib fuzz_seeds -- --ignored    # writes the seeds, from the repo root
+#     cargo +nightly fuzz run hpack_decode         # or `frames`, from here or the root
+#
+# The targets are in `src/fuzz.rs`, built only under `--cfg fuzzing`.
+[package]
+name = "slopio-h2-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+slopio-h2 = { path = "..", default-features = false }
+
+# Not a member of anything above it.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "hpack_decode"
+path = "fuzz_targets/hpack_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frames"
+path = "fuzz_targets/frames.rs"
+test = false
+doc = false
+bench = false
