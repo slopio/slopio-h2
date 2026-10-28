@@ -195,11 +195,34 @@ impl Decoder {
         })
     }
 
-    pub fn decode<F>(
+    pub fn decode<F>(&mut self, src: &mut Cursor<&mut BytesMut>, f: F) -> Result<(), DecoderError>
+    where
+        F: FnMut(Header),
+    {
+        // Where the last whole representation ends. The cursor is committed
+        // once, there or at the end, rather than after every field: a block
+        // decoded only in part resumes from it.
+        let mut done = 0;
+        let res = self.decode_representations(src, &mut done, f);
+        let end = if res.is_ok() { src.position() } else { done };
+        src.get_mut().advance(end as usize);
+        src.set_position(0);
+
+        match res? {
+            true => Err(DecoderError::InvalidField),
+            false => Ok(()),
+        }
+    }
+
+    /// Whether a field was refused. `done` follows the cursor past each
+    /// whole representation; taking a literal's bytes resets the cursor, so
+    /// it is relative to wherever the block starts by then.
+    fn decode_representations<F>(
         &mut self,
         src: &mut Cursor<&mut BytesMut>,
+        done: &mut u64,
         mut f: F,
-    ) -> Result<(), DecoderError>
+    ) -> Result<bool, DecoderError>
     where
         F: FnMut(Header),
     {
@@ -221,7 +244,6 @@ impl Decoder {
                 Indexed => {
                     can_resize = false;
                     let entry = self.decode_indexed(src)?;
-                    consume(src);
                     emit(entry);
                 }
                 LiteralWithIndexing => {
@@ -229,20 +251,17 @@ impl Decoder {
                     let entry = self.decode_literal(src, true, &mut huff.0)?;
 
                     self.table.insert(entry.detached());
-                    consume(src);
 
                     emit(entry);
                 }
                 LiteralWithoutIndexing => {
                     can_resize = false;
                     let entry = self.decode_literal(src, false, &mut huff.0)?;
-                    consume(src);
                     emit(entry);
                 }
                 LiteralNeverIndexed => {
                     can_resize = false;
                     let entry = self.decode_literal(src, false, &mut huff.0)?;
-                    consume(src);
 
                     // TODO: Track that this should never be indexed
 
@@ -254,15 +273,12 @@ impl Decoder {
                     }
 
                     self.process_size_update(src)?;
-                    consume(src);
                 }
             }
+            *done = src.position();
         }
 
-        if invalid {
-            return Err(DecoderError::InvalidField);
-        }
-        Ok(())
+        Ok(invalid)
     }
 
     fn process_size_update(&mut self, buf: &mut Cursor<&mut BytesMut>) -> Result<(), DecoderError> {
@@ -480,11 +496,6 @@ impl StringMarker {
             None => take(buf, self.len),
         }
     }
-}
-
-fn consume(buf: &mut Cursor<&mut BytesMut>) {
-    // Commits the cursor: decoding resumes from here if it was only partial.
-    take(buf, 0);
 }
 
 impl Table {
@@ -1035,6 +1046,41 @@ mod test {
             }
             _ => panic!(),
         }
+    }
+
+    /// The whole fields before the cut are decoded once: resuming starts
+    /// after them, past a literal whose bytes moved the start of the block.
+    #[test]
+    fn resuming_a_cut_block_skips_its_whole_fields() {
+        let mut de = Decoder::new(4096);
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&indexed_literal(b"foo", b"bar"));
+        buf.extend_from_slice(&[0x82]); // :method GET
+        let last = indexed_literal(b"baz", b"qux");
+        buf.extend(&last[..last.len() - 1]);
+
+        let mut fields = vec![];
+        let e = de
+            .decode(&mut Cursor::new(&mut buf), |h| fields.push(h))
+            .unwrap_err();
+        assert_eq!(e, DecoderError::NeedMore(NeedMore::StringUnderflow));
+        assert_eq!(fields.len(), 2);
+
+        buf.extend(&last[last.len() - 1..]);
+        de.decode(&mut Cursor::new(&mut buf), |h| fields.push(h))
+            .unwrap();
+        assert!(buf.is_empty());
+
+        let names: Vec<_> = fields
+            .iter()
+            .map(|h| match h {
+                Header::Field { name, value } => format!("{}: {}", name, value.to_str().unwrap()),
+                Header::Method(m) => format!(":method: {m}"),
+                _ => panic!("unexpected {h:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["foo: bar", ":method: GET", "baz: qux"]);
+        assert_eq!(de.table.size(), 2 * (32 + 6));
     }
 
     fn decode_block(de: &mut Decoder, block: &[u8]) -> (Vec<Header>, Result<(), DecoderError>) {
