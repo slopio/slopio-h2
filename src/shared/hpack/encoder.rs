@@ -1,4 +1,4 @@
-use super::table::{Index, Table};
+use super::table::{Index, Table, static_status};
 use super::{Header, huffman};
 
 use http::header::{HeaderName, HeaderValue};
@@ -65,6 +65,15 @@ impl Encoder {
         let mut last_index = None;
 
         for header in headers {
+            // One byte, with nothing to look up or index: what most
+            // responses start with.
+            if let Header::Status(status) = header
+                && let Some(n) = static_status(status)
+            {
+                encode_int(n, 7, 0x80, dst);
+                continue;
+            }
+
             match header.reify() {
                 Ok(header) => {
                     let index = self.table.index(header);
@@ -708,6 +717,42 @@ mod test {
             "the first is still there"
         );
         assert_eq!(encode(&mut encoder, two()).len(), 1, "and so is the second");
+    }
+
+    /// A status in the static table is its one-byte index; any other is a
+    /// literal on the `:status` name, and both decode back.
+    #[test]
+    fn statuses_encode_and_decode_back() {
+        let mut encoder = Encoder::default();
+        assert_eq!(
+            encode(&mut encoder, vec![Header::Status(StatusCode::OK)]),
+            [0x88]
+        );
+        assert_eq!(
+            encode(&mut encoder, vec![Header::Status(StatusCode::NOT_FOUND)]),
+            [0x8d]
+        );
+
+        let statuses = [200, 201, 404, 418, 500, 201].map(|s| StatusCode::from_u16(s).unwrap());
+        let res = encode(
+            &mut encoder,
+            statuses.iter().map(|&s| Header::Status(s)).collect(),
+        );
+        assert_eq!(res[0], 0x88);
+
+        let mut buf = BytesMut::from(&res[..]);
+        let mut decoded = Vec::new();
+        crate::shared::hpack::Decoder::default()
+            .decode(&mut std::io::Cursor::new(&mut buf), |h| decoded.push(h))
+            .unwrap();
+        let back: Vec<_> = decoded
+            .iter()
+            .map(|h| match h {
+                Header::Status(s) => *s,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(back, statuses);
     }
 
     fn encode(e: &mut Encoder, hdrs: Vec<Header<Option<HeaderName>>>) -> Vec<u8> {

@@ -1,6 +1,7 @@
 use super::Header;
 
 use fnv::FnvHasher;
+use http::StatusCode;
 use http::header;
 use http::method::Method;
 
@@ -706,15 +707,20 @@ fn index_static(header: &Header) -> Option<(usize, bool)> {
             _ => Some((4, false)),
         },
         Header::Protocol(..) => None,
-        Header::Status(ref v) => match u16::from(*v) {
-            200 => Some((8, true)),
-            204 => Some((9, true)),
-            206 => Some((10, true)),
-            304 => Some((11, true)),
-            400 => Some((12, true)),
-            404 => Some((13, true)),
-            500 => Some((14, true)),
-            _ => Some((8, false)),
-        },
+        Header::Status(v) => Some(static_status(v).map_or((8, false), |n| (n, true))),
+    }
+}
+
+/// Where `status` is in the static table with its value, if it is.
+pub fn static_status(status: StatusCode) -> Option<usize> {
+    match status.as_u16() {
+        200 => Some(8),
+        204 => Some(9),
+        206 => Some(10),
+        304 => Some(11),
+        400 => Some(12),
+        404 => Some(13),
+        500 => Some(14),
+        _ => None,
     }
 }
