@@ -11,7 +11,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use runtime::Handle;
-use runtime::spawn;
+use runtime::spawn_next;
 
 #[cfg(feature = "grpc")]
 use crate::grpc::GrpcFormat;
@@ -76,14 +76,18 @@ impl Incoming {
 
     /// `answer` runs on the task's first poll, so the stream is the
     /// connection's before anything touches it. The task is as large as
-    /// `answer`'s future and no larger.
+    /// `answer`'s future and no larger. It goes to the head of the run queue
+    /// (`spawn_next`): it runs right after the connection task that decoded
+    /// its request, while that memory is fresh.
     pub fn spawn<F, Fut>(self, answer: F) -> StreamTask
     where
         F: FnOnce(Stream) -> Fut + 'static,
         Fut: Future<Output = ()> + 'static,
     {
         let stream = self.stream;
-        StreamTask(spawn(ContainPanic(async move { answer(stream).await })))
+        StreamTask(spawn_next(ContainPanic(
+            async move { answer(stream).await },
+        )))
     }
 }
 
