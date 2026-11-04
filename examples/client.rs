@@ -7,12 +7,13 @@
 //! A host that is a name is resolved by slopio-dns, against `DNS` (ip:port)
 //! or else the first `nameserver` of /etc/resolv.conf.
 
+use slopio::http;
 use std::net::{IpAddr, SocketAddr};
 
-use runtime::main_thread_with;
+use slopio::main_thread_with;
 use slopio_h2::client::{DnsClient, PlainTextClient};
 
-runtime::define_buf_ring!(ClientRing, bgid = 1, buffer_size = 16384, ring_size = 64);
+slopio::define_buf_ring!(ClientRing, bgid = 1, buffer_size = 16384, ring_size = 64);
 
 /// slopio-dns reads no system configuration, so this does.
 fn dns_server() -> SocketAddr {

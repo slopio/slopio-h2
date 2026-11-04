@@ -6,8 +6,8 @@
 //!     go install google.golang.org/grpc/interop/client@latest
 //!     client -server_host localhost -server_port 8080 -test_case empty_unary
 
-use http::{HeaderMap, StatusCode};
-use runtime::{main_thread_with, thread_per_core_with};
+use slopio::http::{HeaderMap, StatusCode};
+use slopio::{main_thread_with, thread_per_core_with};
 use slopio_h2::grpc::{Code, GrpcCall, GrpcRouter, Status, service};
 use slopio_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 
@@ -17,7 +17,7 @@ use testing::{
     StreamingInputCallResponse, StreamingOutputCallRequest, StreamingOutputCallResponse,
 };
 
-runtime::define_buf_ring!(
+slopio::define_buf_ring!(
     MyBufRing,
     bgid = 1,
     buffer_size = 65536,

@@ -24,19 +24,20 @@
 //! on the server's deadlines or budgets; nothing is left open, owed or in
 //! flight.
 
+use slopio::http;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 use std::rc::Rc;
 use std::time::Duration;
 
-use runtime_core::deterministic_testing::{
+use slopio::deterministic_testing::{
     AcceptEvent, Actor, ActorCx, Dialogue, DialogueReport, FakeRingHandle, Faults, FdKind,
     ReadReply, Scripted, WriteReply, mint,
 };
-use runtime_core::io_driver::operations::sockets::multi_accept::MultiAccept;
-use runtime_core::runtime::{RuntimeInner, spawn};
-use runtime_streams::StreamExt;
+use slopio::io_driver::operations::sockets::multi_accept::MultiAccept;
+use slopio::runtime::{RuntimeInner, spawn};
+use slopio::streams::StreamExt;
 
 use super::{GET_BLOCK, PREFACE, echo};
 use crate::dst::peer::block;
@@ -49,7 +50,7 @@ use crate::server::{Limits, Stream};
 use crate::shared::transport::PlainMessages;
 
 // A ring a single connection can empty, as a busy worker's would be.
-runtime_core::define_buf_ring!(
+slopio::define_buf_ring!(
     CrowdRing,
     bgid = 0,
     buffer_size = 1024,

@@ -8,8 +8,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use runtime::tracing::SpanWrapper;
-use runtime::tracing::types::{self, SpanData, SpanId};
+use slopio::tracing::SpanWrapper;
+use slopio::tracing::types::{self, SpanData, SpanId};
 
 use super::proto::{SpanFlags, SpanKind, StatusCode};
 use crate::grpc::PREFIX_LEN;
@@ -237,7 +237,7 @@ mod tests {
     use std::time::Duration;
 
     use prost::Message;
-    use runtime::tracing::types::{KeyValue, SpanEvent, SpanLink, TraceId};
+    use slopio::tracing::types::{KeyValue, SpanEvent, SpanLink, TraceId};
 
     use super::super::proto::{ExportTraceServiceRequest, any_value::Value};
     use super::*;

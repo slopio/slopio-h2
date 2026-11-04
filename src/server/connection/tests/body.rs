@@ -4,8 +4,8 @@
 
 use std::time::Duration;
 
-use http::{HeaderMap, StatusCode};
-use runtime_core::deterministic_testing::ReadEvent;
+use slopio::deterministic_testing::ReadEvent;
+use slopio::http::{HeaderMap, StatusCode};
 
 use super::{
     DATA, FLAG_END_HEADERS, FLAG_END_STREAM, Frame, HEADERS, PREFACE, SETTINGS, WINDOW_UPDATE,
@@ -166,7 +166,7 @@ fn a_static_body_handed_over_is_sent_whole() {
     let written = run(None, &[], |stream: Stream| async move {
         stream.write_headers(StatusCode::OK, &HeaderMap::new());
         stream
-            .write_owned_final(runtime::Bytes::from_static(&ASSET))
+            .write_owned_final(slopio::Bytes::from_static(&ASSET))
             .await;
     });
     assert_eq!(status(&written), "200");

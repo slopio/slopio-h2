@@ -7,17 +7,18 @@
 
 #![cfg(feature = "tls")]
 
+use slopio::http;
 use std::net::TcpListener;
 use std::sync::Once;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use http::{HeaderMap, StatusCode};
 use rcgen::{CertificateParams, KeyPair};
-use runtime::main_thread_with;
-use runtime::runtime::time::Sleep;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use slopio::http::{HeaderMap, StatusCode};
+use slopio::main_thread_with;
+use slopio::runtime::time::Sleep;
 use slopio_h2::client;
 use slopio_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 use slopio_tls::{
@@ -25,8 +26,8 @@ use slopio_tls::{
     server_config,
 };
 
-runtime::define_buf_ring!(ServerRing, bgid = 0, buffer_size = 16384, ring_size = 256);
-runtime::define_buf_ring!(ClientRing, bgid = 1, buffer_size = 16384, ring_size = 64);
+slopio::define_buf_ring!(ServerRing, bgid = 0, buffer_size = 16384, ring_size = 256);
+slopio::define_buf_ring!(ClientRing, bgid = 1, buffer_size = 16384, ring_size = 64);
 
 const H2: &[&[u8]] = &[b"h2"];
 

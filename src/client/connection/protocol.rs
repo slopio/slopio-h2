@@ -1,3 +1,4 @@
+use slopio::http;
 use std::rc::Rc;
 
 use crate::client::connection::keepalive::Keepalive;
@@ -41,7 +42,7 @@ impl Protocol {
         Self {
             shared,
             handshake: Handshake::AwaitingSettings,
-            keepalive: Keepalive::new(runtime::runtime::now()),
+            keepalive: Keepalive::new(slopio::runtime::now()),
             closing: false,
             failure: None,
         }

@@ -1,4 +1,5 @@
-use http::{HeaderMap, HeaderValue, StatusCode};
+use slopio::http;
+use slopio::http::{HeaderMap, HeaderValue, StatusCode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Code {

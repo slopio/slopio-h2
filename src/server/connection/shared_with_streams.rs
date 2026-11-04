@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use http::{HeaderMap, StatusCode};
+use slopio::http::{HeaderMap, StatusCode};
 
 use crate::server::stream::StreamState;
 use crate::shared::connection::STREAM_ID;
@@ -13,7 +13,7 @@ use crate::shared::{
     },
     hpack::Header,
 };
-use runtime::Handle;
+use slopio::Handle;
 use std::rc::Weak;
 
 pub type LiveStreams = StreamMap<StreamState, Handle<()>>;

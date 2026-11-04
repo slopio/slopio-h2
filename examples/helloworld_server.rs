@@ -3,12 +3,12 @@
 //!     taskset -c 0 cargo run --release --example helloworld_server
 //!     taskset -c 1 cargo run --release --example grpc_load
 
-use http::{HeaderMap, StatusCode};
-use runtime::{main_thread_with, thread_per_core_with};
+use slopio::http::{HeaderMap, StatusCode};
+use slopio::{main_thread_with, thread_per_core_with};
 use slopio_h2::grpc::{GrpcCall, GrpcRouter, Status, service};
 use slopio_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 
-runtime::define_buf_ring!(ServerRing, bgid = 0, buffer_size = 16384, ring_size = 2048);
+slopio::define_buf_ring!(ServerRing, bgid = 0, buffer_size = 16384, ring_size = 2048);
 
 /// `helloworld.HelloRequest`.
 #[derive(Clone, PartialEq, prost::Message)]

@@ -1,7 +1,7 @@
 # slopio-h2
 
 An HTTP/2 server and client, with gRPC on top, for Linux. Built on
-[`runtime`](https://github.com/saucisoupe/slopio), on io_uring.
+[`slopio`](https://crates.io/crates/slopio), on io_uring.
 
 ## HTTP/2 only
 

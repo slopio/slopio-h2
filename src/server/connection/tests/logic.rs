@@ -1,10 +1,11 @@
 //! Sequences a conforming peer produces, which the connection has to serve:
 //! a defence that fires on an honest exchange is an outage.
 
+use slopio::http;
 use std::time::Duration;
 
-use runtime_core::deterministic_testing::{ReadEvent, Scripted};
-use runtime_core::runtime::time::Sleep;
+use slopio::deterministic_testing::{ReadEvent, Scripted};
+use slopio::runtime::time::Sleep;
 
 use super::{
     DATA, FLAG_END_HEADERS, FLAG_END_STREAM, Frame, GET_BLOCK, GOAWAY, HEADERS, PING, PREFACE,
@@ -555,7 +556,7 @@ fn padding_is_credited_back_on_the_stream() {
 #[test]
 fn a_peer_with_no_hpack_table_is_not_sent_indexed_fields() {
     use crate::shared::hpack::Decoder;
-    use runtime::bytes::BytesMut;
+    use slopio::bytes::BytesMut;
 
     let mut bytes = PREFACE.to_vec();
     // SETTINGS_HEADER_TABLE_SIZE (0x1) = 0.

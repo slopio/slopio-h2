@@ -44,8 +44,7 @@ impl Shutdown {
         if self.until.get().is_some() {
             return;
         }
-        self.until
-            .set(Some(runtime::runtime::now() + drain_timeout));
+        self.until.set(Some(slopio::runtime::now() + drain_timeout));
         // A wake only queues the task, so no member runs, or leaves, while
         // the map is borrowed.
         for shared in self.members.borrow().values().flatten() {

@@ -1,8 +1,9 @@
+use slopio::http;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use http::HeaderName;
-use http::uri::Scheme;
+use slopio::http::HeaderName;
+use slopio::http::uri::Scheme;
 
 use crate::client::stream::{Failure, Stream, StreamState};
 use crate::shared::codec::frames::{encode::encode_rst_stream, stream_id::StreamId};
@@ -281,7 +282,7 @@ fn request_headers<'r>(
 /// §8.2.2: connection-specific fields an HTTP/2 message MUST NOT carry. `TE`
 /// may stay only as `trailers`.
 fn is_connection_specific(name: &HeaderName, value: &http::HeaderValue) -> bool {
-    use http::header;
+    use slopio::http::header;
     matches!(
         *name,
         header::CONNECTION | header::TRANSFER_ENCODING | header::UPGRADE

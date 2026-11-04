@@ -2,12 +2,12 @@
 //!
 //!     cargo run --example grpc_server
 
-use http::{HeaderMap, StatusCode};
-use runtime::{main_thread_with, thread_per_core_with};
+use slopio::http::{HeaderMap, StatusCode};
+use slopio::{main_thread_with, thread_per_core_with};
 use slopio_h2::grpc::{GrpcCall, GrpcRouter, Status, service};
 use slopio_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 
-runtime::define_buf_ring!(
+slopio::define_buf_ring!(
     MyBufRing,
     bgid = 1,
     buffer_size = 65536,

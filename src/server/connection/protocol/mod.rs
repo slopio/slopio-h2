@@ -430,7 +430,7 @@ impl<H: Handler> Protocol<H> {
             return;
         }
         self.phase = Phase::HalfClosed {
-            since: runtime::runtime::now(),
+            since: slopio::runtime::now(),
         };
         self.shared.close_credit();
         self.reset_stalled();

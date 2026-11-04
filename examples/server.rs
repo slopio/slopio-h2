@@ -3,13 +3,13 @@
 //!     cargo run --example server
 //!     curl --http2-prior-knowledge http://localhost:8080/ -v
 
-use http::{HeaderMap, StatusCode};
-use runtime::main_thread_with;
+use slopio::http::{HeaderMap, StatusCode};
+use slopio::main_thread_with;
 use slopio_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 
 // Not a smaller ring: `ring_size` is how many sockets the kernel can serve
 // between two submits, reserve or no reserve. `bgid` must be below 4.
-runtime::define_buf_ring!(
+slopio::define_buf_ring!(
     MyBufRing,
     bgid = 1,
     buffer_size = 65536,
@@ -22,7 +22,7 @@ fn main() {
     println!("try: curl --http2-prior-knowledge http://localhost:8080/ -v");
 
     if std::env::var_os("PER_CORE").is_some() {
-        runtime::thread_per_core_with::<MyBufRing, _>(|_| Box::pin(serve()));
+        slopio::thread_per_core_with::<MyBufRing, _>(|_| Box::pin(serve()));
     } else {
         main_thread_with::<MyBufRing, _>(serve());
     }

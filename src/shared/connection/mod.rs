@@ -43,8 +43,8 @@ impl DryRing {
     pub async fn wait(&mut self) {
         self.retries += 1;
         match self.retries <= DRY_YIELDS {
-            true => runtime::yield_now().await,
-            false => runtime::runtime::time::Sleep::during(DRY_BACKOFF).await,
+            true => slopio::yield_now().await,
+            false => slopio::runtime::time::Sleep::during(DRY_BACKOFF).await,
         }
     }
 

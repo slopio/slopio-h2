@@ -1,4 +1,4 @@
-use http::{HeaderMap, Method, header};
+use slopio::http::{HeaderMap, Method, header};
 
 use super::GrpcEncoding;
 use crate::shared::codec::frames::headers::Headers;
@@ -85,6 +85,7 @@ impl AnnouncedEncoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use slopio::http;
 
     fn announced(value: Option<&'static str>) -> AnnouncedEncoding {
         let mut fields = HeaderMap::new();

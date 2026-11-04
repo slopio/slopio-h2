@@ -10,6 +10,7 @@
 //! No request deadline is imposed; that is the application's, via
 //! [`Stream::with_deadline`].
 
+use slopio::http;
 use std::cell::RefCell;
 use std::io;
 use std::marker::PhantomData;
@@ -17,9 +18,9 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
-use runtime::Handle;
-use runtime::net::{BufRingSpec, connect_tcp};
-use runtime::runtime::time::timeout;
+use slopio::Handle;
+use slopio::net::{BufRingSpec, connect_tcp};
+use slopio::runtime::time::timeout;
 
 use crate::client::shared::ClientShared;
 #[cfg(test)]

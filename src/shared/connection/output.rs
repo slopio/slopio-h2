@@ -3,8 +3,8 @@
 
 use std::task::Waker;
 
-use runtime::bytes::Bytes;
-use runtime::net::IoBuf;
+use slopio::bytes::Bytes;
+use slopio::net::IoBuf;
 
 use crate::shared::codec::types::HEADER_LEN;
 

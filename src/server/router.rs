@@ -19,7 +19,7 @@
 
 use std::rc::Rc;
 
-use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use slopio::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 
 use crate::server::{Handler, Incoming, Stream, StreamTask};
 

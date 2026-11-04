@@ -17,12 +17,12 @@
 //!         -d '{"text": "a", "index": 1} {"text": "b", "index": 2}' \
 //!         localhost:8080 slopio.echo.v1.Echo/Chat
 
-use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
-use runtime::main_thread_with;
+use slopio::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use slopio::main_thread_with;
 use slopio_h2::grpc::{GrpcCall, GrpcRouter, Status, service};
 use slopio_h2::server::{Params, Router, Server, ServerSettings, ServerTransport, Stream};
 
-runtime::define_buf_ring!(
+slopio::define_buf_ring!(
     RouterRing,
     bgid = 1,
     buffer_size = 65536,
@@ -33,7 +33,7 @@ runtime::define_buf_ring!(
 fn main() {
     println!("listening on http://localhost:8080 (HTTP/2 cleartext, prior knowledge)");
     if std::env::var_os("PER_CORE").is_some() {
-        runtime::thread_per_core_with::<RouterRing, _>(|_| Box::pin(serve()));
+        slopio::thread_per_core_with::<RouterRing, _>(|_| Box::pin(serve()));
     } else {
         main_thread_with::<RouterRing, _>(serve());
     }

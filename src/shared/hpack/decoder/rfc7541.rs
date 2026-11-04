@@ -6,7 +6,7 @@
 use super::*;
 use crate::shared::hpack::Encoder;
 
-use http::header::{HeaderName, HeaderValue};
+use slopio::http::header::{HeaderName, HeaderValue};
 
 struct Example {
     section: &'static str,

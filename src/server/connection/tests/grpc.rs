@@ -1,7 +1,8 @@
+use slopio::http;
 use std::time::Duration;
 
 use prost::Message as _;
-use runtime_core::deterministic_testing::{ReadEvent, Scripted};
+use slopio::deterministic_testing::{ReadEvent, Scripted};
 
 use super::{
     DATA, FLAG_END_HEADERS, FLAG_END_STREAM, Frame, GOAWAY, HEADERS, PREFACE, RST_STREAM, SETTINGS,

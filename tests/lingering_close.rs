@@ -7,10 +7,10 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 
-use runtime::main_thread_with;
+use slopio::main_thread_with;
 use slopio_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 
-runtime::define_buf_ring!(ServerRing, bgid = 0, buffer_size = 16384, ring_size = 256);
+slopio::define_buf_ring!(ServerRing, bgid = 0, buffer_size = 16384, ring_size = 256);
 
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const SETTINGS: u8 = 4;

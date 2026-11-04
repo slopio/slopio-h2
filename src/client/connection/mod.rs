@@ -4,8 +4,8 @@ use std::rc::Rc;
 use std::task::Poll;
 use std::time::SystemTime;
 
-use runtime::runtime::time::timeout;
-use runtime_streams::StreamExt;
+use slopio::runtime::time::timeout;
+use slopio::streams::StreamExt;
 
 use crate::client::shared::ClientShared;
 use crate::client::{
@@ -140,7 +140,7 @@ impl<T: Transport> Driver<T> {
         T: 'static,
     {
         let shared = Rc::clone(&self.protocol.shared);
-        Connection::new(shared, Some(runtime::spawn(self.run())))
+        Connection::new(shared, Some(slopio::spawn(self.run())))
     }
 
     /// Test-only: a handle with no task to wait on.
@@ -154,7 +154,7 @@ impl<T: Transport> Driver<T> {
     /// which it never will.
     async fn run(mut self) -> io::Result<()> {
         // Silence starts after the handshake, which was the peer talking.
-        self.protocol.keepalive.heard(runtime::runtime::now());
+        self.protocol.keepalive.heard(slopio::runtime::now());
         let mut dry = DryRing::default();
         let ended = loop {
             if finished(&self.protocol.shared) {
@@ -172,7 +172,7 @@ impl<T: Transport> Driver<T> {
 
             // Nothing in flight is cut: with no stream open, `finished` says so
             // on the next turn.
-            if self.idle_too_long(runtime::runtime::now()) {
+            if self.idle_too_long(slopio::runtime::now()) {
                 self.protocol.shared.stop_opening();
                 continue;
             }
@@ -185,7 +185,7 @@ impl<T: Transport> Driver<T> {
             match event {
                 Event::Inbound(chunk) => {
                     dry.refilled();
-                    self.protocol.keepalive.heard(runtime::runtime::now());
+                    self.protocol.keepalive.heard(slopio::runtime::now());
                     self.decoder.decode_with(chunk.as_ref(), &mut self.protocol);
                 }
                 Event::Flush => {
@@ -223,7 +223,7 @@ impl<T: Transport> Driver<T> {
         match self
             .protocol
             .keepalive
-            .due(runtime::runtime::now(), in_flight)
+            .due(slopio::runtime::now(), in_flight)
         {
             Due::Nothing => Ok(()),
             Due::Ping(opaque) => {

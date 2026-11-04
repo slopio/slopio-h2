@@ -1,3 +1,4 @@
+use slopio::http;
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::pin::pin;
@@ -5,9 +6,9 @@ use std::rc::Rc;
 use std::task::{Poll, Waker};
 use std::time::{Duration, SystemTime};
 
-use http::HeaderMap;
-use runtime::bytes::Bytes;
-use runtime::runtime::time::timeout;
+use slopio::bytes::Bytes;
+use slopio::http::HeaderMap;
+use slopio::runtime::time::timeout;
 
 use crate::client::STREAM_RECV_WINDOW;
 use crate::client::lifecycle::{Inbound, Lifecycle, Outbound};
@@ -435,7 +436,7 @@ impl Stream {
 
     /// Enforced only where the application waits, not by the connection loop.
     pub fn with_deadline(mut self, within: Duration) -> Self {
-        self.deadline = Some(runtime::runtime::now() + within);
+        self.deadline = Some(slopio::runtime::now() + within);
         self
     }
 
@@ -751,7 +752,7 @@ impl Stream {
         let mut op = pin!(op);
         loop {
             let left = deadline
-                .duration_since(runtime::runtime::now())
+                .duration_since(slopio::runtime::now())
                 .unwrap_or_default();
             if left.is_zero() {
                 return Err(self.expire());

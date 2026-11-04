@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use http::HeaderMap;
+use slopio::http::HeaderMap;
 
 use super::frame::{Accumulating, GrpcFrame};
 use super::prefix::{Prefix, PrefixRead};
@@ -172,6 +172,7 @@ impl GrpcInput {
 mod tests {
     use super::super::GrpcEncoding;
     use super::*;
+    use slopio::http;
 
     fn input(encoding: Option<&'static str>) -> GrpcInput {
         let mut fields = HeaderMap::new();

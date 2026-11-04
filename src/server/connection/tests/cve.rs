@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use runtime_core::deterministic_testing::{ReadEvent, Scripted};
+use slopio::deterministic_testing::{ReadEvent, Scripted};
 
 use super::{
     CONTINUATION, DATA, FLAG_END_HEADERS, FLAG_END_STREAM, Frame, GET_BLOCK, GOAWAY, HEADERS, PING,

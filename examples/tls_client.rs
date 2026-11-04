@@ -7,13 +7,14 @@
 //! first `nameserver` of /etc/resolv.conf. `INSECURE=1` skips checking the
 //! certificate, for a local server: `https://127.0.0.1:8443/`.
 
+use slopio::http;
 use std::net::{IpAddr, SocketAddr};
 
-use runtime::main_thread_with;
+use slopio::main_thread_with;
 use slopio_h2::client::{DnsClient, TlsClient};
 use slopio_tls::{ClientSettings, client_config, client_config_dangerous_no_verification};
 
-runtime::define_buf_ring!(ClientRing, bgid = 1, buffer_size = 16384, ring_size = 64);
+slopio::define_buf_ring!(ClientRing, bgid = 1, buffer_size = 16384, ring_size = 64);
 
 /// §3.3: ALPN is not optional over TLS. A server that will not agree to `h2`
 /// is refused rather than spoken HTTP/2 at.

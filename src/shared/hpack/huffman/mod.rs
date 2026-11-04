@@ -3,7 +3,7 @@ mod table;
 use self::table::{DECODE_TABLE, ENCODE_TABLE};
 use crate::shared::hpack::DecoderError;
 
-use runtime::bytes::BytesMut;
+use slopio::bytes::BytesMut;
 
 struct Decoder {
     state: u8,

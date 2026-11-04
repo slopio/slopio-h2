@@ -1,9 +1,10 @@
+use slopio::http;
 use std::cell::{Cell, RefCell};
 use std::task::{Poll, Waker};
 use std::time::{Duration, SystemTime};
 
-use http::StatusCode;
-use runtime::bytes::Bytes;
+use slopio::bytes::Bytes;
+use slopio::http::StatusCode;
 
 #[cfg(feature = "grpc")]
 use crate::grpc::{GrpcError, GrpcFormat, GrpcFrame, GrpcInput};
@@ -112,7 +113,7 @@ impl StreamState {
         };
 
         Ok(Self {
-            created_at: runtime::runtime::now(),
+            created_at: slopio::runtime::now(),
             window: StreamWindow::new(settings, window),
             #[cfg(feature = "grpc")]
             grpc,
@@ -131,7 +132,7 @@ impl StreamState {
     /// Floors at zero on a wall clock that stepped backwards, so a clock
     /// adjustment never fails a request.
     pub fn age(&self) -> Duration {
-        runtime::runtime::now()
+        slopio::runtime::now()
             .duration_since(self.created_at)
             .unwrap_or_default()
     }
@@ -194,7 +195,7 @@ impl StreamState {
 
     fn note_send_blocked(&self) {
         if self.send_blocked_since.get().is_none() {
-            self.send_blocked_since.set(Some(runtime::runtime::now()));
+            self.send_blocked_since.set(Some(slopio::runtime::now()));
         }
     }
 
@@ -779,7 +780,7 @@ impl crate::shared::connection::SendSide for StreamState {
 
 /// Floors at zero on a clock that stepped backwards.
 fn elapsed_since(since: SystemTime) -> Duration {
-    runtime::runtime::now()
+    slopio::runtime::now()
         .duration_since(since)
         .unwrap_or_default()
 }

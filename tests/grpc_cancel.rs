@@ -10,15 +10,15 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use http::{HeaderMap, StatusCode};
-use runtime::main_thread_with;
-use runtime::runtime::time::Sleep;
+use slopio::http::{HeaderMap, StatusCode};
+use slopio::main_thread_with;
+use slopio::runtime::time::Sleep;
 use slopio_h2::client::{self, PlainText};
 use slopio_h2::grpc::{Code, GrpcCall, GrpcClient, Status, service};
 use slopio_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 
-runtime::define_buf_ring!(ServerRing, bgid = 0, buffer_size = 16384, ring_size = 256);
-runtime::define_buf_ring!(ClientRing, bgid = 1, buffer_size = 16384, ring_size = 64);
+slopio::define_buf_ring!(ServerRing, bgid = 0, buffer_size = 16384, ring_size = 256);
+slopio::define_buf_ring!(ClientRing, bgid = 1, buffer_size = 16384, ring_size = 64);
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct Request {

@@ -8,6 +8,7 @@
 //! Nothing is queued: past its connections for an origin a request is refused
 //! with [`Unavailable::AtLimit`].
 
+use slopio::http;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io;
@@ -18,9 +19,9 @@ use std::sync::Arc;
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
-use http::uri::{Scheme, Uri};
-use runtime::net::BufRingSpec;
-use runtime::runtime::time::timeout;
+use slopio::http::uri::{Scheme, Uri};
+use slopio::net::BufRingSpec;
+use slopio::runtime::time::timeout;
 use slopio_dns::protocol::Name;
 use slopio_dns::{DnsClient, IpVersion, ResolveError};
 
@@ -837,16 +838,16 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::time::Duration;
 
-    use runtime_core::deterministic_testing::FakeRing;
-    use runtime_core::runtime::RuntimeInner;
-    use runtime_core::runtime::time::timeout;
+    use slopio::deterministic_testing::FakeRing;
+    use slopio::runtime::RuntimeInner;
+    use slopio::runtime::time::timeout;
 
     use super::*;
     use crate::client::CONNECTION_RECV_WINDOW;
     use crate::client::shared::ClientShared;
     use crate::shared::connection::settings::Settings;
 
-    runtime_core::define_buf_ring!(PoolRing, bgid = 1, buffer_size = 4096, ring_size = 4);
+    slopio::define_buf_ring!(PoolRing, bgid = 1, buffer_size = 4096, ring_size = 4);
 
     /// A connection whose handshake is done and whose loop never runs: its
     /// requests are written to a buffer no one flushes, which is all a client
@@ -880,7 +881,7 @@ mod tests {
         let (fake, _) = FakeRing::builder().virtual_time().build();
         RuntimeInner::simulated(fake).block_on::<PoolRing, _>(
             // Spawned from inside: `spawn` needs the runtime already running.
-            async move { runtime_core::runtime::spawn(app).await },
+            async move { slopio::runtime::spawn(app).await },
             None,
             |run| run(),
         )
@@ -1185,7 +1186,7 @@ mod tests {
             let tasks: Vec<_> = (0..5)
                 .map(|_| {
                     let client = Rc::clone(&client);
-                    runtime_core::runtime::spawn(async move {
+                    slopio::runtime::spawn(async move {
                         // Kept alive past the burst, so no slot frees early.
                         let stream = client.send_request(&request(), true).await;
                         sleep(Duration::from_millis(5)).await;
@@ -1222,7 +1223,7 @@ mod tests {
             let tasks: Vec<_> = (0..3)
                 .map(|_| {
                     let client = Rc::clone(&client);
-                    runtime_core::runtime::spawn(async move {
+                    slopio::runtime::spawn(async move {
                         match client.send_request(&request(), true).await {
                             Err(ClientError::Connect(e)) => Some(e.kind()),
                             _ => None,
@@ -1280,7 +1281,7 @@ mod tests {
             let client = Rc::new(client);
             let abandoned = {
                 let client = Rc::clone(&client);
-                runtime_core::runtime::spawn(async move {
+                slopio::runtime::spawn(async move {
                     let request = request();
                     let send = client.send_request(&request, true);
                     // Dropped part-way, its opening with it.
@@ -1294,7 +1295,7 @@ mod tests {
             };
             let spawn_request = || {
                 let client = Rc::clone(&client);
-                runtime_core::runtime::spawn(async move {
+                slopio::runtime::spawn(async move {
                     client.send_request(&request(), true).await.is_ok()
                 })
             };
@@ -1434,7 +1435,7 @@ mod tests {
                 .into_iter()
                 .map(|uri| {
                     let client = Rc::clone(&client);
-                    runtime_core::runtime::spawn(async move {
+                    slopio::runtime::spawn(async move {
                         match client.send_request(&request_to(uri), true).await {
                             Ok(_) => "opened",
                             Err(ClientError::AtCapacity) => "at capacity",

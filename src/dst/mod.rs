@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use runtime_core::deterministic_testing::{
+use slopio::deterministic_testing::{
     FakeRing, FakeRingHandle, Fault, Faults, KernelFaults, open_fds,
 };
 

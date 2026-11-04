@@ -3,10 +3,10 @@ use crate::shared::codec::frames::head::Head;
 use crate::shared::codec::frames::stream_id::StreamId;
 use crate::shared::hpack::{self, BytesStr, Error};
 
-use http::header;
-use http::{HeaderMap, Method, StatusCode};
+use slopio::http::header;
+use slopio::http::{HeaderMap, Method, StatusCode};
 
-use runtime::bytes::BytesMut;
+use slopio::bytes::BytesMut;
 
 use std::io::Cursor;
 
@@ -327,6 +327,7 @@ pub fn content_length(fields: &HeaderMap) -> Result<Option<u64>, ()> {
 mod tests {
     use super::*;
     use crate::shared::codec::frames::head::Kind;
+    use slopio::http;
 
     /// A `HeaderMap` holds `MAX_SIZE` values. With a limit this large the
     /// list is within it, so the map is what runs out.

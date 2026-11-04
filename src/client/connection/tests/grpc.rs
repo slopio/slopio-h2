@@ -1,6 +1,7 @@
+use slopio::http;
 use std::time::Duration;
 
-use runtime_core::deterministic_testing::ReadEvent;
+use slopio::deterministic_testing::ReadEvent;
 
 use super::{
     DATA, FLAG_END_HEADERS, FLAG_END_STREAM, HEADERS, STATUS_200, WINDOW_UPDATE, frame, literal,

@@ -12,7 +12,7 @@ use crate::shared::{
     connection::DryRing,
     transport::{RecvError, Transport},
 };
-use runtime::runtime::time::timeout;
+use slopio::runtime::time::timeout;
 
 mod protocol;
 pub(crate) mod shared_with_streams;
@@ -158,7 +158,7 @@ impl<T: Transport, H: Handler> Connection<T, H> {
                 .with_max_header_list_size(limits.max_header_list_size as usize),
             protocol: Protocol::new(handler, peer, limits),
             partial_since: None,
-            last_swept: runtime::runtime::now(),
+            last_swept: slopio::runtime::now(),
             probe_sent: None,
             idle_timeout: limits.idle_timeout,
             shutdown: None,
@@ -179,7 +179,7 @@ impl<T: Transport, H: Handler> Connection<T, H> {
         // Silence is measured from here, not counted in ticks: the tick
         // restarts whenever handler output wakes the loop, so a dead peer
         // would otherwise be held for as long as a handler kept writing.
-        let mut last_heard = runtime::runtime::now();
+        let mut last_heard = slopio::runtime::now();
         let mut dry = DryRing::default();
         loop {
             match self.due(last_heard) {
@@ -194,7 +194,7 @@ impl<T: Transport, H: Handler> Connection<T, H> {
                 Phase::Draining { until } => {
                     let left = until.map_or(DEADLINE_TICK, |until| {
                         until
-                            .duration_since(runtime::runtime::now())
+                            .duration_since(slopio::runtime::now())
                             .unwrap_or_default()
                     });
                     timeout(left.min(DEADLINE_TICK), self.next_event()).await
@@ -252,7 +252,7 @@ impl<T: Transport, H: Handler> Connection<T, H> {
                 }
             };
             self.decoder.decode_with(chunk.as_ref(), &mut self.protocol);
-            last_heard = runtime::runtime::now();
+            last_heard = slopio::runtime::now();
             self.probe_sent = None;
             self.sweep_if_due();
             if self.drain().await.is_err() {
@@ -302,7 +302,7 @@ impl<T: Transport, H: Handler> Connection<T, H> {
                 return Ok(());
             }
             self.flush().await?;
-            runtime::yield_now().await;
+            slopio::yield_now().await;
             if self.protocol.shared().output_is_empty() {
                 return Ok(());
             }
@@ -314,7 +314,7 @@ impl<T: Transport, H: Handler> Connection<T, H> {
     /// a connection.
     #[inline]
     fn due(&mut self, last_heard: SystemTime) -> Due {
-        let now = runtime::runtime::now();
+        let now = slopio::runtime::now();
         let since = |then: SystemTime| now.duration_since(then).unwrap_or_default();
 
         match self.protocol.phase() {
@@ -367,7 +367,7 @@ impl<T: Transport, H: Handler> Connection<T, H> {
     /// Must run after the dispatch: judging on evidence one turn stale would
     /// reset a stream whose DATA just arrived.
     fn sweep_if_due(&mut self) {
-        let now = runtime::runtime::now();
+        let now = slopio::runtime::now();
         let due = now
             .duration_since(self.last_swept)
             .is_ok_and(|since| since >= SWEEP_INTERVAL);

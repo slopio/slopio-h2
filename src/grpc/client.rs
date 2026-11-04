@@ -1,7 +1,8 @@
+use slopio::http;
 use std::cell::{Cell, RefCell};
 
-use http::uri::{Authority, Scheme, Uri};
-use http::{HeaderMap, HeaderValue, Method, header};
+use slopio::http::uri::{Authority, Scheme, Uri};
+use slopio::http::{HeaderMap, HeaderValue, Method, header};
 
 use super::input::GrpcError;
 use super::status::{Code, Status};

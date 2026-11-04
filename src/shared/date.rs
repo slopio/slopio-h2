@@ -8,14 +8,14 @@
 use std::cell::RefCell;
 use std::time::UNIX_EPOCH;
 
-use http::HeaderValue;
+use slopio::http::HeaderValue;
 
 thread_local! {
     static CACHED: RefCell<Option<(u64, HeaderValue)>> = const { RefCell::new(None) };
 }
 
 pub fn now() -> HeaderValue {
-    let secs = runtime::runtime::now()
+    let secs = slopio::runtime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
 

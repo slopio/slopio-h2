@@ -2,7 +2,7 @@
 //! preface announces and what the connection enforces have to be the same
 //! numbers.
 
-use runtime_core::deterministic_testing::ReadEvent;
+use slopio::deterministic_testing::ReadEvent;
 
 use super::{
     FLAG_END_HEADERS, FLAG_END_STREAM, Frame, GET_BLOCK, HEADERS, PREFACE, RST_STREAM, SETTINGS,

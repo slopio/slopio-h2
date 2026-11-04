@@ -1,7 +1,7 @@
 use super::table::{Index, Table, static_status};
 use super::{Header, huffman};
 
-use http::header::{HeaderName, HeaderValue};
+use slopio::http::header::{HeaderName, HeaderValue};
 
 #[derive(Debug)]
 pub struct Encoder {
@@ -265,8 +265,8 @@ fn position(buf: &[u8]) -> usize {
 #[cfg(test)]
 mod test {
     use super::*;
-    use http::*;
-    use runtime::bytes::BytesMut;
+    use slopio::bytes::BytesMut;
+    use slopio::http::*;
 
     #[test]
     fn test_encode_method_get() {
@@ -420,7 +420,7 @@ mod test {
 
     #[test]
     fn test_sensitive_headers_are_never_indexed() {
-        use http::header::HeaderValue;
+        use slopio::http::header::HeaderValue;
 
         let name = "my-password".parse().unwrap();
         let mut value = HeaderValue::from_bytes(b"12345").unwrap();

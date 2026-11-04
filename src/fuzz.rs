@@ -2,6 +2,7 @@
 //! for the tests: the decoders are crate-private. Each takes whatever bytes
 //! the fuzzer makes and panics only on a broken invariant, never on bad input.
 
+use slopio::http;
 use std::io::Cursor;
 
 use crate::shared::codec::frames::headers::Headers;

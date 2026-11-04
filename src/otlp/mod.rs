@@ -4,7 +4,7 @@
 //! ```ignore
 //! let endpoint = "127.0.0.1:4317".parse()?;
 //! let service = OtlpService { name: "api".into(), version: None, host_name: None };
-//! runtime::thread_per_core_traced::<Ring, _, _>(
+//! slopio::thread_per_core_traced::<Ring, _, _>(
 //!     move || OtlpCollector::<Ring>::new(endpoint, &service),
 //!     worker,
 //! );
@@ -17,9 +17,9 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use runtime::net::BufRingSpec;
-use runtime::runtime::time::timeout;
-use runtime::tracing::{Collector, SpanWrapper, thread_id};
+use slopio::net::BufRingSpec;
+use slopio::runtime::time::timeout;
+use slopio::tracing::{Collector, SpanWrapper, thread_id};
 
 use crate::client::{PlainText, PlainTextClient};
 use crate::grpc::GrpcClient;

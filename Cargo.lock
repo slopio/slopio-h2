@@ -9,11 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "async_timers"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#31b091ad68d29ed80274fcc71c849ab9f500cf4f"
-
-[[package]]
 name = "aws-lc-rs"
 version = "1.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -178,15 +173,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "io_uring_rb"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#31b091ad68d29ed80274fcc71c849ab9f500cf4f"
-dependencies = [
- "io-uring",
- "rustix",
-]
-
-[[package]]
 name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -286,29 +272,6 @@ name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
-
-[[package]]
-name = "popple-dns"
-version = "0.1.0"
-source = "git+ssh://git@github.com/slopio/slopio-dns.git#ca4c89f75865d541d9f94abb4fa9be532322af12"
-dependencies = [
- "rand",
- "runtime",
- "runtime-streams",
- "rustc-hash",
-]
-
-[[package]]
-name = "popple-tls"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/slopio-tls.git#dd05cafa1b61214a87df378e72b6147f30a651d8"
-dependencies = [
- "libc",
- "runtime",
- "runtime-streams",
- "rustls",
- "zeroize",
-]
 
 [[package]]
 name = "powerfmt"
@@ -431,48 +394,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "runtime"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#31b091ad68d29ed80274fcc71c849ab9f500cf4f"
-dependencies = [
- "libc",
- "libmimalloc-sys",
- "runtime-core",
-]
-
-[[package]]
-name = "runtime-core"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#31b091ad68d29ed80274fcc71c849ab9f500cf4f"
-dependencies = [
- "async_timers",
- "bitfield-struct",
- "bumpalo",
- "io-uring",
- "io_uring_rb",
- "libc",
- "pin-project",
- "rand",
- "runtime-streams",
- "slab",
- "smallvec",
- "socket2",
-]
-
-[[package]]
-name = "runtime-http"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#31b091ad68d29ed80274fcc71c849ab9f500cf4f"
-dependencies = [
- "runtime-core",
-]
-
-[[package]]
-name = "runtime-streams"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#31b091ad68d29ed80274fcc71c849ab9f500cf4f"
-
-[[package]]
 name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -560,24 +481,63 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
+name = "slopio"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11e7b942e83aa37165cb6d076a0c0992a674bb0164fadf03865c8598f30d415c"
+dependencies = [
+ "bitfield-struct",
+ "bumpalo",
+ "io-uring",
+ "libc",
+ "libmimalloc-sys",
+ "pin-project",
+ "rand",
+ "rustix",
+ "slab",
+ "smallvec",
+ "socket2",
+]
+
+[[package]]
+name = "slopio-dns"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb776d566b258b0301d9590f5323a26f2712ccaa5c386bd5c147ed366a9583ee"
+dependencies = [
+ "rand",
+ "rustc-hash",
+ "slopio",
+]
+
+[[package]]
 name = "slopio-h2"
 version = "0.1.0"
 dependencies = [
  "fnv",
  "libc",
  "matchit",
- "popple-dns",
- "popple-tls",
  "prost",
  "rcgen",
- "runtime",
- "runtime-core",
- "runtime-http",
- "runtime-streams",
  "rustc-hash",
  "rustls",
+ "slopio",
+ "slopio-dns",
+ "slopio-tls",
  "webpki-roots",
  "zerocopy",
+]
+
+[[package]]
+name = "slopio-tls"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e77f32b76d9d082a75b0321ac697d40f8b249268822d4706952da5aab53b5a34"
+dependencies = [
+ "libc",
+ "rustls",
+ "slopio",
+ "zeroize",
 ]
 
 [[package]]

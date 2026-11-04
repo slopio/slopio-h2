@@ -26,12 +26,12 @@ use std::fmt::Write as _;
 use std::rc::Rc;
 use std::time::Duration;
 
-use runtime_core::deterministic_testing::{
+use slopio::deterministic_testing::{
     AcceptEvent, Check, Dialogue, DialogueReport, FakeRingHandle, Fault, FdKind, Scripted, mint,
 };
-use runtime_core::io_driver::operations::sockets::multi_accept::MultiAccept;
-use runtime_core::runtime::{RuntimeInner, spawn};
-use runtime_streams::StreamExt;
+use slopio::io_driver::operations::sockets::multi_accept::MultiAccept;
+use slopio::runtime::{RuntimeInner, spawn};
+use slopio::streams::StreamExt;
 
 use super::{GET_BLOCK, PREFACE, echo};
 use crate::dst::{
@@ -45,7 +45,7 @@ use crate::shared::transport::PlainMessages;
 
 // Small buffers, so a frame spans many completions; a pool past the ring, so
 // the reserve is in play.
-runtime_core::define_buf_ring!(
+slopio::define_buf_ring!(
     DstRing,
     bgid = 0,
     buffer_size = 512,

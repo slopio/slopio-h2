@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use http::HeaderMap;
+use slopio::http::HeaderMap;
 
 use crate::shared::connection::MAX_SLEEP;
 
@@ -32,21 +32,22 @@ pub fn parse_timeout(fields: &HeaderMap) -> Option<Duration> {
 /// in slices. Each slice re-reads the clock, so the slicing cannot drift the
 /// deadline later.
 pub async fn sleep(duration: Duration) {
-    let deadline = runtime::runtime::now() + duration;
+    let deadline = slopio::runtime::now() + duration;
     loop {
         let left = deadline
-            .duration_since(runtime::runtime::now())
+            .duration_since(slopio::runtime::now())
             .unwrap_or_default();
         if left.is_zero() {
             return;
         }
-        runtime::runtime::time::Sleep::during(left.min(MAX_SLEEP)).await;
+        slopio::runtime::time::Sleep::during(left.min(MAX_SLEEP)).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use slopio::http;
 
     fn timeout(value: &'static str) -> Option<Duration> {
         let mut fields = HeaderMap::new();

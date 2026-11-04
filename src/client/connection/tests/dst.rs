@@ -21,15 +21,16 @@
 //! frames are never wrong; the connection's loop always ends, against a
 //! vanished server on its keepalive; nothing is left open, owed or in flight.
 
+use slopio::http;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use runtime_core::deterministic_testing::{
+use slopio::deterministic_testing::{
     Check, Dialogue, DialogueReport, FakeRingHandle, Fault, simulated_socket,
 };
-use runtime_core::runtime::RuntimeInner;
-use runtime_core::runtime::time::timeout;
+use slopio::runtime::RuntimeInner;
+use slopio::runtime::time::timeout;
 
 use super::Driver;
 use crate::client::{CONNECT_TIMEOUT, Connection, PlainText};
@@ -43,7 +44,7 @@ use crate::shared::transport::PlainMessages;
 
 // Small buffers, so a frame spans many completions; a pool past the ring, so
 // the reserve is in play.
-runtime_core::define_buf_ring!(
+slopio::define_buf_ring!(
     DstRing,
     bgid = 0,
     buffer_size = 512,
@@ -406,7 +407,7 @@ fn run(seed: u64, journal: Option<&Slot>) -> Result<Report, String> {
     let wanted = rounds.clone();
     let played = RuntimeInner::simulated(fake).block_on::<DstRing, _>(
         async move {
-            runtime_core::runtime::spawn(async move {
+            slopio::runtime::spawn(async move {
                 let transport = PlainMessages::<DstRing, false>::new(socket);
                 // As `connect` does.
                 match timeout(CONNECT_TIMEOUT, Driver::handshake(transport)).await {
@@ -539,7 +540,7 @@ fn a_seed_replays_the_same_run() {
 /// for ever; past `FLUSH_TIMEOUT` the connection is given up on.
 #[test]
 fn a_server_that_stops_reading_does_not_hold_the_connection() {
-    let (fake, handle) = runtime_core::deterministic_testing::FakeRing::builder()
+    let (fake, handle) = slopio::deterministic_testing::FakeRing::builder()
         .virtual_time()
         .build();
     let (server, report) = Dialogue::new()
@@ -556,13 +557,13 @@ fn a_server_that_stops_reading_does_not_hold_the_connection() {
 
     let (answered, ended, took) = RuntimeInner::simulated(fake).block_on::<DstRing, _>(
         async move {
-            runtime_core::runtime::spawn(async move {
+            slopio::runtime::spawn(async move {
                 let transport = PlainMessages::<DstRing, false>::new(socket);
                 let conn = Driver::handshake(transport)
                     .await
                     .expect("a handshake")
                     .spawn();
-                let started = runtime_core::runtime::now();
+                let started = slopio::runtime::now();
                 // Past any room the vanished server leaves, inside its window.
                 let asked = Ask {
                     body: Some(60_000),
@@ -576,7 +577,7 @@ fn a_server_that_stops_reading_does_not_hold_the_connection() {
                     Err(()) => Some(false),
                 };
                 let ended = timeout(PATIENCE, conn.closed()).await.ok();
-                let took = runtime_core::runtime::now()
+                let took = slopio::runtime::now()
                     .duration_since(started)
                     .unwrap_or_default();
                 (answered, ended.map(|r| r.is_ok()), took)

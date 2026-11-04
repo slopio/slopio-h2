@@ -2,9 +2,9 @@ use crate::shared::codec::ext::Protocol;
 
 use super::DecoderError;
 
-use http::header::{HeaderName, HeaderValue};
-use http::{Method, StatusCode};
-use runtime::bytes::Bytes;
+use slopio::bytes::Bytes;
+use slopio::http::header::{HeaderName, HeaderValue};
+use slopio::http::{Method, StatusCode};
 use std::fmt;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -176,7 +176,7 @@ impl Header {
     }
 
     pub fn skip_value_index(&self, index_paths: bool) -> bool {
-        use http::header;
+        use slopio::http::header;
 
         match *self {
             Header::Field { ref name, .. } => matches!(

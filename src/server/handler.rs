@@ -6,12 +6,13 @@
 //! around every route at once would be as large as the largest of them, for
 //! every request.
 
+use slopio::http;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use runtime::Handle;
-use runtime::spawn_next;
+use slopio::Handle;
+use slopio::spawn_next;
 
 #[cfg(feature = "grpc")]
 use crate::grpc::GrpcFormat;

@@ -11,9 +11,9 @@
 use super::{BytesStr, Decoder, DecoderError, Encoder, Header};
 use crate::dst::{Rng, seeds};
 
-use http::header::{self, HeaderName, HeaderValue};
-use http::{Method, StatusCode};
-use runtime::bytes::BytesMut;
+use slopio::bytes::BytesMut;
+use slopio::http::header::{self, HeaderName, HeaderValue};
+use slopio::http::{Method, StatusCode};
 
 use std::io::Cursor;
 

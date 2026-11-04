@@ -3,10 +3,10 @@ use crate::shared::hpack::Error;
 use super::{Header, header::BytesStr, huffman};
 use crate::shared::codec::ext::Protocol;
 
-use http::header::{self, HeaderName, HeaderValue};
-use http::method::{self, Method};
-use http::status::{self, StatusCode};
-use runtime::bytes::{Bytes, BytesMut};
+use slopio::bytes::{Bytes, BytesMut};
+use slopio::http::header::{self, HeaderName, HeaderValue};
+use slopio::http::method::{self, Method};
+use slopio::http::status::{self, StatusCode};
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -641,7 +641,7 @@ impl From<DecoderError> for Error {
 }
 
 pub fn get_static(idx: usize) -> Header {
-    use http::header::HeaderValue;
+    use slopio::http::header::HeaderValue;
 
     match idx {
         1 => Header::Authority(BytesStr::from_static("")),

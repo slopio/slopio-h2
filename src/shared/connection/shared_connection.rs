@@ -3,8 +3,8 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::task::{Poll, Waker};
 
-use http::{HeaderMap, HeaderName};
-use runtime::bytes::Bytes;
+use slopio::bytes::Bytes;
+use slopio::http::{HeaderMap, HeaderName};
 
 use crate::shared::codec::frames::{
     encode::{encode_data_header, encode_header_block_in_place, encode_window_update},
@@ -576,7 +576,7 @@ mod tests {
     use std::pin::pin;
     use std::task::Context;
 
-    use runtime::net::IoBuf;
+    use slopio::net::IoBuf;
 
     use super::*;
     use crate::shared::codec::types::HEADER_LEN;

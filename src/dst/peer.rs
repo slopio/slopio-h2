@@ -14,8 +14,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-use runtime::bytes::BytesMut;
-use runtime_core::deterministic_testing::{ActorCx, ReadReply, WriteReply};
+use slopio::bytes::BytesMut;
+use slopio::deterministic_testing::{ActorCx, ReadReply, WriteReply};
 
 use super::{
     DATA, FLAG_ACK, FLAG_END_HEADERS, FLAG_END_STREAM, GOAWAY, HEADERS, PING, RST_STREAM, SETTINGS,

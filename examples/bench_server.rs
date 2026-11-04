@@ -3,47 +3,47 @@
 //!
 //!     RING=64x128+512 PER_CORE=1 taskset -c 0,1 cargo run --release --example bench_server
 
-use http::{HeaderMap, StatusCode};
-use runtime::net::BufRingSpec;
-use runtime::{main_thread_with, thread_per_core_with};
+use slopio::http::{HeaderMap, StatusCode};
+use slopio::net::BufRingSpec;
+use slopio::{main_thread_with, thread_per_core_with};
 use slopio_h2::server::{Server, ServerSettings, ServerTransport, Stream};
 
 // Only the ring actually selected is ever installed: each of these is its own
 // type with its own thread-local.
-runtime::define_buf_ring!(Ring64x512, bgid = 1, buffer_size = 65536, ring_size = 512);
-runtime::define_buf_ring!(Ring64x16, bgid = 1, buffer_size = 65536, ring_size = 16);
-runtime::define_buf_ring!(Ring64x64, bgid = 1, buffer_size = 65536, ring_size = 64);
-runtime::define_buf_ring!(
+slopio::define_buf_ring!(Ring64x512, bgid = 1, buffer_size = 65536, ring_size = 512);
+slopio::define_buf_ring!(Ring64x16, bgid = 1, buffer_size = 65536, ring_size = 16);
+slopio::define_buf_ring!(Ring64x64, bgid = 1, buffer_size = 65536, ring_size = 64);
+slopio::define_buf_ring!(
     Ring64x16p512,
     bgid = 1,
     buffer_size = 65536,
     ring_size = 16,
     pool_size = 512
 );
-runtime::define_buf_ring!(
+slopio::define_buf_ring!(
     Ring64x64p512,
     bgid = 1,
     buffer_size = 65536,
     ring_size = 64,
     pool_size = 512
 );
-runtime::define_buf_ring!(
+slopio::define_buf_ring!(
     Ring64x128p512,
     bgid = 1,
     buffer_size = 65536,
     ring_size = 128,
     pool_size = 512
 );
-runtime::define_buf_ring!(
+slopio::define_buf_ring!(
     Ring64x256p512,
     bgid = 1,
     buffer_size = 65536,
     ring_size = 256,
     pool_size = 512
 );
-runtime::define_buf_ring!(Ring64x4096, bgid = 1, buffer_size = 65536, ring_size = 4096);
-runtime::define_buf_ring!(Ring16x4096, bgid = 1, buffer_size = 16384, ring_size = 4096);
-runtime::define_buf_ring!(
+slopio::define_buf_ring!(Ring64x4096, bgid = 1, buffer_size = 65536, ring_size = 4096);
+slopio::define_buf_ring!(Ring16x4096, bgid = 1, buffer_size = 16384, ring_size = 4096);
+slopio::define_buf_ring!(
     Ring16x16384,
     bgid = 1,
     buffer_size = 16384,
@@ -126,7 +126,7 @@ async fn bench_route(stream: Stream) {
     match requested_size(stream.path()) {
         Some(n) => {
             stream
-                .write_owned_final(runtime::Bytes::from_static(&FILLER[..n]))
+                .write_owned_final(slopio::Bytes::from_static(&FILLER[..n]))
                 .await
         }
         None => {

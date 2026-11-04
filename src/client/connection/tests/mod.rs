@@ -1,13 +1,12 @@
+use slopio::http;
 use std::io;
 
 use std::time::Duration;
 
-use runtime::Bytes;
-use runtime_core::deterministic_testing::{
-    FakeRing, ReadEvent, Scripted, WriteEvent, simulated_socket,
-};
-use runtime_core::runtime::RuntimeInner;
-use runtime_core::runtime::time::timeout;
+use slopio::Bytes;
+use slopio::deterministic_testing::{FakeRing, ReadEvent, Scripted, WriteEvent, simulated_socket};
+use slopio::runtime::RuntimeInner;
+use slopio::runtime::time::timeout;
 
 use super::Driver;
 use crate::client::{Body, Connection, PlainText, Unavailable};
@@ -22,7 +21,7 @@ mod dst_peer;
 #[cfg(feature = "grpc")]
 mod grpc;
 
-runtime_core::define_buf_ring!(TestRing, bgid = 3, buffer_size = 16384, ring_size = 4);
+slopio::define_buf_ring!(TestRing, bgid = 3, buffer_size = 16384, ring_size = 4);
 
 const DATA: u8 = 0x0;
 const HEADERS: u8 = 0x1;
@@ -89,7 +88,7 @@ fn handshake(mut inbound: Vec<ReadEvent>) -> (io::Result<Settings>, Vec<u8>) {
         async move {
             // Spawned: a root future that yields with an empty task list puts
             // the runtime to sleep with nothing armed to wake it.
-            runtime_core::runtime::spawn(async move {
+            slopio::runtime::spawn(async move {
                 Driver::handshake(PlainMessages::<TestRing, false>::new(socket))
                     .await
                     .map(|conn| conn.connection().peer_settings())
@@ -118,7 +117,7 @@ where
 
     let result = RuntimeInner::simulated(fake).block_on::<TestRing, _>(
         async move {
-            runtime_core::runtime::spawn(async move {
+            slopio::runtime::spawn(async move {
                 let conn = Driver::handshake(PlainMessages::<TestRing, false>::new(socket))
                     .await
                     .expect("the handshake completed");
@@ -279,7 +278,7 @@ fn a_silent_server_does_not_hold_the_connection_for_ever() {
 
     let result = RuntimeInner::simulated(fake).block_on::<TestRing, _>(
         async move {
-            runtime_core::runtime::spawn(async move {
+            slopio::runtime::spawn(async move {
                 timeout(
                     CONNECT_TIMEOUT,
                     Driver::handshake(PlainMessages::<TestRing, false>::new(socket)),
@@ -1545,7 +1544,7 @@ fn decode_block_with(
     payload: &[u8],
 ) -> std::collections::HashMap<String, String> {
     use crate::shared::hpack::Header;
-    use runtime::bytes::BytesMut;
+    use slopio::bytes::BytesMut;
 
     let mut buf = BytesMut::from(payload);
     let mut cursor = std::io::Cursor::new(&mut buf);
@@ -1873,17 +1872,17 @@ fn a_peer_that_stops_reading_does_not_hold_the_goodbye() {
 
     let (outcome, took) = RuntimeInner::simulated(fake).block_on::<TestRing, _>(
         async move {
-            runtime_core::runtime::spawn(async move {
+            slopio::runtime::spawn(async move {
                 let conn = Driver::handshake(PlainMessages::<TestRing, false>::new(socket))
                     .await
                     .expect("the handshake completed");
                 let client = conn.spawn();
                 script.on_write(fd, WriteEvent::All.after(farewell * 60));
 
-                let start = runtime_core::runtime::now();
+                let start = slopio::runtime::now();
                 client.close();
                 let outcome = client.closed().await.map_err(|e| e.to_string());
-                let took = runtime_core::runtime::now().duration_since(start).unwrap();
+                let took = slopio::runtime::now().duration_since(start).unwrap();
                 (outcome, took)
             })
             .await

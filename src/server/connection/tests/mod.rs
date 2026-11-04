@@ -20,12 +20,13 @@ mod limits;
 mod logic;
 mod routing;
 
+use slopio::http;
 use std::time::Duration;
 
-use runtime_core::deterministic_testing::{
+use slopio::deterministic_testing::{
     FakeRing, FakeRingHandle, ReadEvent, Scripted, WriteEvent, simulated_socket,
 };
-use runtime_core::runtime::RuntimeInner;
+use slopio::runtime::RuntimeInner;
 
 use super::FLUSH_TIMEOUT;
 use crate::server::Limits;
@@ -33,7 +34,7 @@ use crate::server::connection::Connection;
 use crate::shared::transport::PlainMessages;
 
 // Four buffers: the loop recycles each chunk as soon as it is decoded.
-runtime_core::define_buf_ring!(TestRing, bgid = 2, buffer_size = 16384, ring_size = 4);
+slopio::define_buf_ring!(TestRing, bgid = 2, buffer_size = 16384, ring_size = 4);
 
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
@@ -95,7 +96,7 @@ pub(super) struct Frame {
 /// name stay distinct.
 fn decode_block(payload: &[u8]) -> std::collections::HashMap<String, String> {
     use crate::shared::hpack::{Decoder, Header};
-    use runtime::bytes::BytesMut;
+    use slopio::bytes::BytesMut;
 
     let mut buf = BytesMut::from(payload);
     let mut cursor = std::io::Cursor::new(&mut buf);
@@ -202,7 +203,7 @@ fn run_writes<H: crate::server::Handler>(
         async move {
             // Spawned, as `Server` does: a root future that yields with an empty task
             // list puts the runtime to sleep with nothing armed to wake it.
-            runtime_core::runtime::spawn(
+            slopio::runtime::spawn(
                 Connection::new(
                     PlainMessages::<TestRing, false>::new(socket),
                     None,

@@ -1,4 +1,4 @@
-use runtime::bytes::{Bytes, BytesMut};
+use slopio::bytes::{Bytes, BytesMut};
 
 use super::prefix::PREFIX_LEN;
 use crate::shared::codec::frames::stream_id::StreamId;

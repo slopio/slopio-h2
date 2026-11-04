@@ -1,9 +1,9 @@
 use super::Header;
 
 use fnv::FnvHasher;
-use http::StatusCode;
-use http::header;
-use http::method::Method;
+use slopio::http::StatusCode;
+use slopio::http::header;
+use slopio::http::method::Method;
 
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};

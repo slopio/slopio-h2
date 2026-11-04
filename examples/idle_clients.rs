@@ -3,12 +3,13 @@
 //!     PORT=8090 cargo run --release --example bench_server &
 //!     N=2000 ADDR=127.0.0.1:8090 cargo run --release --example idle_clients
 
+use slopio::http;
 use std::net::SocketAddr;
 
-use runtime::main_thread_with;
+use slopio::main_thread_with;
 use slopio_h2::client::PlainTextClient;
 
-runtime::define_buf_ring!(IdleRing, bgid = 1, buffer_size = 16384, ring_size = 64);
+slopio::define_buf_ring!(IdleRing, bgid = 1, buffer_size = 16384, ring_size = 64);
 
 fn main() {
     let addr: SocketAddr = std::env::var("ADDR")

@@ -20,6 +20,7 @@
 //! (then never processed); every handler ends; every connection ends; nothing
 //! is left open, owed or in flight.
 
+use slopio::http;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as _;
@@ -27,13 +28,13 @@ use std::pin::pin;
 use std::rc::Rc;
 use std::time::Duration;
 
-use runtime_core::deterministic_testing::{
+use slopio::deterministic_testing::{
     AcceptEvent, Actor, ActorCx, FakeRingHandle, FdKind, ReadReply, Scripted, WriteReply, mint,
 };
-use runtime_core::io_driver::operations::sockets::multi_accept::MultiAccept;
-use runtime_core::runtime::time::{Sleep, timeout};
-use runtime_core::runtime::{RuntimeInner, spawn};
-use runtime_streams::StreamExt;
+use slopio::io_driver::operations::sockets::multi_accept::MultiAccept;
+use slopio::runtime::time::{Sleep, timeout};
+use slopio::runtime::{RuntimeInner, spawn};
+use slopio::streams::StreamExt;
 
 use crate::dst::peer::{
     CANCEL, CREDIT, Credit, INITIAL_WINDOW_SIZE, In, PREFACE as CLIENT_PREFACE, Wire, block,
@@ -45,7 +46,7 @@ use crate::server::shutdown::Shutdown;
 use crate::server::{Limits, Stream, serve_plain};
 use crate::shared::transport::PlainMessages;
 
-runtime_core::define_buf_ring!(
+slopio::define_buf_ring!(
     PeerRing,
     bgid = 0,
     buffer_size = 1024,
@@ -585,11 +586,11 @@ fn run(seed: u64, journal: Option<&Slot>) -> Result<Summary, String> {
                         listener, limits, handler, &shutdown, stop,
                     )
                     .await;
-                    let stopped = runtime_core::runtime::now();
+                    let stopped = slopio::runtime::now();
                     shutdown.begin(limits.drain_timeout);
                     let _ = timeout(limits.drain_timeout + DRAIN_GRACE, shutdown.emptied()).await;
                     Some(
-                        runtime_core::runtime::now()
+                        slopio::runtime::now()
                             .duration_since(stopped)
                             .unwrap_or_default(),
                     )

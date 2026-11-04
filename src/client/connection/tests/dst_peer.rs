@@ -19,17 +19,18 @@
 //! GOAWAY (then failed, never answered); the connection's loop ends; nothing
 //! is left open, owed or in flight.
 
+use slopio::http;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::rc::Rc;
 use std::time::Duration;
 
-use runtime_core::deterministic_testing::{
+use slopio::deterministic_testing::{
     Actor, ActorCx, FakeRingHandle, ReadReply, WriteReply, simulated_socket,
 };
-use runtime_core::runtime::RuntimeInner;
-use runtime_core::runtime::time::timeout;
+use slopio::runtime::RuntimeInner;
+use slopio::runtime::time::timeout;
 
 use super::Driver;
 use crate::client::{CONNECT_TIMEOUT, Connection, PlainText, Stream};
@@ -37,7 +38,7 @@ use crate::dst::peer::{CREDIT, Credit, INITIAL_WINDOW_SIZE, In, MAX_CONCURRENT_S
 use crate::dst::{Rng, Slot, explore, judge, leftovers, profile, ring};
 use crate::shared::transport::PlainMessages;
 
-runtime_core::define_buf_ring!(
+slopio::define_buf_ring!(
     PeerRing,
     bgid = 0,
     buffer_size = 1024,
@@ -334,7 +335,7 @@ async fn app(
     for round in rounds {
         let tasks: Vec<_> = round
             .into_iter()
-            .map(|(id, a)| runtime_core::runtime::spawn(ask(conn.clone(), a, id)))
+            .map(|(id, a)| slopio::runtime::spawn(ask(conn.clone(), a, id)))
             .collect();
         for task in tasks {
             outcomes.push(task.await);
@@ -441,7 +442,7 @@ fn run(seed: u64, journal: Option<&Slot>) -> Result<Summary, String> {
     let plan = rounds.clone();
     let (outcomes, ended) = RuntimeInner::simulated(fake).block_on::<PeerRing, _>(
         async move {
-            runtime_core::runtime::spawn(async move {
+            slopio::runtime::spawn(async move {
                 let transport = PlainMessages::<PeerRing, false>::new(socket);
                 match timeout(CONNECT_TIMEOUT, Driver::handshake(transport)).await {
                     Ok(Ok(driver)) => app(driver.spawn(), rounds).await,

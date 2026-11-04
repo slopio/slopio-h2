@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
-use http::{HeaderMap, HeaderValue, StatusCode};
+use slopio::http::{HeaderMap, HeaderValue, StatusCode};
 
 use super::frame::{GrpcFrame, MessageError};
 use super::input::GrpcError;
@@ -214,14 +214,12 @@ where
     // later than the client's — by the transit, the safe direction.
     let status = match call.timeout {
         None => grpc(&call).await,
-        Some(timeout) => {
-            match runtime::runtime::select::select(grpc(&call), sleep(timeout)).await {
-                runtime::runtime::select::SelectResult::First(status) => status,
-                runtime::runtime::select::SelectResult::Second(()) => {
-                    Status::new(Code::DeadlineExceeded, "deadline exceeded")
-                }
+        Some(timeout) => match slopio::runtime::select::select(grpc(&call), sleep(timeout)).await {
+            slopio::runtime::select::SelectResult::First(status) => status,
+            slopio::runtime::select::SelectResult::Second(()) => {
+                Status::new(Code::DeadlineExceeded, "deadline exceeded")
             }
-        }
+        },
     };
     call.finish(status);
 }

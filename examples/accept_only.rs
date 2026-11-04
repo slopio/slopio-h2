@@ -4,12 +4,12 @@
 //!     MODE=hold cargo run --release --example accept_only   # accept + spawn
 //!     MODE=recv cargo run --release --example accept_only   # + arm MultiRecv
 
-use runtime::net::{MultiAccept, MultiRecv};
-use runtime::{spawn, thread_per_core_with};
-use runtime_streams::StreamExt;
+use slopio::net::{MultiAccept, MultiRecv};
+use slopio::streams::StreamExt;
+use slopio::{spawn, thread_per_core_with};
 
 // The geometry `examples/server.rs` ships, so the floor is measured on it.
-runtime::define_buf_ring!(
+slopio::define_buf_ring!(
     Ring,
     bgid = 1,
     buffer_size = 65536,

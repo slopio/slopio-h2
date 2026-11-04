@@ -5,13 +5,13 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
-use http::uri::Scheme;
-use runtime::io_driver::operations::sockets::multi_recv::{CompletionError, Continuation};
-use runtime::io_driver::operations::sockets::recv::{ClassicRecv, socket_recv};
-use runtime::io_driver::operations::sockets::send_vectored::send_vectored_all;
-use runtime::io_driver::operations::sockets::send_vectored_zc::send_vectored_all_zc;
-use runtime::net::{BorrowedBuffer, BufRingSpec, IoBuf, MultiRecv, SocketWrapper};
-use runtime_streams::Stream;
+use slopio::http::uri::Scheme;
+use slopio::io_driver::operations::sockets::multi_recv::{CompletionError, Continuation};
+use slopio::io_driver::operations::sockets::recv::{ClassicRecv, socket_recv};
+use slopio::io_driver::operations::sockets::send_vectored::send_vectored_all;
+use slopio::io_driver::operations::sockets::send_vectored_zc::send_vectored_all_zc;
+use slopio::net::{BorrowedBuffer, BufRingSpec, IoBuf, MultiRecv, SocketWrapper};
+use slopio::streams::Stream;
 
 /// What a transport is, as a type: [`PlainText`] or [`Tls`]. Sealed, since the
 /// scheme a connection claims must be the one it runs.

@@ -22,13 +22,13 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use http::{HeaderMap, Method, StatusCode, header};
-use runtime::runtime::time::Sleep;
-use runtime::tracing::{self, KeyValue, Level, Span, SpanKind, Status};
+use slopio::http::{HeaderMap, Method, StatusCode, header};
+use slopio::runtime::time::Sleep;
+use slopio::tracing::{self, KeyValue, Level, Span, SpanKind, Status};
 use slopio_h2::otlp::{OtlpCollector, OtlpService};
 use slopio_h2::server::{Params, Router, Server, ServerSettings, ServerTransport, Stream};
 
-runtime::define_buf_ring!(
+slopio::define_buf_ring!(
     ServerRing,
     bgid = 1,
     buffer_size = 65536,
@@ -38,7 +38,7 @@ runtime::define_buf_ring!(
 
 // The exporter receives its responses into a ring of its own. One
 // connection per worker, and small answers, so a small ring.
-runtime::define_buf_ring!(OtlpRing, bgid = 2, buffer_size = 16384, ring_size = 16);
+slopio::define_buf_ring!(OtlpRing, bgid = 2, buffer_size = 16384, ring_size = 16);
 
 fn main() {
     let endpoint: SocketAddr = match std::env::var("OTLP_ENDPOINT") {
@@ -59,11 +59,11 @@ fn main() {
     let collector = move || OtlpCollector::<OtlpRing>::new(endpoint, &service);
 
     if std::env::var_os("PER_CORE").is_some() {
-        runtime::thread_per_core_traced::<(ServerRing, OtlpRing), _, _>(collector, |_| {
+        slopio::thread_per_core_traced::<(ServerRing, OtlpRing), _, _>(collector, |_| {
             Box::pin(serve())
         });
     } else {
-        runtime::main_thread_traced::<(ServerRing, OtlpRing), _, _>(collector, serve());
+        slopio::main_thread_traced::<(ServerRing, OtlpRing), _, _>(collector, serve());
     }
 }
 

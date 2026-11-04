@@ -9,11 +9,11 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use runtime::{main_thread_with, thread_per_core_with};
+use slopio::{main_thread_with, thread_per_core_with};
 use slopio_h2::client::PlainTextClient;
 use slopio_h2::grpc::{Code, GrpcClient};
 
-runtime::define_buf_ring!(LoadRing, bgid = 0, buffer_size = 16384, ring_size = 1024);
+slopio::define_buf_ring!(LoadRing, bgid = 0, buffer_size = 16384, ring_size = 1024);
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct HelloRequest {
@@ -96,7 +96,7 @@ async fn run(settings: Settings) {
         for _ in 0..settings.concurrency {
             let grpc = Rc::clone(&grpc);
             let outcomes = Rc::clone(&outcomes);
-            workers.push(runtime::spawn(async move {
+            workers.push(slopio::spawn(async move {
                 let request = HelloRequest {
                     name: "world".into(),
                 };
