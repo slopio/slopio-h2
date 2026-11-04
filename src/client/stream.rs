@@ -529,8 +529,8 @@ impl Stream {
         .await
     }
 
-    /// The body whole, if the response declared a length of at most
-    /// [`InputData::ONESHOT_LIMIT`]: gathered in one allocation as it arrived,
+    /// The body whole, if the response declared a length of at most 16 KiB:
+    /// gathered in one allocation as it arrived,
     /// and handed over when complete. Otherwise [`Body::Streaming`], as soon
     /// as the head is in: the body is then [`Stream::read`]'s.
     pub async fn body(&self) -> io::Result<Body> {

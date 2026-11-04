@@ -1,9 +1,9 @@
 Third-party code bundled in this repository
 ===========================================
 
-This crate is licensed under MIT OR Apache-2.0 (see LICENSE-MIT and
-LICENSE-APACHE), with the exception of the files listed below, which are
-derived from other projects and remain under their original licenses.
+This crate is licensed under MIT (see LICENSE), with the exception of the
+files listed below, which are derived from other projects and remain under
+their original licenses.
 
 
 hyperium/h2 (MIT)
@@ -14,10 +14,10 @@ Upstream: https://github.com/hyperium/h2
 The HPACK implementation and the frame codec were taken from h2 and adapted.
 The files concerned:
 
-    src/hpack/                  header compression: decoder, encoder,
+    src/shared/hpack/           header compression: decoder, encoder,
                                 dynamic table, Huffman coding and its
                                 generated table
-    src/codec/                  frame parsing and serialization, frame
+    src/shared/codec/           frame parsing and serialization, frame
                                 types, stream ids
 
 Changes made against upstream: `Bytes` removed from several paths so header
@@ -25,10 +25,10 @@ and frame data can be read out of the buffers this crate's runtime owns,
 unused frame types and code paths dropped, HEADERS frame handling reworked,
 and upstream's own test fixtures and fuzz targets removed.
 
-Everything else in this repository is original work: the connection and
-stream state machines (`src/protocol/`), the write path and its buffer pool
-(`src/io/`), the server and client entry points, the gRPC framing
-(`src/grpc/`), and the test suites (`tests/`).
+Everything else in this repository is original work: the server and the
+client (`src/server/`, `src/client/`), the connection state, flow control
+and write path they share (`src/shared/connection/`), gRPC (`src/grpc/`),
+OTLP export (`src/otlp/`), and the test suites.
 
 Upstream license text, reproduced in full as MIT requires:
 

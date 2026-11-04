@@ -77,3 +77,9 @@ the tests.
   real socket.
 - `examples`: servers, clients and load generators.
 - `TODO.md`: what is left.
+
+## License
+
+MIT, see [LICENSE](LICENSE). The HPACK and frame codec code adapted from
+[h2](https://github.com/hyperium/h2) stays under its MIT license, see
+[LICENSE-THIRD-PARTY](LICENSE-THIRD-PARTY).

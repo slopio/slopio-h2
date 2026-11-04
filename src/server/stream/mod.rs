@@ -714,8 +714,13 @@ impl Stream {
             .await;
     }
 
+    /// A gRPC message, length-prefixed. Encoded straight into the
+    /// connection's output when it can all go at once; framed apart
+    /// otherwise, and sent from its own buffer rather than copied in, if
+    /// large enough.
+    ///
     /// No `_final`: a gRPC response always ends with its trailers, never with
-    /// END_STREAM on DATA. See [`crate::grpc::write_message`].
+    /// END_STREAM on DATA.
     #[cfg(feature = "grpc")]
     pub async fn write_message<M: prost::Message>(&self, message: &M) {
         crate::grpc::write_message(self.token.shared(), self.id(), self.state(), message, false)

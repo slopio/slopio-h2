@@ -2,6 +2,22 @@
 name = "slopio-h2"
 version = "0.1.0"
 edition = "2024"
+description = "HTTP/2 server and client with gRPC, for Linux, on the io_uring runtime slopio"
+readme = "README.md"
+keywords = ["http2", "grpc", "io-uring", "server", "slopio"]
+categories = [
+    "network-programming",
+    "web-programming::http-server",
+    "web-programming::http-client",
+    "os::linux-apis",
+]
+license = "MIT"
+repository = "https://github.com/slopio/slopio-h2"
+# Benchmarks stay local, and CI stays out of the crate.
+exclude = ["/bench", "/examples/bench_router.rs", "/.github"]
+
+[package.metadata.docs.rs]
+features = ["grpc", "tls", "otlp"]
 
 [features]
 default = ["grpc"]
